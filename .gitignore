@@ -6,3 +6,6 @@ simulated_log.csv
 __pycache__/
 models/
 data/
+DataSet/*
+Docs/*
+.venv
