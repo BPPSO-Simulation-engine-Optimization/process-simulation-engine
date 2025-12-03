@@ -1,6 +1,0 @@
-action,resource,concept_name,event_origin,event_id,lifecycle,timestamp,loan_goal,application_type,case_concept_name,requested_amount,first_withdrawal_amount,number_of_terms,accepted,monthly_cost,selected,credit_score,offered_amount,offer_id
-Created,User_17,A_Create Application,Application,Event_6e70daaddfb7,complete,2025-12-03 16:00:41.848805,Home improvement,New credit,Application_420342313,20000,20000.0,72,True,498.29,True,850,15000.0,Offer_1331679312
-Created,User_17,A_Create Application,Application,Event_00d70c3223bc,complete,2025-12-03 16:00:41.851130,Home improvement,New credit,Application_1858657870,20000,20000.0,72,True,498.29,True,850,15000.0,Offer_1271425524
-Created,User_17,A_Create Application,Application,Event_fd7ae63eb7f0,complete,2025-12-03 16:00:41.851845,Home improvement,New credit,Application_872599495,20000,20000.0,72,True,498.29,True,850,15000.0,Offer_1846514307
-Created,User_17,A_Create Application,Application,Event_f3c001700a01,complete,2025-12-03 16:00:41.852445,Home improvement,New credit,Application_654201299,20000,20000.0,72,True,498.29,True,850,15000.0,Offer_1783602648
-Created,User_17,A_Create Application,Application,Event_da06476f6e55,complete,2025-12-03 16:00:41.853026,Home improvement,New credit,Application_330505946,20000,20000.0,72,True,498.29,True,850,15000.0,Offer_1391985512
