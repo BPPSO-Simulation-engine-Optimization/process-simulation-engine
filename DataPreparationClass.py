@@ -22,10 +22,9 @@ class DataPreparationClass:
         df = self.delete_top1_percent_duration_outliers(df)
 
         # 2. Feature Engineering (that needs timestamps)
-        df = self.unroll_loops(df)
+        # df = self.unroll_loops(df)
         df = self.calculate_durations(df)
         df = self.extract_datetime_features(df)
-        df = self.add_aggregate_features(df)
 
         # 3. Encoding and Scaling
         df = self.one_hot_encode_categorical_columns(df)
@@ -96,7 +95,7 @@ class DataPreparationClass:
         
         return df[df["case:concept:name"].isin(valid_cases)].copy()
 
-    # Outlier entfernen (oberstes & unterstes 1% der Case-Duration) | TODO: to be discussed
+    # Outlier entfernen (oberstes & unterstes 1% der Case-Duration)
     def delete_top1_percent_duration_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
 
         case_durations = (
@@ -115,7 +114,6 @@ class DataPreparationClass:
 
         return df_filtered
 
-    # TODO: to be discussed
     def unroll_loops(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Unrolls loops by appending the occurrence count to the activity name.
@@ -162,22 +160,7 @@ class DataPreparationClass:
 
         return df
 
-    def add_aggregate_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Adds aggregate case-level features.
-        """
-    
-        # Count of A_Incomplete per case
-        incompletes = df[df["concept:name"].astype(str).str.contains("A_Incomplete", na=False)].groupby("case:concept:name").size()
-        df["num_incomplete"] = df["case:concept:name"].map(incompletes).fillna(0)
-        
-        # Flag for W_Validate application
-        has_validation = df[df["concept:name"].astype(str).str.contains("W_Validate application", na=False)]["case:concept:name"].unique()
-        df["has_validation"] = df["case:concept:name"].isin(has_validation).astype(int)
 
-        # TODO: to be discussed -> more/other?
-        
-        return df
 
     # One-Hot-Encoding
     def one_hot_encode_categorical_columns(self, df: pd.DataFrame) -> pd.DataFrame:
