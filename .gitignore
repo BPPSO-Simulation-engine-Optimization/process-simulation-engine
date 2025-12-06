@@ -9,3 +9,4 @@ data/
 DataSet/*
 Docs/*
 .venv
+eventlog.xes.gz
