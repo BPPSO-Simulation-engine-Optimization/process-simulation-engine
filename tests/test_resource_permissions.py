@@ -82,19 +82,19 @@ class TestResourcePermissionsRealLog(unittest.TestCase):
         cls.rp = BasicResourcePermissions(log_path=log_path)
 
     def test_oracle_create_application(self):
-        # Oracle: 111 resources
+        # Oracle: 111 resources (source: Celonis Analysis)
         activity = "A_Create Application"
         resources = self.rp.get_eligible_resources(activity)
         self.assertEqual(len(resources), 111, f"Expected 111 resources for {activity}, found {len(resources)}")
 
     def test_oracle_assess_potential_fraud(self):
-        # Oracle: 56 resources
+        # Oracle: 56 resources (source: Celonis Analysis)
         activity = "W_Assess potential fraud"
         resources = self.rp.get_eligible_resources(activity)
         self.assertEqual(len(resources), 56, f"Expected 56 resources for {activity}, found {len(resources)}")
 
     def test_oracle_validate_application(self):
-        # Oracle: 133 resources
+        # Oracle: 133 resources (source: Celonis Analysis)
         activity = "W_Validate application"
         resources = self.rp.get_eligible_resources(activity)
         self.assertEqual(len(resources), 133, f"Expected 133 resources for {activity}, found {len(resources)}")
