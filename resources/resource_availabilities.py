@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 class ResourceAvailabilityModel:
     """
     Basic model for resource availabilities:
-    - Uses a two-week interval starting from the first timestamp in the log
-    - All resources share the same working hours (e.g. Mon–Fri, 08:00–17:00)
+    - 2-week interval as repeating calendar pattern (14 days)
+    - All resources share the same working pattern (e.g. Mon–Fri, 08:00–17:00 in both weeks)
     """
 
     def __init__(
@@ -15,55 +15,59 @@ class ResourceAvailabilityModel:
         interval_days: int = 14,
         workday_start_hour: int = 8,
         workday_end_hour: int = 17,
-        working_weekdays=None,
+        working_cycle_days=None,
     ):
-        if working_weekdays is None:
-            # 0 = Monday, ..., 6 = Sunday
-            working_weekdays = {0, 1, 2, 3, 4}
-
         self.event_log_df = event_log_df.copy()
         self.interval_days = interval_days
         self.workday_start_hour = workday_start_hour
         self.workday_end_hour = workday_end_hour
-        self.working_weekdays = working_weekdays
 
-        # wir brauchen echte Datumswerte
+        # Default: Mon–Fri in both weeks
+        if working_cycle_days is None:
+            working_cycle_days = {0, 1, 2, 3, 4, 7, 8, 9, 10, 11}
+        self.working_cycle_days = working_cycle_days
+
+        # Ensure proper datetime type
         if not pd.api.types.is_datetime64_any_dtype(self.event_log_df["time:timestamp"]):
             self.event_log_df["time:timestamp"] = pd.to_datetime(
                 self.event_log_df["time:timestamp"], errors="coerce"
             )
 
-        # Simulationshorizont: zwei Wochen ab dem ersten Event
-        self.start_time: datetime = self.event_log_df["time:timestamp"].min().normalize()
-        self.end_time: datetime = self.start_time + timedelta(days=self.interval_days)
+        # Use the Monday of the week of the first timestamp as cycle anchor
+        first_ts = self.event_log_df["time:timestamp"].min()
+        first_date = first_ts.normalize().date()
+        monday_date = first_date - timedelta(days=first_ts.weekday())  # Mon=0
 
-        # Menge der Ressourcen aus dem Log
+        self.cycle_start_date = monday_date
+
+        # Resources in the log
         self.resources = sorted(self.event_log_df["org:resource"].dropna().unique())
 
-    def is_within_interval(self, current_time: datetime) -> bool:
-        """Check if current_time is inside the global availability interval."""
-        return self.start_time <= current_time < self.end_time
+    def _cycle_day_index(self, current_time: datetime) -> int:
+        """
+        Map current_time to a day index in the 2-week cycle [0..interval_days-1].
+        The cycle repeats infinitely.
+        """
+        delta_days = (current_time.date() - self.cycle_start_date).days
+        return delta_days % self.interval_days
 
     def is_working_time(self, current_time: datetime) -> bool:
-        """Check if current_time is during working hours on a working day."""
-        weekday = current_time.weekday()
-        hour = current_time.hour
-        if weekday not in self.working_weekdays:
+        """
+        Check if current_time falls on a working day in the cycle
+        and within the working hours.
+        """
+        cycle_day = self._cycle_day_index(current_time)
+        if cycle_day not in self.working_cycle_days:
             return False
+
+        hour = current_time.hour
         return self.workday_start_hour <= hour < self.workday_end_hour
 
     def is_available(self, resource_id: str, current_time: datetime) -> bool:
         """
-        Basic model: all resources share the same calendar.
-        You could extend this later with resource-specific calendars.
+        Basic: all resources share the same 2-week calendar.
         """
         if resource_id not in self.resources:
-            # unbekannte Ressource -> nicht verfügbar
-            return False
-
-        if not self.is_within_interval(current_time):
             return False
 
         return self.is_working_time(current_time)
-
-
