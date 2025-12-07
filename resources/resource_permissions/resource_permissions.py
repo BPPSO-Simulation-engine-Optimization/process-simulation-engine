@@ -7,11 +7,11 @@ from sklearn.cluster import KMeans
 from ordinor.org_model_miner import resource_features, group_discovery, group_profiling
 from ordinor.org_model_miner.models import base
 
-from resources.resource_features import ResourceActivityMatrix
-from resources.resource_clustering import ResourceClusterer
-from resources.group_profiling import GroupProfiler
-from resources.organizational_model import OrganizationalModel
-from resources.data_preparation import ResourceDataPreparation
+from resources.resource_permissions.resource_features import ResourceActivityMatrix
+from resources.resource_permissions.resource_clustering import ResourceClusterer
+from resources.resource_permissions.group_profiling import GroupProfiler
+from resources.resource_permissions.organizational_model import OrganizationalModel
+from resources.resource_permissions.data_preparation import ResourceDataPreparation
 
 logger = logging.getLogger(__name__)
 

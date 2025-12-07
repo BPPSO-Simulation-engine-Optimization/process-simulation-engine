@@ -17,7 +17,7 @@ from datetime import datetime
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from resources.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
+from resources.resource_permissions.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
 
 logger = logging.getLogger(__name__)
 
