@@ -52,7 +52,7 @@ class ResourceAvailabilityModel:
             return False
         return self.workday_start_hour <= hour < self.workday_end_hour
 
-    def is_available(self, resource_id: str, current_time: datetime) -> bool:
+    def is_available(self, resource_id: str, timestamp: datetime) -> bool:
         """
         Basic model: all resources share the same calendar.
         You could extend this later with resource-specific calendars.
@@ -61,8 +61,8 @@ class ResourceAvailabilityModel:
             # unbekannte Ressource -> nicht verfügbar
             return False
 
-        if not self.is_within_interval(current_time):
+        if not self.is_within_interval(timestamp):
             return False
 
-        return self.is_working_time(current_time)
+        return self.is_working_time(timestamp)
 
