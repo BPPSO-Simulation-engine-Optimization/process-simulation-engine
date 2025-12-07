@@ -228,6 +228,92 @@ def test_advanced_model(df):
     print(f"  Sample (first 10): {available[:10]}")
 
 
+def test_lifecycle_tracking(df):
+    """Test lifecycle-aware availability."""
+    print("\n" + "=" * 80)
+    print("TESTING LIFECYCLE-AWARE AVAILABILITY")
+    print("=" * 80)
+    
+    model = AdvancedResourceAvailabilityModel(
+        df, 
+        enable_pattern_mining=True,
+        enable_lifecycle_tracking=True
+    )
+    
+    if not model.enable_lifecycle_tracking:
+        print("[WARNING] Lifecycle tracking not enabled")
+        return
+    
+    if not model.resource_busy_periods:
+        print("[WARNING] No busy periods extracted (no lifecycle data)")
+        return
+    
+    print(f"\n[INFO] Resources with busy period data: {len(model.resource_busy_periods)}")
+    
+    # Pick resources with busy periods
+    resources_with_periods = [r for r in model.resources if r in model.resource_busy_periods and len(model.resource_busy_periods[r]) > 0]
+    
+    if not resources_with_periods:
+        print("[WARNING] No resources with busy periods found")
+        return
+    
+    # Test with top 3 resources that have busy periods
+    test_resources = resources_with_periods[:3]
+    
+    for i, resource in enumerate(test_resources, 1):
+        busy_periods = model.resource_busy_periods[resource]
+        
+        print(f"\n{'-' * 80}")
+        print(f"Resource {i}: {resource}")
+        print(f"{'-' * 80}")
+        print(f"Total busy periods: {len(busy_periods)}")
+        
+        # Show first few busy periods
+        print(f"\nFirst 3 busy periods:")
+        for j, (start, end, activity) in enumerate(busy_periods[:3]):
+            duration = (end - start).total_seconds() / 3600
+            print(f"  {j+1}. {activity[:40]:40s}: {start} to {end} ({duration:.2f}h)")
+        
+        # Get busy period stats
+        stats = model.get_busy_period_stats(resource)
+        print(f"\nBusy Period Statistics:")
+        print(f"  Total periods: {stats['total_busy_periods']}")
+        print(f"  Avg duration: {stats['avg_duration_hours']:.2f}h")
+        print(f"  Min duration: {stats['min_duration_hours']:.2f}h")
+        print(f"  Max duration: {stats['max_duration_hours']:.2f}h")
+        print(f"  Total busy time: {stats['total_busy_hours']:.2f}h")
+        
+        # Test availability during busy period
+        if busy_periods:
+            test_time = busy_periods[0][0] + timedelta(minutes=30)  # 30 min into first busy period
+            
+            print(f"\n[TEST] Testing availability at {test_time}:")
+            is_busy = model.is_resource_busy_at(resource, test_time)
+            current_activity = model.get_current_activity(resource, test_time)
+            is_available = model.is_available(resource, test_time)
+            probability = model.predict_availability_probability(resource, test_time)
+            
+            print(f"  Time: {test_time}")
+            print(f"  Is busy: {is_busy}")
+            print(f"  Current activity: {current_activity}")
+            print(f"  Available: {is_available}")
+            print(f"  Probability: {probability:.2%}")
+            
+            # Test workload
+            workload = model.get_resource_workload_at(resource, test_time, window_hours=2)
+            print(f"  Workload (±1h window): {workload} overlapping activities")
+            
+            # Test after busy period ends
+            test_time_after = busy_periods[0][1] + timedelta(minutes=10)
+            is_busy_after = model.is_resource_busy_at(resource, test_time_after)
+            is_available_after = model.is_available(resource, test_time_after)
+            
+            print(f"\n[TEST] Testing 10 min after busy period ends:")
+            print(f"  Time: {test_time_after}")
+            print(f"  Is busy: {is_busy_after}")
+            print(f"  Available: {is_available_after}")
+
+
 def main():
     """Main test function."""
     print("\nLoading XES log...")
@@ -244,6 +330,7 @@ def main():
     # Run tests
     test_basic_model(df)
     test_advanced_model(df)
+    test_lifecycle_tracking(df)
     
     print("\n" + "=" * 80)
     print("ALL TESTS COMPLETED")

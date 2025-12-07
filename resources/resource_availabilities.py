@@ -135,6 +135,7 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         workday_end_hour: int = 17,
         working_cycle_days: Optional[Set[int]] = None,
         enable_pattern_mining: bool = True,
+        enable_lifecycle_tracking: bool = True,
         min_activity_threshold: int = 10,
     ):
         """
@@ -147,6 +148,7 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             workday_end_hour: Default end hour
             working_cycle_days: Default working days
             enable_pattern_mining: Whether to mine resource patterns from data
+            enable_lifecycle_tracking: Whether to track busy periods from lifecycle data
             min_activity_threshold: Minimum activities required to mine patterns
         """
         super().__init__(
@@ -158,6 +160,7 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         )
         
         self.enable_pattern_mining = enable_pattern_mining
+        self.enable_lifecycle_tracking = enable_lifecycle_tracking
         self.min_activity_threshold = min_activity_threshold
         
         # Resource-specific patterns
@@ -165,9 +168,15 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         self.resource_clusters: Dict[str, int] = {}
         self.cluster_profiles: Dict[int, Dict] = {}
         
+        # Lifecycle-based busy periods: {resource: [(start_time, end_time, activity), ...]}
+        self.resource_busy_periods: Dict[str, List[Tuple[datetime, datetime, str]]] = {}
+        
         if enable_pattern_mining:
             self._mine_resource_patterns()
             self._cluster_resources()
+        
+        if enable_lifecycle_tracking and 'lifecycle:transition' in event_log_df.columns:
+            self._extract_busy_periods()
 
     def _mine_resource_patterns(self):
         """Mine work patterns for each resource from historical event log."""
@@ -231,6 +240,53 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             }
         
         print(f"Mined patterns for {len(self.resource_patterns)} resources")
+
+    def _extract_busy_periods(self):
+        """Extract periods when resources are busy from lifecycle transitions."""
+        print("\n[LIFECYCLE] Extracting busy periods from lifecycle data...")
+        
+        df = self.event_log_df.copy()
+        
+        # Group by case and activity
+        grouped = df.groupby(['case:concept:name', 'concept:name'])
+        
+        busy_count = 0
+        total_duration = 0
+        
+        for (case, activity), group in grouped:
+            group_sorted = group.sort_values('time:timestamp')
+            
+            # Find start and complete events
+            start_events = group_sorted[group_sorted['lifecycle:transition'].isin(['start', 'schedule'])]
+            complete_events = group_sorted[group_sorted['lifecycle:transition'] == 'complete']
+            
+            if not start_events.empty and not complete_events.empty:
+                # Take first start and last complete
+                start_time = start_events.iloc[0]['time:timestamp']
+                complete_time = complete_events.iloc[-1]['time:timestamp']
+                resource = group_sorted.iloc[0]['org:resource']
+                
+                # Ensure complete is after start
+                if pd.notna(start_time) and pd.notna(complete_time) and complete_time > start_time:
+                    if resource not in self.resource_busy_periods:
+                        self.resource_busy_periods[resource] = []
+                    
+                    self.resource_busy_periods[resource].append((start_time, complete_time, activity))
+                    busy_count += 1
+                    
+                    duration_hours = (complete_time - start_time).total_seconds() / 3600
+                    total_duration += duration_hours
+        
+        print(f"[SUCCESS] Extracted {busy_count:,} busy periods for {len(self.resource_busy_periods)} resources")
+        
+        if busy_count > 0:
+            avg_duration = total_duration / busy_count
+            print(f"[STATS] Average busy period duration: {avg_duration:.2f} hours")
+            
+            # Calculate statistics per resource
+            periods_per_resource = [len(periods) for periods in self.resource_busy_periods.values()]
+            avg_periods = sum(periods_per_resource) / len(periods_per_resource) if periods_per_resource else 0
+            print(f"[STATS] Average busy periods per resource: {avg_periods:.1f}")
 
     def _get_default_pattern(self) -> Dict:
         """Get default pattern for resources with insufficient data."""
@@ -327,10 +383,51 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             'num_resources': len(resources),
         }
 
+    def is_resource_busy_at(self, resource_id: str, check_time: datetime) -> bool:
+        """
+        Check if resource is currently busy (working on an activity).
+        
+        Uses lifecycle data to determine if resource is in the middle of an activity.
+        
+        Args:
+            resource_id: Resource identifier
+            check_time: Time to check
+            
+        Returns:
+            True if resource is busy at the given time
+        """
+        if not self.enable_lifecycle_tracking:
+            return False
+        
+        if resource_id not in self.resource_busy_periods:
+            return False
+        
+        # Convert check_time to timezone-aware if needed
+        check_ts = pd.Timestamp(check_time)
+        
+        for start_time, end_time, activity in self.resource_busy_periods[resource_id]:
+            start_ts = pd.Timestamp(start_time)
+            end_ts = pd.Timestamp(end_time)
+            
+            # Normalize timezones for comparison
+            if start_ts.tz is not None and check_ts.tz is None:
+                start_ts = start_ts.tz_localize(None)
+                end_ts = end_ts.tz_localize(None)
+            elif start_ts.tz is None and check_ts.tz is not None:
+                check_ts = check_ts.tz_localize(None)
+            
+            if start_ts <= check_ts <= end_ts:
+                return True
+        
+        return False
+
     def is_available(self, resource_id: str, current_time: datetime, 
                      use_probabilistic: bool = False) -> bool:
         """
         Check if a resource is available at the given time.
+        
+        Enhanced with lifecycle tracking: checks both time patterns AND
+        whether resource is currently busy with another activity.
         
         Args:
             resource_id: Resource identifier
@@ -338,13 +435,17 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             use_probabilistic: If True, uses probability-based availability
         
         Returns:
-            True if resource is available, False otherwise
+            True if resource is available (not busy and within working hours)
         """
         if resource_id not in self.resources:
             return False
         
         # Check holidays first
         if current_time.date() in self.nl_holidays:
+            return False
+        
+        # Check if resource is busy (lifecycle-based)
+        if self.enable_lifecycle_tracking and self.is_resource_busy_at(resource_id, current_time):
             return False
         
         # Use pattern mining if enabled
@@ -432,13 +533,129 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             'working_days_per_week': len(pattern['working_days']),
         }
 
+    def get_resource_workload_at(self, resource_id: str, check_time: datetime, 
+                                  window_hours: float = 1.0) -> int:
+        """
+        Calculate how many activities a resource is handling around a time.
+        
+        Args:
+            resource_id: Resource identifier
+            check_time: Center time to check
+            window_hours: Time window in hours (± from check_time)
+            
+        Returns:
+            Number of overlapping activities in the time window
+        """
+        if not self.enable_lifecycle_tracking:
+            return 0
+        
+        if resource_id not in self.resource_busy_periods:
+            return 0
+        
+        check_ts = pd.Timestamp(check_time)
+        window_start = check_ts - pd.Timedelta(hours=window_hours/2)
+        window_end = check_ts + pd.Timedelta(hours=window_hours/2)
+        
+        overlapping = 0
+        
+        for start_time, end_time, activity in self.resource_busy_periods[resource_id]:
+            start_ts = pd.Timestamp(start_time)
+            end_ts = pd.Timestamp(end_time)
+            
+            # Normalize timezones
+            if start_ts.tz is not None and check_ts.tz is None:
+                start_ts = start_ts.tz_localize(None)
+                end_ts = end_ts.tz_localize(None)
+            
+            # Check if busy period overlaps with window
+            if not (end_ts < window_start or start_ts > window_end):
+                overlapping += 1
+        
+        return overlapping
+
+    def get_current_activity(self, resource_id: str, check_time: datetime) -> Optional[str]:
+        """
+        Get the activity a resource is currently working on.
+        
+        Args:
+            resource_id: Resource identifier
+            check_time: Time to check
+            
+        Returns:
+            Activity name if resource is busy, None otherwise
+        """
+        if not self.enable_lifecycle_tracking:
+            return None
+        
+        if resource_id not in self.resource_busy_periods:
+            return None
+        
+        check_ts = pd.Timestamp(check_time)
+        
+        for start_time, end_time, activity in self.resource_busy_periods[resource_id]:
+            start_ts = pd.Timestamp(start_time)
+            end_ts = pd.Timestamp(end_time)
+            
+            # Normalize timezones
+            if start_ts.tz is not None and check_ts.tz is None:
+                start_ts = start_ts.tz_localize(None)
+                end_ts = end_ts.tz_localize(None)
+            elif start_ts.tz is None and check_ts.tz is not None:
+                check_ts = check_ts.tz_localize(None)
+            
+            if start_ts <= check_ts <= end_ts:
+                return activity
+        
+        return None
+
+    def get_busy_period_stats(self, resource_id: str) -> Dict:
+        """
+        Get statistics about resource busy periods.
+        
+        Args:
+            resource_id: Resource identifier
+            
+        Returns:
+            Dictionary with busy period statistics
+        """
+        if not self.enable_lifecycle_tracking or resource_id not in self.resource_busy_periods:
+            return {
+                'total_busy_periods': 0,
+                'avg_duration_hours': 0,
+                'total_busy_hours': 0,
+                'min_duration_hours': 0,
+                'max_duration_hours': 0
+            }
+        
+        periods = self.resource_busy_periods[resource_id]
+        durations = []
+        
+        for start_time, end_time, activity in periods:
+            duration_hours = (end_time - start_time).total_seconds() / 3600
+            durations.append(duration_hours)
+        
+        return {
+            'total_busy_periods': len(periods),
+            'avg_duration_hours': np.mean(durations) if durations else 0,
+            'total_busy_hours': sum(durations),
+            'min_duration_hours': min(durations) if durations else 0,
+            'max_duration_hours': max(durations) if durations else 0
+        }
+
     def predict_availability_probability(self, resource_id: str, 
                                         current_time: datetime) -> float:
         """
         Predict probability that a resource is available at given time.
         
+        Takes into account both temporal patterns and lifecycle state.
+        Returns 0 if resource is currently busy.
+        
         Returns value between 0 and 1.
         """
+        # If resource is busy, availability is 0
+        if self.enable_lifecycle_tracking and self.is_resource_busy_at(resource_id, current_time):
+            return 0.0
+        
         if resource_id not in self.resource_patterns:
             return 0.5  # Unknown, assume 50%
         

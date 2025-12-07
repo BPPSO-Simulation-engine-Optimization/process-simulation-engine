@@ -15,25 +15,25 @@
         │  (Interval-Based)  │         │  (Pattern Mining)      │
         └────────────────────┘         └────────────────────────┘
                     │                               │
-                    │                               ├─────────────────┐
-                    │                               │                 │
-                    ▼                               ▼                 ▼
-        ┌────────────────────┐         ┌────────────────┐  ┌────────────────┐
-        │  • 2-week cycles   │         │ Pattern Mining │  │   Clustering   │
-        │  • Fixed hours     │         │  • Work hours  │  │  • K-means     │
-        │  • Holiday check   │         │  • Peak hours  │  │  • 5 clusters  │
-        │  • Next available  │         │  • Intensity   │  │  • Profiles    │
-        └────────────────────┘         └────────────────┘  └────────────────┘
-                    │                               │                 │
-                    │                               ▼                 │
-                    │                   ┌────────────────────┐        │
-                    │                   │  Probabilistic     │        │
-                    │                   │  Predictions       │        │
-                    │                   │  • Hour prob       │        │
-                    │                   │  • Day prob        │        │
-                    │                   │  • Combined        │        │
-                    │                   └────────────────────┘        │
-                    │                               │                 │
+                    │                               ├─────────────────┬───────────────┐
+                    │                               │                 │               │
+                    ▼                               ▼                 ▼               ▼
+        ┌────────────────────┐         ┌────────────────┐  ┌────────────────┐  ┌──────────────┐
+        │  • 2-week cycles   │         │ Pattern Mining │  │   Clustering   │  │  Lifecycle   │
+        │  • Fixed hours     │         │  • Work hours  │  │  • K-means     │  │  Tracking    │
+        │  • Holiday check   │         │  • Peak hours  │  │  • 5 clusters  │  │  • Busy check│
+        │  • Next available  │         │  • Intensity   │  │  • Profiles    │  │  • Current   │
+        └────────────────────┘         └────────────────┘  └────────────────┘  │    activity  │
+                    │                               │                 │         └──────────────┘
+                    │                               ▼                 │               │
+                    │                   ┌────────────────────┐        │               │
+                    │                   │  Probabilistic     │        │               │
+                    │                   │  Predictions       │        │               │
+                    │                   │  • Hour prob       │◄───────────────────────┘
+                    │                   │  • Day prob        │  (0% if busy)
+                    │                   │  • Combined        │
+                    │                   └────────────────────┘
+                    │                               │
                     └───────────────┬───────────────┴─────────────────┘
                                     ▼
                         ┌────────────────────────┐
@@ -62,6 +62,7 @@ BPIC 2017 Dataset (XES)
 │  • time:timestamp               │
 │  • concept:name                 │
 │  • case:concept:name            │
+│  • lifecycle:transition (NEW)   │
 └────────┬────────────────────────┘
          │
          ├──────────────────────────┐
@@ -72,19 +73,19 @@ BPIC 2017 Dataset (XES)
 │  Configuration  │    │  Pattern Mining      │
 └────────┬────────┘    └──────────┬───────────┘
          │                        │
-         │                        ├─────────────┐
-         │                        │             │
-         ▼                        ▼             ▼
-┌─────────────────┐    ┌──────────────┐  ┌────────────┐
-│ Availability    │    │  Resource    │  │  Resource  │
-│ Checker         │    │  Patterns    │  │  Clusters  │
-└─────────────────┘    └──────────────┘  └────────────┘
-                              │
-                              ▼
-                    ┌──────────────────┐
-                    │  Probability     │
-                    │  Calculator      │
-                    └──────────────────┘
+         │                        ├─────────────┬──────────────┐
+         │                        │             │              │
+         ▼                        ▼             ▼              ▼
+┌─────────────────┐    ┌──────────────┐  ┌────────────┐  ┌──────────────┐
+│ Availability    │    │  Resource    │  │  Resource  │  │ Busy Period  │
+│ Checker         │    │  Patterns    │  │  Clusters  │  │ Extractor    │
+└─────────────────┘    └──────────────┘  └────────────┘  └──────┬───────┘
+                              │                                  │
+                              ▼                                  ▼
+                    ┌──────────────────┐              ┌──────────────────┐
+                    │  Probability     │◄─────────────│ Lifecycle Checker│
+                    │  Calculator      │  (blocks if  │ • is_busy_at()   │
+                    └──────────────────┘   busy)      └──────────────────┘
 ```
 
 ## Pattern Mining Process
@@ -92,10 +93,12 @@ BPIC 2017 Dataset (XES)
 ```
 For Each Resource:
     
-    1. EXTRACT ACTIVITIES
+    1. EXTRACT ACTIVITIES & LIFECYCLE EVENTS (NEW)
        ┌──────────────────────────┐
        │ Filter by org:resource   │
        │ Get all timestamps       │
+       │ Extract lifecycle states │
+       │ Match start→complete     │
        └──────────┬───────────────┘
                   │
                   ▼
@@ -113,6 +116,7 @@ For Each Resource:
        │ • Peak hours (top 25%)   │
        │ • Activity intensity     │
        │ • Working days (unique)  │
+       │ • Busy periods (NEW)     │
        └──────────┬───────────────┘
                   │
                   ▼
@@ -164,6 +168,10 @@ is_available(resource_id, current_time)
     ├─> Is resource in system?
     │   NO → Return False
     │   YES → Continue
+    │
+    ├─> [LIFECYCLE CHECK - NEW] Is resource busy with activity?
+    │   YES → Return False (probability = 0%)
+    │   NO → Continue
     │
     ├─> Is it a public holiday?
     │   YES → Return False
@@ -331,6 +339,13 @@ Result: 15.7% probability ✓
 │  Total Events:           1,202,267                     │
 │  Date Range:             396 days                      │
 │                                                        │
+│  Lifecycle Tracking (NEW):                             │
+│    States Found:         7 lifecycle states            │
+│    Busy Periods:         36,776 extracted              │
+│    Resources Tracked:    143 (96%)                     │
+│    Avg Busy Duration:    59.93 hours                   │
+│    Avg Periods/Resource: 257.2                         │
+│                                                        │
 │  Clusters Identified:    5                             │
 │  Patterns Mined:         149 (100%)                    │
 │                                                        │
@@ -342,6 +357,7 @@ Result: 15.7% probability ✓
 │    Activities:           148,404                       │
 │    Pattern:              24/7 (Automated)              │
 │    Cluster:              3 (High-Intensity)            │
+│    Busy Periods:         11,950 tracked                │
 │                                                        │
 └────────────────────────────────────────────────────────┘
 ```
@@ -373,11 +389,19 @@ ADVANCED MODEL:
   ✅ Available resources query
   ✅ Resource info API
   ✅ Timezone handling
+  ✅ Lifecycle-aware availability (NEW)
+  ✅ Busy period extraction (36,776 periods)
+  ✅ Real-time busy checking
+  ✅ Current activity detection
+  ✅ Workload calculation (overlapping activities)
+  ✅ Automatic double-booking prevention
 
 TESTING:
   ✅ Comprehensive test suite
   ✅ Basic model tests (13 cases)
   ✅ Advanced model tests
+  ✅ Lifecycle tracking tests (NEW)
+  ✅ Busy period validation (NEW)
   ✅ Integration examples
   ✅ All tests passing
 

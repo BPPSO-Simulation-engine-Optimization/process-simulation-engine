@@ -4,16 +4,18 @@ This folder contains two resource availability models for process simulation: a 
 
 ## 🚀 Quick Start
 
-### Installation
+### Set-Up
 
 ```bash
 pip install -r requirements.txt
 ```
-
+```bash
+.venv\Scripts\activate
+```
 ### Run Tests
 
 ```bash
-python test_resource_availabilities_new.py
+python test_resource_availabilities.py
 ```
 
 ### Run Examples
@@ -86,6 +88,9 @@ available = model.get_available_resources(check_time)
 - ✅ Peak hour detection
 - ✅ Activity intensity analysis
 - ✅ Workload statistics
+- ✅ **Lifecycle-aware availability** (NEW)
+- ✅ Real-time busy period tracking
+- ✅ Current activity detection
 
 ## 📊 BPIC 2017 Results
 
@@ -93,6 +98,9 @@ available = model.get_available_resources(check_time)
 - **Events**: 1,202,267
 - **Resources**: 149
 - **Date Range**: Jan 2016 - Feb 2017
+- **Lifecycle States**: 7 (complete, suspend, schedule, start, resume, ate_abort, withdraw)
+- **Busy Periods Extracted**: 36,776 (143 resources)
+- **Avg Busy Period**: 59.93 hours
 
 ### Key Findings
 
@@ -128,6 +136,9 @@ Does everything in Basic Model **PLUS**:
 5. **Clusters** resources with similar patterns
 6. **Predicts** availability probability (0-1)
 7. **Provides** workload statistics
+8. **Tracks lifecycle states** (start/complete events)
+9. **Identifies busy periods** when resources are occupied
+10. **Prevents double-booking** by checking current activities
 
 ## 💡 Use Cases
 
@@ -164,7 +175,8 @@ model = AdvancedResourceAvailabilityModel(
     event_log_df=df,
     interval_days=14,
     enable_pattern_mining=True,          # Enable mining
-    min_activity_threshold=10            # Min activities to mine
+    min_activity_threshold=10,           # Min activities to mine
+    enable_lifecycle_tracking=True       # Track busy periods (NEW)
 )
 ```
 
@@ -200,6 +212,12 @@ get_available_resources(current_time) -> list
 
 # Check with probability
 is_available(resource_id, current_time, use_probabilistic=True) -> bool
+
+# Lifecycle-aware methods (NEW)
+is_resource_busy_at(resource_id, current_time) -> bool
+get_current_activity(resource_id, current_time) -> str | None
+get_busy_period_stats(resource_id) -> dict
+get_resource_workload_at(resource_id, current_time, window_hours=1) -> int
 ```
 
 ## 🎓 Example Output
@@ -249,6 +267,14 @@ At Saturday 10:00 AM:
 - Can boost availability probability
 - Reflects actual work patterns
 
+### 5. Lifecycle-Aware Availability (NEW)
+- Extracts busy periods from lifecycle events
+- Tracks start/schedule → complete transitions
+- Prevents assigning resources already working
+- Returns 0% probability when resource is busy
+- Provides current activity information
+- Calculates workload (overlapping activities)
+
 ## 📚 Documentation
 
 For detailed information, see [RESOURCE_AVAILABILITY_DOCUMENTATION.md](RESOURCE_AVAILABILITY_DOCUMENTATION.md)
@@ -264,6 +290,10 @@ The test suite (`test_resource_availabilities_new.py`) covers:
 - ✅ Cluster analysis
 - ✅ Probability predictions
 - ✅ Next available time queries
+- ✅ Lifecycle busy period extraction
+- ✅ Real-time availability checking
+- ✅ Current activity detection
+- ✅ Workload calculation
 
 ## 🤝 Integration with Simulation
 
@@ -298,12 +328,14 @@ def assign_activity(activity, current_time):
 
 **Advanced Model**: AI-powered pattern mining with resource clustering
 - ✅ Data-driven insights
+- ✅ Lifecycle-aware tracking
+- ✅ Real-time busy detection
 - ✅ Individual resource profiles
 - ✅ Probabilistic predictions
 - ✅ Cluster analysis
 
-Both models support process simulation engines and can handle real-world datasets like BPIC 2017.
+
 
 ---
 
-**Questions?** Check the full documentation or run the examples!
+
