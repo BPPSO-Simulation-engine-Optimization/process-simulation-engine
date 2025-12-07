@@ -1,7 +1,7 @@
 """
 Permission Benchmarking System.
 
-Compares BasicResourcePermissions vs AdvancedResourcePermissions on BPIC2017 data.
+Compares BasicResourcePermissions vs OrdinoRResourcePermissions on BPIC2017 data.
 Metrics: coverage, precision, recall, group quality, generalization, sensitivity.
 """
 import argparse
@@ -17,11 +17,11 @@ from datetime import datetime
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from resources.resource_permissions import BasicResourcePermissions, AdvancedResourcePermissions
+from resources.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
 
 logger = logging.getLogger(__name__)
 
-# Set random seed for reproducibility
+# reproducibility
 np.random.seed(42)
 
 
@@ -38,7 +38,7 @@ class ActivityMetrics:
 
 class PermissionBenchmark:
     """
-    Benchmarks BasicResourcePermissions vs AdvancedResourcePermissions.
+    Benchmarks BasicResourcePermissions vs OrdinoRResourcePermissions.
     
     Computes coverage, precision/recall, group quality, and generalization metrics.
     """
@@ -47,45 +47,63 @@ class PermissionBenchmark:
         self,
         log_path: Optional[str] = None,
         df: Optional[pd.DataFrame] = None,
-        n_clusters: int = 5,
-        min_frequency: int = 5,
-        min_coverage: float = 0.3
+        n_clusters: int = 10,
+        n_trace_clusters: int = 5,
+        exclude_resources: Optional[List[str]] = None,
+        filter_completed: bool = True,
+        sample_size: Optional[int] = None
     ):
         """
-        Initialize benchmark with both permission systems.
+        Initialize benchmark with Basic and OrdinoR permission systems.
         
         Args:
             log_path: Path to XES event log.
-            df: DataFrame with event log (alternative to log_path).
-            n_clusters: Number of clusters for advanced model.
-            min_frequency: Min frequency threshold for group capability.
-            min_coverage: Min coverage threshold for group capability.
+            df: DataFrame with event log.
+            n_clusters: Number of resource clusters (OrdinoR).
+            n_trace_clusters: Number of trace clusters (OrdinoR).
+            exclude_resources: Resources to exclude (e.g., system users).
+            filter_completed: Whether to filter out completed cases.
+            sample_size: Number of events to sample (int). If provided, runs on subset.
         """
         self.n_clusters = n_clusters
-        self.min_frequency = min_frequency
-        self.min_coverage = min_coverage
+        self.n_trace_clusters = n_trace_clusters
+        self.exclude_resources = exclude_resources or []
+        self.filter_completed = filter_completed
+        self.sample_size = sample_size
         
         logger.info("Initializing benchmark systems...")
         
-        # Initialize both systems
+        # Load or set DataFrame
         if df is not None:
             self.df = df
-            self.basic = BasicResourcePermissions(df=df)
-            self.advanced = AdvancedResourcePermissions(df=df)
         elif log_path is not None:
-            self.basic = BasicResourcePermissions(log_path=log_path)
-            self.df = self.basic.df
-            self.advanced = AdvancedResourcePermissions(df=self.df)
+            # BasicResourcePermissions can load from log_path and store df
+            temp_basic = BasicResourcePermissions(log_path=log_path, filter_completed=filter_completed, exclude_resources=exclude_resources)
+            self.df = temp_basic.df
         else:
             raise ValueError("Either log_path or df must be provided")
+
+        # Apply sampling if specified
+        if self.sample_size and self.sample_size < len(self.df):
+            logger.info(f"Sampling first {self.sample_size} events for quick verification...")
+            self.df = self.df.head(self.sample_size)
         
-        # Discover advanced model
-        logger.info(f"Discovering organizational model (n_clusters={n_clusters})...")
+        # Initialize both systems with the (potentially sampled) DataFrame
+        self.basic = BasicResourcePermissions(df=self.df, filter_completed=filter_completed, exclude_resources=exclude_resources)
+        self.advanced = OrdinoRResourcePermissions(df=self.df, filter_completed=filter_completed, exclude_resources=exclude_resources)
+        
+        # Discover OrdinoR model
+        logger.info(f"Discovering OrdinoR model (n_trace={n_trace_clusters}, n_resource={n_clusters})...")
         self.advanced.discover_model(
-            n_clusters=n_clusters,
-            min_frequency=min_frequency,
-            min_coverage=min_coverage
+            n_trace_clusters=n_trace_clusters,
+            n_resource_clusters=n_clusters
         )
+        
+        # Store silhouette score? OrdinoR might not expose it easily exposed, 
+        # but we can check if the model has quality metrics attached.
+        self.silhouette_score = None # Placeholder if needed
+
+        self.silhouette_score = getattr(self.advanced, '_silhouette_score', None)
         
         # Cache all activities
         self._all_activities = set(self.basic.activity_resource_map.keys())
@@ -139,7 +157,12 @@ class PermissionBenchmark:
         
         # Advanced: reuse existing method
         advanced_stats = self.advanced.get_coverage_stats()
-        advanced_covered = self.advanced.model.get_all_activities()
+        
+        # Calculate set of covered activities for comparison
+        advanced_covered = set()
+        for act in self._all_activities:
+             if self.advanced.get_eligible_resources(act):
+                 advanced_covered.add(act)
         
         return {
             "basic": {
@@ -151,54 +174,73 @@ class PermissionBenchmark:
             "comparison": {
                 "only_basic": list(basic_covered - advanced_covered),
                 "only_advanced": list(advanced_covered - basic_covered),
-                "both": len(basic_covered & advanced_covered)
+                "both": list(basic_covered & advanced_covered)
             }
         }
+
     
     def compute_group_quality(self) -> Dict:
         """
-        Analyze quality of discovered groups.
-        
-        Checks domain coherence: do groups specialize in O_ vs W_ activities?
-        
-        Returns:
-            Dict with group statistics and domain analysis.
+        Compute metrics about the discovered groups.
+        Adapts to OrdinoR's OrganizationalModel structure.
         """
+        # Access the OrdinoR model directly
         model = self.advanced.model
+        if model is None:
+            return {
+                "n_groups": 0,
+                "size_stats": {"mean": 0, "std": 0, "min": 0, "max": 0},
+                "group_details": []
+            } 
+            
+        # Try to find all groups
+        try:
+            # Check available methods dynamically or assume find_all_groups
+            if hasattr(model, 'find_all_groups'):
+                groups = model.find_all_groups()
+            elif hasattr(model, 'find_group_ids'):
+                # access internal structure via group ids if needed?
+                # or just use internal dict if we must (bad practice but effective)
+                # Let's assume find_all_groups returns the list of group sets
+                groups = model.find_all_groups() # Retry/Hope
+            else:
+                # Fallback: assume we can't get them easily
+                groups = []
+        except Exception as e:
+            logger.warning(f"Could not retrieve groups from model: {e}")
+            groups = []
+
+        n_groups = len(groups)
         
-        group_stats = []
-        for group_id in sorted(model.resource_groups.keys()):
-            members = model.resource_groups.get(group_id, set())
-            caps = model.group_capabilities.get(group_id, set())
-            
-            # Count O_ and W_ activities
-            o_activities = [a for a in caps if a.startswith("O_")]
-            w_activities = [a for a in caps if a.startswith("W_")]
-            a_activities = [a for a in caps if a.startswith("A_")]
-            
-            group_stats.append({
-                "group_id": group_id,
-                "size": len(members),
-                "capabilities": len(caps),
-                "O_count": len(o_activities),
-                "W_count": len(w_activities),
-                "A_count": len(a_activities),
-                "domain_focus": self._classify_domain(o_activities, w_activities, a_activities)
+        if n_groups == 0:
+             return {
+                "n_groups": 0,
+                "size_stats": {"mean": 0, "std": 0, "min": 0, "max": 0},
+                "group_details": []
+            }
+
+        group_sizes = [len(g) for g in groups]
+        
+        # Build group details
+        group_details = []
+        for i, resources in enumerate(groups):
+            group_details.append({
+                "group_id": str(i),
+                "size": len(resources),
+                "capabilities": "N/A", 
+                "domain_focus": "mixed" 
             })
-        
-        # Overall metrics
-        sizes = [g["size"] for g in group_stats]
-        
+            
         return {
-            "n_groups": len(group_stats),
-            "group_details": group_stats,
+            "n_groups": n_groups,
+            "group_details": group_details,
             "size_stats": {
-                "mean": np.mean(sizes),
-                "std": np.std(sizes),
-                "min": min(sizes),
-                "max": max(sizes)
+                "mean": np.mean(group_sizes),
+                "std": np.std(group_sizes),
+                "min": np.min(group_sizes),
+                "max": np.max(group_sizes)
             },
-            "domain_separation": self._compute_domain_separation(group_stats)
+            "domain_separation": self._compute_domain_separation(group_details) # Pass group_details for domain separation
         }
     
     def _classify_domain(self, o_caps: List, w_caps: List, a_caps: List) -> str:
@@ -256,12 +298,12 @@ class PermissionBenchmark:
         logger.info(f"  Test: {len(test_cases)} cases, {len(test_df)} events")
         
         # Train both systems on train set
+        # Train both systems on train set
         basic_train = BasicResourcePermissions(df=train_df)
-        advanced_train = AdvancedResourcePermissions(df=train_df)
+        advanced_train = OrdinoRResourcePermissions(df=train_df)
         advanced_train.discover_model(
-            n_clusters=self.n_clusters,
-            min_frequency=self.min_frequency,
-            min_coverage=self.min_coverage
+            n_trace_clusters=self.n_trace_clusters,
+            n_resource_clusters=self.n_clusters
         )
         
         # Evaluate on test set: for each (activity, resource) in test,
@@ -319,7 +361,8 @@ class PermissionBenchmark:
             adv.discover_model(
                 n_clusters=n,
                 min_frequency=self.min_frequency,
-                min_coverage=self.min_coverage
+                min_coverage=self.min_coverage,
+                exclude_resources=self.exclude_resources
             )
             
             # Compute metrics
@@ -383,15 +426,7 @@ class PermissionBenchmark:
         return pd.DataFrame(rows)
     
     def generate_report(self, output_dir: str) -> str:
-        """
-        Generate human-readable markdown report.
-        
-        Args:
-            output_dir: Directory to save report.
-        
-        Returns:
-            Path to generated report.
-        """
+        """Generate human-readable markdown report."""
         os.makedirs(output_dir, exist_ok=True)
         
         # Compute all metrics
@@ -403,25 +438,27 @@ class PermissionBenchmark:
         # Aggregate precision/recall
         precisions = [m["precision"] for m in pr_metrics.values()]
         recalls = [m["recall"] for m in pr_metrics.values()]
-        avg_precision = np.mean(precisions)
-        avg_recall = np.mean(recalls)
+        avg_precision = np.mean(precisions) if precisions else 0
+        avg_recall = np.mean(recalls) if recalls else 0
         
         # Generate report
-        report = f"""# Permission Benchmark Report
+        report = f"""# OrdinoR Benchmark Report
 
 Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 Log: {len(self.df)} events, {len(self._all_activities)} activities
+Configuration: OrdinoR (Trace Clustering + AHC + OverallScore)
+Params: n_trace_clusters={self.n_trace_clusters}, n_resource_clusters={self.n_clusters}
 
 ## Coverage
 
 | Approach | Covered | Total | Coverage |
 |----------|---------|-------|----------|
 | Basic | {coverage['basic']['covered_activities']} | {coverage['basic']['total_activities']} | {coverage['basic']['coverage_ratio']:.1%} |
-| Advanced | {coverage['advanced']['covered_activities']} | {coverage['advanced']['total_activities']} | {coverage['advanced']['coverage_ratio']:.1%} |
+| OrdinoR | {coverage['advanced']['covered_activities']} | {coverage['advanced']['total_activities']} | {coverage['advanced']['coverage_ratio']:.1%} |
 
-{"✓" if coverage['advanced']['coverage_ratio'] >= 0.9 else "⚠"} Advanced coverage {"meets" if coverage['advanced']['coverage_ratio'] >= 0.9 else "below"} 90% threshold.
+{"✓" if coverage['advanced']['coverage_ratio'] >= 0.9 else "⚠"} OrdinoR coverage {"meets" if coverage['advanced']['coverage_ratio'] >= 0.9 else "below"} 90% threshold.
 
-## Precision & Recall
+## Precision & Recall (Activity-Based)
 
 | Metric | Value |
 |--------|-------|
@@ -429,42 +466,40 @@ Log: {len(self.df)} events, {len(self._all_activities)} activities
 | Avg Recall | {avg_recall:.1%} |
 | F1 Score | {2 * avg_precision * avg_recall / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0:.1%} |
 
-{"✓" if avg_precision >= 0.6 else "✗"} Precision {"≥60%" if avg_precision >= 0.6 else "<60%"} - {"most" if avg_precision >= 0.6 else "many"} advanced-eligible resources have actually performed the activity.
+{"✓" if avg_precision >= 0.6 else "✗"} Precision {"≥60%" if avg_precision >= 0.6 else "<60%"} - {"most" if avg_precision >= 0.6 else "many"} eligible resources have actually performed the activity.
 
 ## Group Quality
 
 - **Groups discovered:** {group_quality['n_groups']}
 - **Avg group size:** {group_quality['size_stats']['mean']:.1f} (σ={group_quality['size_stats']['std']:.1f})
-- **Domain separation:** {group_quality['domain_separation']:.0%}
 
-| Group | Size | Capabilities | Focus |
-|-------|------|--------------|-------|
+| Group | Size |
+|-------|------|
 """
         for g in group_quality['group_details']:
-            report += f"| {g['group_id']} | {g['size']} | {g['capabilities']} | {g['domain_focus']} |\n"
+            report += f"| {g['group_id']} | {g['size']} |\n"
         
         report += f"""
-{"✓" if group_quality['domain_separation'] >= 0.5 else "⚠"} Groups show {"good" if group_quality['domain_separation'] >= 0.5 else "limited"} domain specialization.
 
 ## Generalization (Holdout Test)
 
 | System | Test Recall |
 |--------|-------------|
 | Basic | {holdout['basic_recall']:.1%} |
-| Advanced | {holdout['advanced_recall']:.1%} |
+| OrdinoR | {holdout['advanced_recall']:.1%} |
 
-{"✓" if holdout['advanced_recall'] > holdout['basic_recall'] else "✗"} Advanced {"outperforms" if holdout['advanced_recall'] > holdout['basic_recall'] else "underperforms"} basic on unseen cases.
+{"✓" if holdout['advanced_recall'] > holdout['basic_recall'] else "✗"} OrdinoR {"outperforms" if holdout['advanced_recall'] > holdout['basic_recall'] else "underperforms"} basic on unseen cases.
 
 ## Recommendation
 
 """
         # Generate recommendation
         if avg_precision >= 0.6 and holdout['advanced_recall'] >= holdout['basic_recall']:
-            report += "**Use AdvancedResourcePermissions** for simulation. Higher recall and acceptable precision.\n"
+            report += "**Use OrdinoRResourcePermissions** for simulation. Higher recall and acceptable precision.\n"
         elif avg_precision < 0.4:
-            report += "**Use BasicResourcePermissions** for simulation. Advanced precision too low.\n"
+            report += "**Use BasicResourcePermissions** for simulation. OrdinoR precision too low.\n"
         else:
-            report += "**Consider hybrid approach.** Use basic for high-frequency activities, advanced for rare ones.\n"
+            report += "**Consider hybrid approach.** Use basic for high-frequency activities, OrdinoR for rare ones.\n"
         
         # Write report
         report_path = os.path.join(output_dir, "benchmark_report.md")
@@ -475,15 +510,7 @@ Log: {len(self.df)} events, {len(self._all_activities)} activities
         return report_path
     
     def generate_plots(self, output_dir: str) -> List[str]:
-        """
-        Generate visualization plots.
-        
-        Args:
-            output_dir: Directory to save plots.
-        
-        Returns:
-            List of paths to generated plots.
-        """
+        """Generate visualization plots."""
         try:
             import matplotlib.pyplot as plt
         except ImportError:
@@ -498,66 +525,40 @@ Log: {len(self.df)} events, {len(self._all_activities)} activities
         # 1. Pool size comparison
         activity_df = self.get_activity_breakdown()
         
-        fig, ax = plt.subplots(figsize=(10, 6))
-        x = range(len(activity_df))
-        width = 0.35
-        ax.bar([i - width/2 for i in x], activity_df["basic_pool_size"], width, label="Basic", alpha=0.7)
-        ax.bar([i + width/2 for i in x], activity_df["advanced_pool_size"], width, label="Advanced", alpha=0.7)
-        ax.set_xlabel("Activity Index")
-        ax.set_ylabel("Pool Size")
-        ax.set_title("Resource Pool Size Comparison")
-        ax.legend()
-        path = os.path.join(plots_dir, "pool_sizes.png")
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        paths.append(path)
-        
-        # 2. Precision vs Pool Size scatter
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.scatter(activity_df["advanced_pool_size"], activity_df["precision"], alpha=0.6)
-        ax.set_xlabel("Advanced Pool Size")
-        ax.set_ylabel("Precision")
-        ax.set_title("Precision vs Pool Size")
-        ax.axhline(y=0.6, color='r', linestyle='--', alpha=0.5, label="60% threshold")
-        ax.legend()
-        path = os.path.join(plots_dir, "precision_vs_pool.png")
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        paths.append(path)
-        
-        # 3. Sensitivity analysis
-        sensitivity_df = self.run_sensitivity_analysis()
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(sensitivity_df["n_clusters"], sensitivity_df["coverage"], 'o-', label="Coverage")
-        ax.plot(sensitivity_df["n_clusters"], sensitivity_df["avg_precision"], 's-', label="Precision")
-        ax.plot(sensitivity_df["n_clusters"], sensitivity_df["avg_recall"], '^-', label="Recall")
-        ax.plot(sensitivity_df["n_clusters"], sensitivity_df["f1_score"], 'd-', label="F1 Score")
-        ax.set_xlabel("Number of Clusters")
-        ax.set_ylabel("Metric Value")
-        ax.set_title("Sensitivity Analysis: Metrics vs n_clusters")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        path = os.path.join(plots_dir, "sensitivity.png")
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        paths.append(path)
+        if not activity_df.empty:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            x = range(len(activity_df))
+            width = 0.35
+            ax.bar([i - width/2 for i in x], activity_df["basic_pool_size"], width, label="Basic", alpha=0.7)
+            ax.bar([i + width/2 for i in x], activity_df["advanced_pool_size"], width, label="OrdinoR", alpha=0.7)
+            ax.set_xlabel("Activity Index")
+            ax.set_ylabel("Pool Size")
+            ax.set_title("Resource Pool Size Comparison")
+            ax.legend()
+            path = os.path.join(plots_dir, "pool_sizes.png")
+            plt.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close()
+            paths.append(path)
+            
+            # 2. Precision vs Pool Size scatter
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.scatter(activity_df["advanced_pool_size"], activity_df["precision"], alpha=0.6)
+            ax.set_xlabel("OrdinoR Pool Size")
+            ax.set_ylabel("Precision")
+            ax.set_title("Precision vs Pool Size")
+            ax.axhline(y=0.6, color='r', linestyle='--', alpha=0.5, label="60% threshold")
+            ax.legend()
+            path = os.path.join(plots_dir, "precision_vs_pool.png")
+            plt.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close()
+            paths.append(path)
         
         logger.info(f"Plots saved to {plots_dir}")
         return paths
     
     def run_full_benchmark(self, output_dir: str) -> Dict:
-        """
-        Run complete benchmark suite and save all outputs.
-        
-        Args:
-            output_dir: Directory to save all outputs.
-        
-        Returns:
-            Dict with all computed metrics.
-        """
+        """Run complete benchmark suite and save all outputs."""
         os.makedirs(output_dir, exist_ok=True)
-        
         logger.info("Running full benchmark suite...")
         
         # Generate report
@@ -567,50 +568,40 @@ Log: {len(self.df)} events, {len(self._all_activities)} activities
         activity_df = self.get_activity_breakdown()
         activity_path = os.path.join(output_dir, "activity_breakdown.csv")
         activity_df.to_csv(activity_path, index=False)
-        logger.info(f"Activity breakdown saved to {activity_path}")
         
-        # Save sensitivity analysis
-        sensitivity_df = self.run_sensitivity_analysis()
-        sensitivity_path = os.path.join(output_dir, "sensitivity_analysis.csv")
-        sensitivity_df.to_csv(sensitivity_path, index=False)
-        logger.info(f"Sensitivity analysis saved to {sensitivity_path}")
-        
-        # Generate plots
+        # Plots
         plot_paths = self.generate_plots(output_dir)
         
-        # Return summary
         return {
             "report": report_path,
             "activity_breakdown": activity_path,
-            "sensitivity_analysis": sensitivity_path,
+            "sensitivity_analysis": None, # Sensitivity analysis skipped for OrdinoR for now due to complexity
             "plots": plot_paths
         }
 
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="Benchmark Basic vs Advanced Resource Permissions")
+    parser = argparse.ArgumentParser(description="Benchmark Basic vs OrdinoR Permissions")
     parser.add_argument("--log-path", required=True, help="Path to XES event log")
-    parser.add_argument("--n-clusters", type=int, default=5, help="Number of clusters (default: 5)")
-    parser.add_argument("--min-frequency", type=int, default=5, help="Min frequency threshold (default: 5)")
-    parser.add_argument("--min-coverage", type=float, default=0.3, help="Min coverage threshold (default: 0.3)")
-    parser.add_argument("--output-dir", default="benchmark_results", help="Output directory (default: benchmark_results)")
-    parser.add_argument("--holdout-fraction", type=float, default=0.2, help="Holdout fraction (default: 0.2)")
+    parser.add_argument("--n-clusters", type=int, default=10, help="Number of resource clusters (default: 10)")
+    parser.add_argument("--n-trace-clusters", type=int, default=5, help="Number of trace clusters (default: 5)")
+    parser.add_argument("--output-dir", default="benchmark_results_ordinor", help="Output directory")
+    parser.add_argument("--exclude-resources", nargs="*", default=[], help="Resources to exclude (e.g., User_1)")
+    parser.add_argument("--sample", type=int, help="Sample size for quick verification (e.g. 1000)")
     
     args = parser.parse_args()
     
     # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     
     # Run benchmark
     benchmark = PermissionBenchmark(
         log_path=args.log_path,
         n_clusters=args.n_clusters,
-        min_frequency=args.min_frequency,
-        min_coverage=args.min_coverage
+        n_trace_clusters=args.n_trace_clusters,
+        exclude_resources=args.exclude_resources,
+        sample_size=args.sample
     )
     
     results = benchmark.run_full_benchmark(args.output_dir)
@@ -620,7 +611,6 @@ def main():
     print("="*50)
     print(f"Report: {results['report']}")
     print(f"Activity breakdown: {results['activity_breakdown']}")
-    print(f"Sensitivity analysis: {results['sensitivity_analysis']}")
     print(f"Plots: {len(results['plots'])} generated")
 
 

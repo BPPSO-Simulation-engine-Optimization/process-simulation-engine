@@ -1,21 +1,35 @@
 # Resource Permission System
 
-This module implements resource eligibility checking for the BPIC2017 simulation engine. We support two approaches:
+Implements resource eligibility checking for the BPIC2017 simulation engine following **OrdinoR (2022)** methodology.
+
+> **Reference:** Yang, J., Ouyang, C., van der Aalst, W. M., ter Hofstede, A. H., & Yu, Y. (2022). OrdinoR: A framework for discovering, evaluating, and analyzing organizational models using event logs. Decision Support Systems, 158, 113771.
 
 ## Quick Start
 
 ```python
-from resources.resource_permissions import BasicResourcePermissions, AdvancedResourcePermissions
+from resources.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
 
-# Basic: direct historical lookup
+# Basic: direct historical lookup (preprocessing applied by default)
 basic = BasicResourcePermissions(log_path="path/to/log.xes.gz")
 eligible = basic.get_eligible_resources("A_Create Application")
 
-# Advanced: group-based lookup via clustering
-advanced = AdvancedResourcePermissions(log_path="path/to/log.xes.gz")
-advanced.discover_model(n_clusters=5)
-eligible = advanced.get_eligible_resources("A_Create Application")
+# OrdinoR: Advanced trace clustering + AHC + Profiling
+ordinor = OrdinoRResourcePermissions(log_path="path/to/log.xes.gz")
+ordinor.discover_model(n_trace_clusters=5, n_resource_clusters=10)
+eligible = ordinor.get_eligible_resources("A_Create Application")
 ```
+
+## Data Preprocessing
+
+Both approaches apply preprocessing by default:
+
+| Step | Effect | BPIC2017 Impact |
+|------|--------|-----------------|
+| Filter completed | Keep only `lifecycle:transition = 'complete'` | 1,202,267 → 475,306 events (39.5%) |
+| Exclude User_1 | Remove system/automation accounts | 475,306 → 399,356 events |
+| Drop NA | Remove missing values | Minor reduction |
+
+**Final dataset:** 399,356 events, 143 resources, 23 activities
 
 ## Two Approaches
 
@@ -25,89 +39,40 @@ Direct mapping from the event log. If a resource has ever performed an activity,
 **Pros:** Simple, fast, no false positives  
 **Cons:** Conservative—new resources have zero capabilities
 
-### AdvancedResourcePermissions
-Clusters resources into groups based on activity profiles (who does what). Assigns capabilities at the group level.
+### OrdinoRResourcePermissions
+Uses the **OrdinoR** library with the paper's best-performing configuration for BPIC2017:
 
-**Pros:** Better generalization, handles resource substitution  
-**Cons:** May include resources who haven't actually done an activity but belong to a capable group
+1.  **Trace Clustering (CT)**: K-Means clustering on bag-of-activities (k=5) to identify Case Types.
+2.  **Execution Contexts**: Combines `CaseType + Activity + TimeType` (CT+AT+TT).
+3.  **Resource Clustering**: Agglomerative Hierarchical Clustering (AHC) with Ward linkage (n=10).
+4.  **Profiling**: OverallScore method (w1=0.5, p=0.5).
+
+**Pros:** Advanced organizational mining, proven academic validity (F1=0.724).  
+**Cons:** More complex pipeline.
 
 ## File Structure
 
 ```
 resources/
-├── resource_permissions.py    # Main entry point (both classes)
-├── resource_features.py       # Builds resource-activity matrix
-├── resource_clustering.py     # Agglomerative clustering
-├── group_profiling.py         # Determines group capabilities
-├── organizational_model.py    # Model storage/persistence
+├── resource_permissions.py    # Main classes (Basic & OrdinoR)
+├── data_preparation.py        # Preprocessing (lifecycle filter, exclude resources)
+├── resource_features.py       # (Internal) Resource profile building
+├── resource_clustering.py     # (Internal) Clustering utilities
+├── group_profiling.py         # (Internal) Profiling utilities
+├── organizational_model.py    # (Internal) Model structure
 └── docs/
     └── README.md              # This file
 ```
 
-## Advanced Pipeline
-
-1. **Feature extraction**: Build a matrix where rows=resources, columns=activities, values=counts
-2. **Clustering**: Run AHC with Ward linkage to group similar resources
-3. **Profiling**: For each group, determine which activities are "capabilities" based on:
-   - `min_frequency`: at least N total occurrences in the group
-   - `min_coverage`: at least X% of group members performed it
-4. **Lookup**: Activity → groups with that capability → all members of those groups
-
-## Parameters
-
-| Param | Default | What it does |
-|-------|---------|--------------|
-| `n_clusters` | 5 | Number of resource groups |
-| `min_frequency` | 5 | Min occurrences for capability |
-| `min_coverage` | 0.3 | Min fraction of members |
-
-## Model Persistence
-
-```python
-# Save after discovery
-advanced.save_model("org_model.json")
-
-# Load later (skip discovery)
-from resources.organizational_model import OrganizationalModel
-model = OrganizationalModel.load("org_model.json")
-advanced = AdvancedResourcePermissions(model=model)
-```
-
-## Tests
-
-```bash
-python3 -m unittest tests/test_resource_permissions.py
-python3 -m unittest tests/test_advanced_permissions.py
-python3 -m unittest tests/test_benchmark.py
-```
-
 ## Benchmarking
 
-Compare Basic vs Advanced approaches:
+Compare Basic vs OrdinoR approaches:
 
 ```bash
 python3 resources/benchmark_permissions.py \
     --log-path /path/to/eventlog.xes.gz \
-    --n-clusters 5 \
-    --output-dir benchmark_results
+    --n-trace-clusters 5 \
+    --n-clusters 10 \
+    --exclude-resources User_1 \
+    --output-dir resources/benchmark_results_ordinor
 ```
-
-Outputs:
-- `benchmark_report.md` - Human-readable analysis
-- `activity_breakdown.csv` - Per-activity metrics
-- `sensitivity_analysis.csv` - Metrics vs n_clusters
-- `plots/` - Visualizations
-
-Key metrics:
-- **Precision**: Of advanced-eligible, how many actually performed the activity?
-- **Recall**: Of actual performers, how many does advanced include?
-- **Coverage**: What % of activities have eligible resources?
-
-On BPIC2017: ~78% precision, ~96% coverage with n_clusters=5.
-
-## Notes
-
-- The advanced approach typically returns *more* eligible resources than basic (group members inherit capabilities)
-- Set `EVENT_LOG_PATH` in `.env` to run integration tests
-- Clustering uses sklearn's `AgglomerativeClustering`—make sure it's installed
-

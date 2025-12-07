@@ -1,13 +1,17 @@
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Any
 import pandas as pd
 import pm4py
 import os
 import logging
+from sklearn.cluster import KMeans
+from ordinor.org_model_miner import resource_features, group_discovery, group_profiling
+from ordinor.org_model_miner.models import base
 
 from resources.resource_features import ResourceActivityMatrix
 from resources.resource_clustering import ResourceClusterer
 from resources.group_profiling import GroupProfiler
 from resources.organizational_model import OrganizationalModel
+from resources.data_preparation import ResourceDataPreparation
 
 logger = logging.getLogger(__name__)
 
@@ -16,42 +20,63 @@ class BasicResourcePermissions:
     """
     Manages resource permissions based on historical event log data.
     Maps activities to the set of resources that have performed them.
+    
+    By default, preprocesses data to include only completed activities
+    following OrdinoR (2022) methodology.
     """
 
-    def __init__(self, log_path: Optional[str] = None, df: Optional[pd.DataFrame] = None):
+    def __init__(
+        self,
+        log_path: Optional[str] = None,
+        df: Optional[pd.DataFrame] = None,
+        filter_completed: bool = True,
+        exclude_resources: Optional[List[str]] = None
+    ):
         """
         Initialize the ResourcePermissions model.
 
         Args:
             log_path: Path to the XES/CSV event log file.
             df: Existing pandas DataFrame containing the event log.
+            filter_completed: If True, only include 'complete' lifecycle events.
+            exclude_resources: Resources to exclude (e.g., ['User_1'] for system users).
         
         Raises:
             ValueError: If neither log_path nor df is provided.
         """
         self.activity_resource_map: Dict[str, Set[str]] = {}
+        self.filter_completed = filter_completed
+        self.exclude_resources = exclude_resources or []
 
         if df is not None:
             self.df = df
+            # Apply preprocessing if filtering is enabled and df hasn't been preprocessed
+            if filter_completed or exclude_resources:
+                self.df = self._preprocess(df)
         elif log_path is not None:
-            self.df = self._load_log(log_path)
+            self.df = self._load_and_preprocess(log_path)
         else:
             raise ValueError("Either 'log_path' or 'df' must be provided.")
 
         self._build_mapping()
 
-    def _load_log(self, path: str) -> pd.DataFrame:
-        """
-        Loads the event log from the given path.
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Event log not found at: {path}")
-        try:
-            log = pm4py.read_xes(path, return_legacy_log_object=True)
-            df = pm4py.convert_to_dataframe(log)
-            return df
-        except Exception as e:
-            raise RuntimeError(f"Failed to load event log: {e}")
+    def _load_and_preprocess(self, path: str) -> pd.DataFrame:
+        """Load and preprocess event log."""
+        prep = ResourceDataPreparation(log_path=path)
+        return prep.prepare(
+            filter_completed=self.filter_completed,
+            exclude_resources=self.exclude_resources if self.exclude_resources else None,
+            drop_na=True
+        )
+    
+    def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply preprocessing to existing DataFrame."""
+        prep = ResourceDataPreparation(df=df)
+        return prep.prepare(
+            filter_completed=self.filter_completed,
+            exclude_resources=self.exclude_resources if self.exclude_resources else None,
+            drop_na=True
+        )
 
     def _build_mapping(self):
         """
@@ -86,174 +111,243 @@ class BasicResourcePermissions:
         return list(resources)
 
 
-class AdvancedResourcePermissions:
+class OrdinoRResourcePermissions:
     """
-    Advanced resource permission system using organizational model mining.
+    Advanced resource permission system using OrdinoR library (Yang et al. 2022).
     
-    Discovers resource groups (roles) via clustering and assigns permissions
-    at the group level based on activity profiles.
-    Source - (2022) OrdinoR: A Framework for Discovering, Evaluating, and Analyzing Organizational Models using Event Logs
+    Implements the best performing configuration for BPIC2017:
+    Resource permissions using OrdinoR library with Trace Clustering.
     """
     
-    def __init__(
-        self,
-        log_path: Optional[str] = None,
-        df: Optional[pd.DataFrame] = None,
-        model: Optional[OrganizationalModel] = None
-    ):
+    def __init__(self, log_path: str = None, df: pd.DataFrame = None, filter_completed: bool = True, exclude_resources: List[str] = None):
         """
-        Initialize the advanced permissions system.
+        Initialize OrdinoR permissions.
         
         Args:
-            log_path: Path to the XES event log file.
-            df: Existing pandas DataFrame containing the event log.
-            model: Pre-built OrganizationalModel (if provided, skips discovery).
-        
-        Raises:
-            ValueError: If neither log_path, df, nor model is provided.
+            log_path: Path to event log XES/CS.
+            df: Optional Pandas DataFrame (if log_path not provided).
+            filter_completed: Whether to keep only completed events.
+            exclude_resources: list of resources to exclude.
         """
-        self.df: Optional[pd.DataFrame] = None
-        self.model: Optional[OrganizationalModel] = model
-        self._all_activities: Set[str] = set()
+        self.model = None
+        self.log_path = log_path
+        self.df = None
         
-        if model is not None:
-            # Use provided model directly
-            logger.info("Using pre-built organizational model")
-        elif df is not None:
-            self.df = df
-            self._extract_all_activities()
+        self.filter_completed = filter_completed
+        self.exclude_resources = exclude_resources or []
+        
+        # Load and preprocess
+        if df is not None:
+             self.df = self._preprocess(df)
         elif log_path is not None:
-            self.df = self._load_log(log_path)
-            self._extract_all_activities()
+             prep = ResourceDataPreparation(log_path=log_path)
+             self.df = prep.prepare(
+                 filter_completed=filter_completed,
+                 exclude_resources=self.exclude_resources,
+                 drop_na=True
+             )
         else:
-            raise ValueError("Either 'log_path', 'df', or 'model' must be provided.")
-    
-    def _load_log(self, path: str) -> pd.DataFrame:
-        """Load event log from XES file."""
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Event log not found at: {path}")
-        try:
-            log = pm4py.read_xes(path, return_legacy_log_object=True)
-            df = pm4py.convert_to_dataframe(log)
-            return df
-        except Exception as e:
-            raise RuntimeError(f"Failed to load event log: {e}")
-    
-    def _extract_all_activities(self) -> None:
-        """Extract all unique activities from the log."""
-        if self.df is not None and "concept:name" in self.df.columns:
-            self._all_activities = set(self.df["concept:name"].dropna().unique())
-    
-    def discover_model(
-        self,
-        n_clusters: int = 5,
-        min_frequency: int = 5,
-        min_coverage: float = 0.3
-    ) -> OrganizationalModel:
+             raise ValueError("Either log_path or df must be provided to OrdinoRResourcePermissions")
+
+    def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply preprocessing manually."""
+        df_out = df.copy()
+        if self.filter_completed and 'lifecycle:transition' in df_out.columns:
+            df_out = df_out[df_out['lifecycle:transition'].str.lower() == 'complete']
+            
+        if self.exclude_resources:
+            df_out = df_out[~df_out['org:resource'].isin(self.exclude_resources)]
+            
+        # Ensure critical columns exist and are not null
+        cols = ['org:resource', 'concept:name'] 
+        if all(c in df_out.columns for c in cols):
+             df_out = df_out.dropna(subset=cols)
+             
+        return df_out
+
+    def discover_model(self, n_trace_clusters: int = 5, n_resource_clusters: int = 10, w1: float = 0.5, p: float = 0.5):
         """
-        Run the full organizational model discovery pipeline.
+        Discover organizational model using OrdinoR pipeline.
         
         Args:
-            n_clusters: Number of resource groups to discover.
-            min_frequency: Minimum activity occurrences for group capability.
-            min_coverage: Minimum fraction of group members for capability.
-        
-        Returns:
-            Discovered OrganizationalModel.
-        
-        Raises:
-            ValueError: If no DataFrame is available for discovery.
+            n_trace_clusters: Number of case types to discover (K-Means).
+            n_resource_clusters: Number of resource groups to discover (AHC).
+            w1: Profiling weight for Relative Stake (default 0.5).
+            p: Profiling threshold (default 0.5).
         """
-        if self.df is None:
-            raise ValueError("No DataFrame available. Initialize with log_path or df.")
+        logger.info("Starting OrdinoR discovery pipeline...")
         
-        logger.info(f"Starting model discovery: n_clusters={n_clusters}, "
-                   f"min_frequency={min_frequency}, min_coverage={min_coverage}")
+        # 1. Trace Clustering
+        logger.info(f"Running Trace Clustering (k={n_trace_clusters})...")
+        df_clustered = self._apply_trace_clustering(self.df, n_clusters=n_trace_clusters)
         
-        # Step 1: Build feature matrix
-        matrix_builder = ResourceActivityMatrix(self.df)
-        matrix = matrix_builder.build_matrix()
-        resource_ids = matrix_builder.get_resource_ids()
+        # 2. Construct Execution Contexts (CT + AT + TT)
+        logger.info("Constructing Execution Contexts (CT+AT+TT)...")
         
-        # Step 2: Cluster resources
-        clusterer = ResourceClusterer(n_clusters=n_clusters)
-        resource_to_group = clusterer.cluster(matrix.values, resource_ids)
+        # OrdinoR direct_count expects:
+        # const.CASE_TYPE -> 'case_type'
+        # const.ACTIVITY_TYPE -> 'activity_type'
+        # const.TIME_TYPE -> 'time_type'
+        # const.RESOURCE -> 'org:resource'
         
-        # Step 3: Profile groups
-        profiler = GroupProfiler(min_frequency=min_frequency, min_coverage=min_coverage)
-        group_capabilities = profiler.profile_groups(matrix, resource_to_group)
+        rl_df = df_clustered.copy()
         
-        # Step 4: Build organizational model
-        resource_groups = clusterer.get_group_members(resource_to_group)
+        # Map CT (Case Type)
+        rl_df['case_type'] = rl_df['case:cluster'].astype(str)
         
-        self.model = OrganizationalModel(
-            resource_groups={k: set(v) for k, v in resource_groups.items()},
-            group_capabilities=group_capabilities,
-            resource_to_group=resource_to_group
+        # Map AT (Activity Type)
+        rl_df['activity_type'] = rl_df['concept:name']
+        
+        # Map TT (Time Type)
+        if 'time:timestamp' in rl_df.columns:
+            rl_df['time:timestamp'] = pd.to_datetime(rl_df['time:timestamp'], utc=True)
+            rl_df['time_type'] = rl_df['time:timestamp'].dt.day_name()
+        else:
+             logger.warning("No timestamp found, using default time type")
+             rl_df['time_type'] = "AnyTime"
+        
+        # 3. Resource Profiling
+        logger.info("Building Resource Profiles...")
+        profiles = resource_features.direct_count(rl_df)
+        
+        # 4. Resource Clustering (AHC)
+        logger.info(f"Clustering Resources (AHC, n={n_resource_clusters})...")
+        groups = group_discovery.ahc(
+            profiles, 
+            n_groups=n_resource_clusters, 
+            method='ward', 
+            metric='euclidean'
         )
         
-        # Log summary
-        logger.info(self.model.summary())
+        # 5. Group Profiling (OverallScore)
+        logger.info(f"Profiling Groups (OverallScore, w1={w1}, p={p})...")
+        self.model = group_profiling.overall_score(
+            groups, 
+            rl_df, 
+            w1=w1, 
+            p=p,
+            auto_search=False
+        )
         
-        # Log coverage stats
-        if self._all_activities:
-            stats = self.model.get_coverage_stats(self._all_activities)
-            logger.info(f"Activity coverage: {stats['coverage_ratio']:.1%} "
-                       f"({stats['covered_activities']}/{stats['total_activities']})")
+        # Clear cache whenever model changes
+        self._eligible_cache = {}
         
-        return self.model
-    
-    def get_eligible_resources(self, activity_name: str) -> List[str]:
+        
+        logger.info(f"Discovery complete. Model has {len(groups)} groups.")
+
+    def _apply_trace_clustering(self, df: pd.DataFrame, n_clusters: int) -> pd.DataFrame:
         """
-        Get all resources eligible to perform the given activity.
+        Apply K-Means clustering on traces based on activity occurrence (Bag-of-Activities).
+        Adds 'case:cluster' column to the DataFrame.
+        """
+        # Create Bag-of-Activities matrix
+        # Rows: Case IDs, Columns: Activities, Values: Count
+        case_id_col = "case:concept:name"
+        activity_col = "concept:name"
         
-        Uses group-based lookup: returns all members of groups that have
-        this activity as a capability.
+        if case_id_col not in df.columns:
+            # Fallback if case id is different or index
+            logger.warning("Standard case ID column not found. Using numeric index as cases?")
+            # This would probably be wrong for process mining. Assuming standard XES.
+            raise ValueError(f"Column {case_id_col} required for trace clustering")
+
+        # Pivot table (fill_value=0)
+        matrix = pd.pivot_table(
+            df, 
+            index=case_id_col, 
+            columns=activity_col, 
+            aggfunc='size', 
+            fill_value=0
+        )
         
-        Args:
-            activity_name: The name of the activity.
+        # K-Means
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(matrix)
         
-        Returns:
-            List of resource IDs. Empty list if no groups handle this activity.
+        # Map clusters back to DataFrame
+        cluster_map = dict(zip(matrix.index, clusters))
         
-        Raises:
-            ValueError: If no model has been discovered or loaded.
+        df_out = df.copy()
+        df_out['case:cluster'] = df_out[case_id_col].map(cluster_map)
+        
+        return df_out
+
+    def get_eligible_resources(self, activity: str) -> List[str]:
+        """
+        Get resources eligible for a given activity.
+        
+        Since OrdinoR model stores 'Contexts' (CaseType, Activity, TimeType),
+        we return resources that have capability for ANY context involving this activity.
         """
         if self.model is None:
-            raise ValueError("No organizational model available. Call discover_model() first.")
+            logger.warning("Model not discovered yet!")
+            return []
+            
+        # Check cache
+        if hasattr(self, '_eligible_cache') and activity in self._eligible_cache:
+            return self._eligible_cache[activity]
         
-        groups = self.model.get_groups_for_activity(activity_name)
-        members = self.model.get_members_of_groups(groups)
-        return list(members)
-    
-    def save_model(self, path: str) -> None:
-        """
-        Save the discovered model to a JSON file.
+        # OrdinoR Execution Context is a tuple: (case_type, activity_type, time_type)
+        # We want to find all contexts where activity matches
         
-        Args:
-            path: File path to save to.
-        """
-        if self.model is None:
-            raise ValueError("No model to save. Call discover_model() first.")
-        self.model.save(path)
-    
-    def load_model(self, path: str) -> None:
-        """
-        Load a model from a JSON file.
+        all_contexts = self.model.find_all_execution_contexts()
         
-        Args:
-            path: File path to load from.
-        """
-        self.model = OrganizationalModel.load(path)
-    
-    def get_coverage_stats(self) -> Dict:
-        """
-        Get coverage statistics for the current model.
+        matching_contexts = []
+        for ctx in all_contexts:
+            # OrdinoR uses tuples for contexts: (case_type, activity_type, time_type)
+            # activity_type is at index 1
+            if isinstance(ctx, tuple):
+                if len(ctx) >= 2 and ctx[1] == activity:
+                    matching_contexts.append(ctx)
+            elif isinstance(ctx, str):
+                # Fallback if OrdinoR ever stringifies keys (unlikely in this ver)
+                if activity in ctx:
+                    matching_contexts.append(ctx)
         
-        Returns:
-            Dict with coverage metrics.
+        eligible_resources = set()
+        for ctx in matching_contexts:
+            group_ids = self.model.find_candidate_groups(ctx)
+            for gid in group_ids:
+                # OrdinoR might return the group (set of resources) or an ID
+                if isinstance(gid, (set, frozenset, list, tuple)):
+                    eligible_resources.update(gid)
+                else:
+                    try:
+                        members = self.model.find_group_members(gid)
+                        eligible_resources.update(members)
+                    except KeyError:
+                        # Fallback or strict error? 
+                        # If gid is not in _mem, maybe it's invalid ID?
+                        logger.warning(f"Group ID {gid} not found in model members.")
+        
+        # Initialize cache if needed (e.g. if accessed before discovery, though unlikely)
+        if not hasattr(self, '_eligible_cache'):
+            self._eligible_cache = {}
+            
+        result = list(eligible_resources)
+        self._eligible_cache[activity] = result
+        return result
+
+    def get_coverage_stats(self) -> Dict[str, Any]:
         """
-        if self.model is None:
-            raise ValueError("No model available.")
-        return self.model.get_coverage_stats(self._all_activities)
+        Compute coverage statistics.
+        Returns dict with covered_activities, total_activities, coverage_ratio.
+        """
+        if self.df is None:
+             return {"covered_activities": 0, "total_activities": 0, "coverage_ratio": 0.0}
+             
+        # Use simple unique check
+        activities = self.df['concept:name'].unique()
+        total = len(activities)
+        covered = 0
+        
+        for act in activities:
+            if self.get_eligible_resources(act):
+                covered += 1
+                
+        return {
+            "covered_activities": covered,
+            "total_activities": total,
+            "coverage_ratio": covered / total if total > 0 else 0.0
+        }
 
