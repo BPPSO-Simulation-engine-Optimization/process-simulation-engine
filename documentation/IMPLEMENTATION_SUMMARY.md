@@ -2,10 +2,6 @@
 
 ## Assignment 1.5: Resource Availabilities for BPIC 2017
 
-**Author**: AI-Generated Solution  
-**Date**: December 2025  
-**Dataset**: BPI Challenge 2017  
-
 ---
 
 ## 📋 Overview
