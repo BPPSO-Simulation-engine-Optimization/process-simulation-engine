@@ -1,12 +1,12 @@
 import pandas as pd
 from datetime import datetime, timedelta
-
+import holidays  # neu
 
 class ResourceAvailabilityModel:
     """
-    Basic model for resource availabilities:
-    - 2-week interval as repeating calendar pattern (14 days)
-    - All resources share the same working pattern (e.g. Mon–Fri, 08:00–17:00 in both weeks)
+    Advanced model for resource availabilities:
+    - Mon–Fri, 08:00–17:00
+    - Plus Dutch public holidays as non-working days
     """
 
     def __init__(
@@ -22,52 +22,53 @@ class ResourceAvailabilityModel:
         self.workday_start_hour = workday_start_hour
         self.workday_end_hour = workday_end_hour
 
-        # Default: Mon–Fri in both weeks
         if working_cycle_days is None:
             working_cycle_days = {0, 1, 2, 3, 4, 7, 8, 9, 10, 11}
         self.working_cycle_days = working_cycle_days
 
-        # Ensure proper datetime type
         if not pd.api.types.is_datetime64_any_dtype(self.event_log_df["time:timestamp"]):
             self.event_log_df["time:timestamp"] = pd.to_datetime(
                 self.event_log_df["time:timestamp"], errors="coerce"
             )
 
-        # Use the Monday of the week of the first timestamp as cycle anchor
         first_ts = self.event_log_df["time:timestamp"].min()
         first_date = first_ts.normalize().date()
         monday_date = first_date - timedelta(days=first_ts.weekday())  # Mon=0
-
         self.cycle_start_date = monday_date
 
-        # Resources in the log
+        # Dutch public holidays (for a range of years, z.B. 2015–2030)
+        years = range(self.cycle_start_date.year, self.cycle_start_date.year + 20)
+        self.nl_holidays = set(holidays.Netherlands(years=years).keys())
+
         self.resources = sorted(self.event_log_df["org:resource"].dropna().unique())
 
     def _cycle_day_index(self, current_time: datetime) -> int:
-        """
-        Map current_time to a day index in the 2-week cycle [0..interval_days-1].
-        The cycle repeats infinitely.
-        """
         delta_days = (current_time.date() - self.cycle_start_date).days
         return delta_days % self.interval_days
 
     def is_working_time(self, current_time: datetime) -> bool:
         """
-        Check if current_time falls on a working day in the cycle
-        and within the working hours.
+        Check if current_time falls on:
+        - a working day in the 2-week cycle
+        - within the working hours
+        - and is not a Dutch public holiday
         """
+        current_date = current_time.date()
+
+        # 1) Feiertag in NL -> nie arbeiten
+        if current_date in self.nl_holidays:
+            return False
+
+        # 2) 2-Wochen-Muster (Mo–Fr in beiden Wochen)
         cycle_day = self._cycle_day_index(current_time)
         if cycle_day not in self.working_cycle_days:
             return False
 
+        # 3) Uhrzeit
         hour = current_time.hour
         return self.workday_start_hour <= hour < self.workday_end_hour
 
     def is_available(self, resource_id: str, current_time: datetime) -> bool:
-        """
-        Basic: all resources share the same 2-week calendar.
-        """
         if resource_id not in self.resources:
             return False
-
         return self.is_working_time(current_time)

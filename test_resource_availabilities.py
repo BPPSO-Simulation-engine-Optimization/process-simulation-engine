@@ -98,6 +98,10 @@ def main():
     future_weekday_07 = datetime(2026, 5, 19, 7, 0)  # Tuesday
     print_check(model, example_resource, "Future Weekday 07:00 (expected False)", future_weekday_07)
 
+    kings_day_2016 = datetime(2016, 4, 27, 10, 0)
+    print_check(model, example_resource, "King's Day 2016 (expected False)", kings_day_2016)
+
+
 
 if __name__ == "__main__":
     print(">>> MAIN EXECUTED")
