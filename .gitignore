@@ -1,3 +1,11 @@
-Dataset/*
+event_log.csv
+simulated_log.csv
+*.csv
+*.xes
+*.log
+__pycache__/
+models/
+data/
+DataSet/*
 Docs/*
 .venv
