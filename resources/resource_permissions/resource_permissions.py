@@ -3,14 +3,11 @@ import pandas as pd
 import pm4py
 import os
 import logging
-from sklearn.cluster import KMeans
+import pickle
+from sklearn.cluster import AgglomerativeClustering
 from ordinor.org_model_miner import resource_features, group_discovery, group_profiling
 from ordinor.org_model_miner.models import base
 
-from resources.resource_permissions.resource_features import ResourceActivityMatrix
-from resources.resource_permissions.resource_clustering import ResourceClusterer
-from resources.resource_permissions.group_profiling import GroupProfiler
-from resources.resource_permissions.organizational_model import OrganizationalModel
 from resources.resource_permissions.data_preparation import ResourceDataPreparation
 
 logger = logging.getLogger(__name__)
@@ -36,7 +33,7 @@ class BasicResourcePermissions:
         Initialize the ResourcePermissions model.
 
         Args:
-            log_path: Path to the XES/CSV event log file.
+            log_path: Path to the XES event log file.
             df: Existing pandas DataFrame containing the event log.
             filter_completed: If True, only include 'complete' lifecycle events.
             exclude_resources: Resources to exclude (e.g., ['User_1'] for system users).
@@ -97,12 +94,14 @@ class BasicResourcePermissions:
         
         self.activity_resource_map = mapping_series.to_dict()
 
-    def get_eligible_resources(self, activity_name: str) -> List[str]:
+    def get_eligible_resources(self, activity_name: str, timestamp:  pd.Timestamp = None, case_id: str = None) -> List[str]:
         """
         Returns a list of all resources that have historically performed the given activity.
-
+        
         Args:
             activity_name: The name of the activity.
+            timestamp: Ignored (Basic model is not context-aware).
+            case_id: Ignored (Basic model is not context-aware).
 
         Returns:
             List[str]: A list of resource IDs. Returns empty list if activity is unknown.
@@ -124,7 +123,7 @@ class OrdinoRResourcePermissions:
         Initialize OrdinoR permissions.
         
         Args:
-            log_path: Path to event log XES/CS.
+            log_path: Path to event log XES.
             df: Optional Pandas DataFrame (if log_path not provided).
             filter_completed: Whether to keep only completed events.
             exclude_resources: list of resources to exclude.
@@ -135,6 +134,9 @@ class OrdinoRResourcePermissions:
         
         self.filter_completed = filter_completed
         self.exclude_resources = exclude_resources or []
+        
+        # Mapping from case_id to case_type (cluster ID)
+        self._case_to_cluster = {}
         
         # Load and preprocess
         if df is not None:
@@ -175,69 +177,116 @@ class OrdinoRResourcePermissions:
             w1: Profiling weight for Relative Stake (default 0.5).
             p: Profiling threshold (default 0.5).
         """
+        import time
+        import threading
+        import sys
+        
+        n_events = len(self.df)
+        n_resources = self.df['org:resource'].nunique()
+        n_activities = self.df['concept:name'].nunique()
+        
+        print(f"\n{'='*60}")
+        print(f"OrdinoR Discovery Pipeline")
+        print(f"{'='*60}")
+        print(f"Dataset: {n_events:,} events, {n_resources} resources, {n_activities} activities")
+        print(f"Config: {n_trace_clusters} trace clusters, {n_resource_clusters} resource clusters")
+        print(f"{'='*60}\n")
+        
         logger.info("Starting OrdinoR discovery pipeline...")
         
-        # 1. Trace Clustering
-        logger.info(f"Running Trace Clustering (k={n_trace_clusters})...")
+        # Step 1: Trace Clustering
+        print("[1/5] Trace Clustering (AHC - Ward's Linkage)...")
+        start = time.time()
         df_clustered = self._apply_trace_clustering(self.df, n_clusters=n_trace_clusters)
+        print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
         
-        # 2. Construct Execution Contexts (CT + AT + TT)
-        logger.info("Constructing Execution Contexts (CT+AT+TT)...")
-        
-        # OrdinoR direct_count expects:
-        # const.CASE_TYPE -> 'case_type'
-        # const.ACTIVITY_TYPE -> 'activity_type'
-        # const.TIME_TYPE -> 'time_type'
-        # const.RESOURCE -> 'org:resource'
+        # Step 2: Construct Execution Contexts
+        print("[2/5] Constructing Execution Contexts (CT+AT+TT)...")
+        start = time.time()
         
         rl_df = df_clustered.copy()
-        
-        # Map CT (Case Type)
         rl_df['case_type'] = rl_df['case:cluster'].astype(str)
-        
-        # Map AT (Activity Type)
         rl_df['activity_type'] = rl_df['concept:name']
         
-        # Map TT (Time Type)
         if 'time:timestamp' in rl_df.columns:
             rl_df['time:timestamp'] = pd.to_datetime(rl_df['time:timestamp'], utc=True)
             rl_df['time_type'] = rl_df['time:timestamp'].dt.day_name()
         else:
-             logger.warning("No timestamp found, using default time type")
-             rl_df['time_type'] = "AnyTime"
+            logger.warning("No timestamp found, using default time type")
+            rl_df['time_type'] = "AnyTime"
         
-        # 3. Resource Profiling
-        logger.info("Building Resource Profiles...")
+        n_contexts = rl_df.groupby(['case_type', 'activity_type', 'time_type']).ngroups
+        print(f"      ✓ Created {n_contexts} unique execution contexts in {time.time() - start:.1f}s\n")
+        
+        # Step 3: Resource Profiling
+        print("[3/5] Building Resource Profiles...")
+        start = time.time()
         profiles = resource_features.direct_count(rl_df)
+        print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
         
-        # 4. Resource Clustering (AHC)
-        logger.info(f"Clustering Resources (AHC, n={n_resource_clusters})...")
+        # Step 4: Resource Clustering
+        print("[4/5] Clustering Resources (AHC)...")
+        start = time.time()
         groups = group_discovery.ahc(
             profiles, 
             n_groups=n_resource_clusters, 
             method='ward', 
             metric='euclidean'
         )
+        print(f"      ✓ Discovered {len(groups)} groups in {time.time() - start:.1f}s\n")
         
-        # 5. Group Profiling (OverallScore)
-        logger.info(f"Profiling Groups (OverallScore, w1={w1}, p={p})...")
-        self.model = group_profiling.overall_score(
-            groups, 
-            rl_df, 
-            w1=w1, 
-            p=p,
-            auto_search=False
-        )
+        # Step 5: Group Profiling (computationally intensive)
+        print("[5/5] Profiling Groups (OverallScore)...")
+        est_minutes = n_events / 8000  # Empirical: ~8000 events/minute
+        print(f"      ⚠ Estimated time: ~{est_minutes:.0f} minutes for {n_events:,} events")
+        start = time.time()
         
-        # Clear cache whenever model changes
+        # Progress monitoring for long-running operations
+        stop_monitor = threading.Event()
+        
+        def monitor_progress():
+            elapsed = 0
+            while not stop_monitor.is_set():
+                time.sleep(5)
+                elapsed += 5
+                mins = elapsed / 60
+                progress = min(99, (mins / est_minutes) * 100)
+                eta = max(0, est_minutes - mins)
+                sys.stdout.write(f"\r      ⏱ Elapsed: {mins:.1f} min | Progress: ~{progress:.0f}% | ETA: ~{eta:.1f} min")
+                sys.stdout.flush()
+        
+        monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+        monitor_thread.start()
+        
+        try:
+            self.model = group_profiling.overall_score(
+                groups, rl_df, w1=w1, p=p, auto_search=True
+            )
+        finally:
+            stop_monitor.set()
+            monitor_thread.join(timeout=1)
+            sys.stdout.write("\r" + " " * 100 + "\r")
+            sys.stdout.flush()
+        
+        elapsed = time.time() - start
+        print(f"      ✓ Completed in {elapsed:.1f}s ({elapsed/60:.1f} min)\n")
+        
         self._eligible_cache = {}
         
-        
+        print(f"{'='*60}")
+        print(f"Discovery Complete! Model has {len(groups)} resource groups.")
+        print(f"{'='*60}\n")
         logger.info(f"Discovery complete. Model has {len(groups)} groups.")
 
     def _apply_trace_clustering(self, df: pd.DataFrame, n_clusters: int) -> pd.DataFrame:
         """
-        Apply K-Means clustering on traces based on activity occurrence (Bag-of-Activities).
+        Apply Agglomerative Hierarchical Clustering (AHC) on traces using Ward's linkage.
+        
+        Following the "Context-Aware Trace Clustering" paper methodology:
+        - Algorithm: Agglomerative Hierarchical Clustering
+        - Linkage: Ward's (Minimum Variance)
+        - Distance: Euclidean (required for Ward's linkage)
+        
         Adds 'case:cluster' column to the DataFrame.
         """
         # Create Bag-of-Activities matrix
@@ -260,9 +309,14 @@ class OrdinoRResourcePermissions:
             fill_value=0
         )
         
-        # K-Means
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        clusters = kmeans.fit_predict(matrix)
+        # Agglomerative Hierarchical Clustering with Ward's linkage
+        # Ward's linkage requires Euclidean distance (implicitly used)
+        ahc = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            metric='euclidean',
+            linkage='ward'
+        )
+        clusters = ahc.fit_predict(matrix)
         
         # Map clusters back to DataFrame
         cluster_map = dict(zip(matrix.index, clusters))
@@ -270,25 +324,51 @@ class OrdinoRResourcePermissions:
         df_out = df.copy()
         df_out['case:cluster'] = df_out[case_id_col].map(cluster_map)
         
+        # Store mapping for later lookup (Case Context)
+        self._case_to_cluster = {str(k): str(v) for k, v in cluster_map.items()}
+        
         return df_out
 
-    def get_eligible_resources(self, activity: str) -> List[str]:
+    def get_eligible_resources(self, activity: str, timestamp: pd.Timestamp = None, case_id: str = None) -> List[str]:
         """
-        Get resources eligible for a given activity.
+        Get resources eligible for a given activity, respecting context if provided.
         
-        Since OrdinoR model stores 'Contexts' (CaseType, Activity, TimeType),
-        we return resources that have capability for ANY context involving this activity.
+        Args:
+            activity: The activity name.
+            timestamp: Optional timestamp to enforce Time Type context.
+            case_id: Optional case ID to enforce Case Type context.
+            
+        Returns:
+            List of resource IDs.
         """
         if self.model is None:
             logger.warning("Model not discovered yet!")
             return []
             
-        # Check cache
-        if hasattr(self, '_eligible_cache') and activity in self._eligible_cache:
-            return self._eligible_cache[activity]
+        # Context-aware caching not implemented for simplicity
+        # if hasattr(self, '_eligible_cache') and activity in self._eligible_cache:
+        #     return self._eligible_cache[activity]
         
         # OrdinoR Execution Context is a tuple: (case_type, activity_type, time_type)
-        # We want to find all contexts where activity matches
+        
+        # 1. Determine constraints
+        target_time_type = None
+        if timestamp:
+            # Match the time type definition in discovery (Day Name)
+            try:
+                if isinstance(timestamp, str):
+                    ts = pd.to_datetime(timestamp)
+                else:
+                    ts = timestamp
+                target_time_type = ts.day_name()
+            except Exception as e:
+                logger.warning(f"Failed to derive time type from {timestamp}: {e}")
+
+        target_case_type = None
+        if case_id and hasattr(self, '_case_to_cluster'):
+            target_case_type = self._case_to_cluster.get(str(case_id))
+            # Note: If case_id is unknown (new trace), target_case_type remains None
+            # This implies a "permissive" fallback: allow any case type.
         
         all_contexts = self.model.find_all_execution_contexts()
         
@@ -296,11 +376,24 @@ class OrdinoRResourcePermissions:
         for ctx in all_contexts:
             # OrdinoR uses tuples for contexts: (case_type, activity_type, time_type)
             # activity_type is at index 1
-            if isinstance(ctx, tuple):
-                if len(ctx) >= 2 and ctx[1] == activity:
-                    matching_contexts.append(ctx)
+            if isinstance(ctx, tuple) and len(ctx) >= 3:
+                c_case, c_act, c_time = ctx[0], ctx[1], ctx[2]
+                
+                # Check Activity
+                if c_act != activity:
+                    continue
+                    
+                # Check Time Context (if provided)
+                if target_time_type and c_time != "AnyTime" and c_time != target_time_type:
+                    continue
+                    
+                # Check Case Context (if provided and known)
+                if target_case_type and c_case != target_case_type:
+                    continue
+                    
+                matching_contexts.append(ctx)
             elif isinstance(ctx, str):
-                # Fallback if OrdinoR ever stringifies keys (unlikely in this ver)
+                # Fallback
                 if activity in ctx:
                     matching_contexts.append(ctx)
         
@@ -350,4 +443,32 @@ class OrdinoRResourcePermissions:
             "total_activities": total,
             "coverage_ratio": covered / total if total > 0 else 0.0
         }
+
+    def save_model(self, path: str):
+        """Save the discovered model to a file."""
+        if self.model is None:
+            logger.warning("No model to save.")
+            return
+        
+        try:
+            with open(path, 'wb') as f:
+                pickle.dump(self.model, f)
+            logger.info(f"Model saved to {path}")
+        except Exception as e:
+            logger.error(f"Failed to save model: {e}")
+
+    def load_model(self, path: str):
+        """Load a discovered model from a file."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model cache not found: {path}")
+            
+        try:
+            with open(path, 'rb') as f:
+                self.model = pickle.load(f)
+            logger.info(f"Model loaded from {path}")
+            # Reset cache
+            self._eligible_cache = {}
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
 
