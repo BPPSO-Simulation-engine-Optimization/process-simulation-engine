@@ -26,25 +26,22 @@ class TestResourceAllocator(unittest.TestCase):
 
         # Verify
         self.assertIn(allocated_resource, ["res1", "res3"])
-        # Verify call arguments (timestamp and case_id should be None by default if not passed)
-        self.permissions.get_eligible_resources.assert_called_with("test_activity", timestamp=self.test_time, case_id=None)
+        self.permissions.get_eligible_resources.assert_called_with("test_activity", timestamp=self.test_time, case_type=None)
         
         # Check that is_available was called for at least some candidates
         self.assertTrue(self.availability.is_available.called)
 
-    def test_allocate_context_aware(self):
-        # Verify that timestamp and case_id are passed to permissions
+    def test_allocate_with_case_type(self):
+        # Verify that case_type is passed to permissions
         self.permissions.get_eligible_resources.return_value = ["res1"]
         self.availability.is_available.return_value = True
         
-        test_case = "case_123"
-        
-        self.allocator.allocate("test_activity", self.test_time, case_id=test_case)
+        self.allocator.allocate("test_activity", self.test_time, case_type="Home improvement")
         
         self.permissions.get_eligible_resources.assert_called_with(
             "test_activity", 
             timestamp=self.test_time, 
-            case_id=test_case
+            case_type="Home improvement"
         )
 
     def test_allocate_no_permission(self):

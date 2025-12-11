@@ -88,7 +88,6 @@ class ResourceAllocator:
                 if not loaded_from_cache:
                     logger.info("Discovering OrdinoR model (this may take time)...")
                     self.permissions.discover_model(
-                        n_trace_clusters=n_trace_clusters, 
                         n_resource_clusters=n_resource_clusters
                     )
                     if cache_path:
@@ -114,7 +113,7 @@ class ResourceAllocator:
             
         return df
 
-    def allocate(self, activity: str, timestamp: datetime, case_id: str = None) -> Optional[str]:
+    def allocate(self, activity: str, timestamp: datetime, case_type: str = None) -> Optional[str]:
         """
         Allocates a suitable resource for the given activity at the given timestamp.
 
@@ -125,18 +124,12 @@ class ResourceAllocator:
         Args:
             activity: Name of the activity.
             timestamp: Time when the activity is to be performed.
-            case_id: Optional Case ID (for context-aware permissions).
+            case_type: Optional Case Type (e.g., "Home improvement", "Car").
         """
         # 1. Eligibility (context-aware)
         try:
-             # Check if the permission model supports context (OrdinoR does, Basic might not fully)
-             # Inspect signature or just try passing kwargs if flexible, 
-             # but here we know OrdinoRResourcePermissions has the new signature.
-             # BasicResourcePermissions needs to be updated too or use kwargs.
-             
-             # Safest is to check signature or assume updated interface
              eligible_resources = self.permissions.get_eligible_resources(
-                 activity, timestamp=timestamp, case_id=case_id
+                 activity, timestamp=timestamp, case_type=case_type
              )
         except TypeError:
              # Fallback for models without context support (e.g. unmodified Basic)

@@ -4,7 +4,7 @@ import pm4py
 import os
 import logging
 import pickle
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering  # Still used by OrdinoR internally via group_discovery.ahc
 from ordinor.org_model_miner import resource_features, group_discovery, group_profiling
 from ordinor.org_model_miner.models import base
 
@@ -94,14 +94,14 @@ class BasicResourcePermissions:
         
         self.activity_resource_map = mapping_series.to_dict()
 
-    def get_eligible_resources(self, activity_name: str, timestamp:  pd.Timestamp = None, case_id: str = None) -> List[str]:
+    def get_eligible_resources(self, activity_name: str, timestamp: pd.Timestamp = None, case_type: str = None) -> List[str]:
         """
         Returns a list of all resources that have historically performed the given activity.
         
         Args:
             activity_name: The name of the activity.
             timestamp: Ignored (Basic model is not context-aware).
-            case_id: Ignored (Basic model is not context-aware).
+            case_type: Ignored (Basic model is not context-aware).
 
         Returns:
             List[str]: A list of resource IDs. Returns empty list if activity is unknown.
@@ -167,15 +167,20 @@ class OrdinoRResourcePermissions:
              
         return df_out
 
-    def discover_model(self, n_trace_clusters: int = 5, n_resource_clusters: int = 10, w1: float = 0.5, p: float = 0.5):
+    def discover_model(self, n_resource_clusters: int = 10, w1: float = 0.5, p: float = 0.5, 
+                        case_type_column: str = 'case:LoanGoal'):
         """
         Discover organizational model using OrdinoR pipeline.
         
+        Uses case attributes (e.g., LoanGoal) directly for Case Type dimension
+        instead of trace clustering. This approach is suitable for simulation because
+        case attributes are known at case instantiation (before any activities occur).
+        
         Args:
-            n_trace_clusters: Number of case types to discover (K-Means).
             n_resource_clusters: Number of resource groups to discover (AHC).
             w1: Profiling weight for Relative Stake (default 0.5).
             p: Profiling threshold (default 0.5).
+            case_type_column: Column name for case type (default 'case:LoanGoal').
         """
         import time
         import threading
@@ -189,23 +194,32 @@ class OrdinoRResourcePermissions:
         print(f"OrdinoR Discovery Pipeline")
         print(f"{'='*60}")
         print(f"Dataset: {n_events:,} events, {n_resources} resources, {n_activities} activities")
-        print(f"Config: {n_trace_clusters} trace clusters, {n_resource_clusters} resource clusters")
+        print(f"Config: Case Type from '{case_type_column}', {n_resource_clusters} resource clusters")
         print(f"{'='*60}\n")
         
         logger.info("Starting OrdinoR discovery pipeline...")
         
-        # Step 1: Trace Clustering
-        print("[1/5] Trace Clustering (AHC - Ward's Linkage)...")
+        # Validate case type column
+        if case_type_column not in self.df.columns:
+            available = [c for c in self.df.columns if c.startswith('case:')]
+            raise ValueError(f"Column '{case_type_column}' not found. Available case columns: {available}")
+        
+        # Step 1: Extract Case Types from attributes
+        print(f"[1/4] Extracting Case Types from '{case_type_column}'...")
         start = time.time()
-        df_clustered = self._apply_trace_clustering(self.df, n_clusters=n_trace_clusters)
+        
+        rl_df = self.df.copy()
+        rl_df['case_type'] = rl_df[case_type_column].astype(str)
+        
+        n_case_types = rl_df['case_type'].nunique()
+        case_type_values = rl_df['case_type'].unique().tolist()
+        print(f"      ✓ Found {n_case_types} case types: {case_type_values[:5]}{'...' if n_case_types > 5 else ''}")
         print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
         
-        # Step 2: Construct Execution Contexts
-        print("[2/5] Constructing Execution Contexts (CT+AT+TT)...")
+        # Step 2: Construct Execution Contexts (CT+AT+TT)
+        print("[2/4] Constructing Execution Contexts (CT+AT+TT)...")
         start = time.time()
         
-        rl_df = df_clustered.copy()
-        rl_df['case_type'] = rl_df['case:cluster'].astype(str)
         rl_df['activity_type'] = rl_df['concept:name']
         
         if 'time:timestamp' in rl_df.columns:
@@ -218,15 +232,11 @@ class OrdinoRResourcePermissions:
         n_contexts = rl_df.groupby(['case_type', 'activity_type', 'time_type']).ngroups
         print(f"      ✓ Created {n_contexts} unique execution contexts in {time.time() - start:.1f}s\n")
         
-        # Step 3: Resource Profiling
-        print("[3/5] Building Resource Profiles...")
+        # Step 3: Resource Profiling & Clustering
+        print("[3/4] Building Resource Profiles & Clustering (AHC)...")
         start = time.time()
         profiles = resource_features.direct_count(rl_df)
-        print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
         
-        # Step 4: Resource Clustering
-        print("[4/5] Clustering Resources (AHC)...")
-        start = time.time()
         groups = group_discovery.ahc(
             profiles, 
             n_groups=n_resource_clusters, 
@@ -235,8 +245,8 @@ class OrdinoRResourcePermissions:
         )
         print(f"      ✓ Discovered {len(groups)} groups in {time.time() - start:.1f}s\n")
         
-        # Step 5: Group Profiling (computationally intensive)
-        print("[5/5] Profiling Groups (OverallScore)...")
+        # Step 4: Group Profiling (computationally intensive)
+        print("[4/4] Profiling Groups (OverallScore)...")
         est_minutes = n_events / 8000  # Empirical: ~8000 events/minute
         print(f"      ⚠ Estimated time: ~{est_minutes:.0f} minutes for {n_events:,} events")
         start = time.time()
@@ -271,72 +281,19 @@ class OrdinoRResourcePermissions:
         elapsed = time.time() - start
         print(f"      ✓ Completed in {elapsed:.1f}s ({elapsed/60:.1f} min)\n")
         
-        self._eligible_cache = {}
-        
         print(f"{'='*60}")
         print(f"Discovery Complete! Model has {len(groups)} resource groups.")
         print(f"{'='*60}\n")
         logger.info(f"Discovery complete. Model has {len(groups)} groups.")
 
-    def _apply_trace_clustering(self, df: pd.DataFrame, n_clusters: int) -> pd.DataFrame:
-        """
-        Apply Agglomerative Hierarchical Clustering (AHC) on traces using Ward's linkage.
-        
-        Following the "Context-Aware Trace Clustering" paper methodology:
-        - Algorithm: Agglomerative Hierarchical Clustering
-        - Linkage: Ward's (Minimum Variance)
-        - Distance: Euclidean (required for Ward's linkage)
-        
-        Adds 'case:cluster' column to the DataFrame.
-        """
-        # Create Bag-of-Activities matrix
-        # Rows: Case IDs, Columns: Activities, Values: Count
-        case_id_col = "case:concept:name"
-        activity_col = "concept:name"
-        
-        if case_id_col not in df.columns:
-            # Fallback if case id is different or index
-            logger.warning("Standard case ID column not found. Using numeric index as cases?")
-            # This would probably be wrong for process mining. Assuming standard XES.
-            raise ValueError(f"Column {case_id_col} required for trace clustering")
-
-        # Pivot table (fill_value=0)
-        matrix = pd.pivot_table(
-            df, 
-            index=case_id_col, 
-            columns=activity_col, 
-            aggfunc='size', 
-            fill_value=0
-        )
-        
-        # Agglomerative Hierarchical Clustering with Ward's linkage
-        # Ward's linkage requires Euclidean distance (implicitly used)
-        ahc = AgglomerativeClustering(
-            n_clusters=n_clusters,
-            metric='euclidean',
-            linkage='ward'
-        )
-        clusters = ahc.fit_predict(matrix)
-        
-        # Map clusters back to DataFrame
-        cluster_map = dict(zip(matrix.index, clusters))
-        
-        df_out = df.copy()
-        df_out['case:cluster'] = df_out[case_id_col].map(cluster_map)
-        
-        # Store mapping for later lookup (Case Context)
-        self._case_to_cluster = {str(k): str(v) for k, v in cluster_map.items()}
-        
-        return df_out
-
-    def get_eligible_resources(self, activity: str, timestamp: pd.Timestamp = None, case_id: str = None) -> List[str]:
+    def get_eligible_resources(self, activity: str, timestamp: pd.Timestamp = None, case_type: str = None) -> List[str]:
         """
         Get resources eligible for a given activity, respecting context if provided.
         
         Args:
             activity: The activity name.
-            timestamp: Optional timestamp to enforce Time Type context.
-            case_id: Optional case ID to enforce Case Type context.
+            timestamp: Optional timestamp to enforce Time Type context (derives day of week).
+            case_type: Optional Case Type (e.g., "Home improvement", "Car").
             
         Returns:
             List of resource IDs.
@@ -344,10 +301,6 @@ class OrdinoRResourcePermissions:
         if self.model is None:
             logger.warning("Model not discovered yet!")
             return []
-            
-        # Context-aware caching not implemented for simplicity
-        # if hasattr(self, '_eligible_cache') and activity in self._eligible_cache:
-        #     return self._eligible_cache[activity]
         
         # OrdinoR Execution Context is a tuple: (case_type, activity_type, time_type)
         
@@ -364,11 +317,10 @@ class OrdinoRResourcePermissions:
             except Exception as e:
                 logger.warning(f"Failed to derive time type from {timestamp}: {e}")
 
+        # Case Type: Use explicit case_type if provided
         target_case_type = None
-        if case_id and hasattr(self, '_case_to_cluster'):
-            target_case_type = self._case_to_cluster.get(str(case_id))
-            # Note: If case_id is unknown (new trace), target_case_type remains None
-            # This implies a "permissive" fallback: allow any case type.
+        if case_type:
+            target_case_type = str(case_type)
         
         all_contexts = self.model.find_all_execution_contexts()
         
