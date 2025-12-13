@@ -10,3 +10,4 @@ DataSet/*
 Docs/*
 .venv
 eventlog.xes.gz
+.DS_Store
