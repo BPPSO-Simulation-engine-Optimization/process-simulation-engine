@@ -42,11 +42,16 @@ class ResourceAllocator:
             n_resource_clusters: Number of resource clusters for OrdinoR (default 10).
             use_sample: If set, load only a sample of the log (for testing/speed).
             cache_path: Path to save/load the permission model cache.
+                        Defaults to 'resources/resource_permissions/ordinor_fullrecall.pkl' for 'ordinor' method.
             df: Optional pre-loaded DataFrame. If provided, log_path is ignored.
             permissions_model: Optional pre-initialized permissions object (Dependency Injection).
         """
         self.log_path = log_path
         self.permission_method = permission_method.lower()
+        
+        # Set default cache path if not provided for OrdinoR methods
+        if cache_path is None and self.permission_method in ('ordinor', 'ordinor-fullrecall'):
+            cache_path = 'resources/resource_permissions/ordinor_fullrecall.pkl'
         
         # 1. Unified Log Loading
         logger.info(f"Initializing ResourceAllocator with method='{self.permission_method}'")

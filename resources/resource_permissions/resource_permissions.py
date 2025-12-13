@@ -145,7 +145,16 @@ class OrdinoRResourcePermissions:
         self.df = None
 
         self.filter_completed = filter_completed
+        self.filter_completed = filter_completed
         self.exclude_resources = exclude_resources or []
+        
+        # Activities where system user (User_1) must be included
+        self.SYSTEM_USER_ACTIVITIES = {
+            "A_Cancelled", "A_Concept", "A_Create Application", "A_Submitted",
+            "O_Cancelled",
+            "W_Assess potential fraud", "W_Call after offers", "W_Call incomplete files", 
+            "W_Complete application", "W_Handle leads", "W_Validate application"
+        }
 
         # FullRecall mode structures
         self._groups: List[Set[str]] = []  # List of resource groups
@@ -356,10 +365,12 @@ class OrdinoRResourcePermissions:
         """
         # FullRecall mode: simple group-based lookup
         if self.profiling_mode == 'full_recall':
-            return self._get_eligible_full_recall(activity)
+            resources = self._get_eligible_full_recall(activity)
+            return self._apply_system_user_logic(activity, resources)
 
         # OverallScore mode: context-aware lookup using OrdinoR model
-        return self._get_eligible_overall_score(activity, timestamp, case_type)
+        resources = self._get_eligible_overall_score(activity, timestamp, case_type)
+        return self._apply_system_user_logic(activity, resources)
 
     def _get_eligible_full_recall(self, activity: str) -> List[str]:
         """Get eligible resources using FullRecall mode (group-based)."""
@@ -377,6 +388,14 @@ class OrdinoRResourcePermissions:
             eligible_resources.update(self._groups[group_idx])
 
         return list(eligible_resources)
+
+    def _apply_system_user_logic(self, activity: str, resources: List[str]) -> List[str]:
+        """Ensure User_1 is included if required for this activity."""
+        if activity in self.SYSTEM_USER_ACTIVITIES:
+            if "User_1" not in resources:
+                # Create a new list to avoid modifying the input if it's a reference
+                resources = list(resources) + ["User_1"]
+        return resources
 
     def _get_eligible_overall_score(self, activity: str, timestamp: pd.Timestamp = None, case_type: str = None) -> List[str]:
         """Get eligible resources using OverallScore mode (context-aware)."""

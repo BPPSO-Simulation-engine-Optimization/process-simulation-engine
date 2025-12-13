@@ -10,7 +10,7 @@ Resource permission mining based on **OrdinoR (2022)** framework.
     - **AT**: Activity name
     - **TT**: Day of week
 - **Resource Clustering**: AHC, Ward's linkage, 10 groups
-- **Group Profiling**: OverallScore ($\omega_1=0.5, p=0.5$)
+- **Group Profiling**: Full Recall (default) or OverallScore ($\omega_1=0.5, p=0.5$)
 
 ### Why LoanGoal (Not Trace Clustering)?
 
