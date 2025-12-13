@@ -54,7 +54,7 @@ resource_allocator = ResourceAllocator(
     cache_path="resources/resource_permissions/ordinor_fullrecall.pkl"
 )
 
-# In your event loop:
+# In the simulation loop:
 selected_resource = resource_allocator.allocate(
     activity="A_Create Application",
     timestamp=current_simulation_time,
