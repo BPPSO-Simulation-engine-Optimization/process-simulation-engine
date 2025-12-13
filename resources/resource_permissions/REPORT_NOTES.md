@@ -22,7 +22,7 @@ Resource permission mining based on **OrdinoR (2022)** framework.
 
 ## 2. Pipeline
 
-1. **Data Prep**: Filter completed events, exclude system users
+1. **Data Prep**: Filter completed events, exclude system users (caveat: 2 activities don't have a completed event, W_Personal Loan collection and W_Shortened completion)
 2. **Case Types**: Extract from `case:LoanGoal` column
 3. **Execution Contexts**: Combine CT+AT+TT
 4. **Resource Profiling**: `ordinor.resource_features.direct_count()`

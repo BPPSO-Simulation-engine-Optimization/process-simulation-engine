@@ -12,3 +12,4 @@ Docs/*
 eventlog.xes.gz
 .DS_Store
 .claude
+sanity_check/
