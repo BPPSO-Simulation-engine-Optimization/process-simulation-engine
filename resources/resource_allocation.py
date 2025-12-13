@@ -14,15 +14,20 @@ logger = logging.getLogger(__name__)
 class ResourceAllocator:
     """
     Allocates resources to activities based on permissions and availability.
-    
+
     Serves as the central entry point for resource management in the simulation.
     Orchestrates:
-    1. Permission Model (Basic or OrdinoR) - Who is qualified?
+    1. Permission Model (Basic, OrdinoR-FullRecall, or OrdinoR-OverallScore) - Who is qualified?
     2. Availability Model (Working Hours) - Who is free?
+
+    Permission Methods:
+    - 'basic': Simple historical lookup (resource did activity before)
+    - 'ordinor': OrdinoR with FullRecall profiling (default, recommended for simulation)
+    - 'ordinor-strict': OrdinoR with OverallScore profiling (precision-optimized)
     """
 
-    def __init__(self, log_path: str = None, permission_method: str = 'ordinor', 
-                 n_trace_clusters: int = 5, n_resource_clusters: int = 10,
+    def __init__(self, log_path: str = None, permission_method: str = 'ordinor',
+                 n_resource_clusters: int = 10,
                  use_sample: int = None, cache_path: str = None, df: pd.DataFrame = None,
                  permissions_model = None):
         """
@@ -30,9 +35,11 @@ class ResourceAllocator:
 
         Args:
             log_path: Path to the XES event log.
-            permission_method: Strategy for permissions ('basic' or 'ordinor').
-            n_trace_clusters: Parameters for OrdinoR (if used).
-            n_resource_clusters: Parameters for OrdinoR (if used).
+            permission_method: Strategy for permissions:
+                - 'basic': Simple historical lookup
+                - 'ordinor': OrdinoR with FullRecall (default, role-based generalization)
+                - 'ordinor-strict': OrdinoR with OverallScore (precision-optimized)
+            n_resource_clusters: Number of resource clusters for OrdinoR (default 10).
             use_sample: If set, load only a sample of the log (for testing/speed).
             cache_path: Path to save/load the permission model cache.
             df: Optional pre-loaded DataFrame. If provided, log_path is ignored.
@@ -72,9 +79,21 @@ class ResourceAllocator:
              self.permissions = permissions_model
         else:
             logger.info("Initializing Resource Permission Model...")
-            if self.permission_method == 'ordinor':
-                self.permissions = OrdinoRResourcePermissions(df=self.df)
-                
+
+            # Determine profiling mode from permission_method
+            if self.permission_method in ('ordinor', 'ordinor-fullrecall'):
+                profiling_mode = 'full_recall'
+            elif self.permission_method == 'ordinor-strict':
+                profiling_mode = 'overall_score'
+            else:
+                profiling_mode = None  # Not OrdinoR
+
+            if self.permission_method.startswith('ordinor'):
+                self.permissions = OrdinoRResourcePermissions(
+                    df=self.df,
+                    profiling_mode=profiling_mode
+                )
+
                 # Check for cache
                 loaded_from_cache = False
                 if cache_path and os.path.exists(cache_path):
@@ -84,19 +103,20 @@ class ResourceAllocator:
                         loaded_from_cache = True
                     except Exception as e:
                         logger.warning(f"Failed to load cache: {e}. Falling back to discovery.")
-                
+
                 if not loaded_from_cache:
-                    logger.info("Discovering OrdinoR model (this may take time)...")
+                    logger.info(f"Discovering OrdinoR model (mode={profiling_mode})...")
                     self.permissions.discover_model(
                         n_resource_clusters=n_resource_clusters
                     )
                     if cache_path:
                         self.permissions.save_model(cache_path)
-                        
+
             elif self.permission_method == 'basic':
                 self.permissions = BasicResourcePermissions(df=self.df)
             else:
-                raise ValueError(f"Unknown permission method: {permission_method}")
+                raise ValueError(f"Unknown permission method: '{permission_method}'. "
+                               f"Valid options: 'basic', 'ordinor', 'ordinor-strict'")
             
     def _load_log(self, log_path: str, sample_size: Optional[int]) -> pd.DataFrame:
         """Load and preprocess the event log into a DataFrame."""

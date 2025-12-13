@@ -3,6 +3,20 @@ Permission Benchmarking System.
 
 Compares BasicResourcePermissions vs OrdinoRResourcePermissions on BPIC2017 data.
 Metrics: coverage, precision, recall, group quality, generalization, sensitivity.
+
+Execute from the resources directory:
+
+    # FullRecall mode (recommended for simulation):
+    python resource_permissions/benchmark_permissions.py \
+        --log-path ../eventlog.xes.gz \
+        --cache-path resource_permissions/ordinor_fullrecall.pkl \
+        --mode full_recall
+
+    # OverallScore mode (precision-optimized) (-> rather for analytical use):
+    python resource_permissions/benchmark_permissions.py \
+        --log-path ../eventlog.xes.gz \
+        --cache-path resource_permissions/ordinor_model-overall_score.pkl \
+        --mode overall_score
 """
 import argparse
 import logging
@@ -14,8 +28,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# Add project root to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add project root to path (go up two levels: resource_permissions -> resources -> project root)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from resources.resource_permissions.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
 
@@ -39,45 +53,50 @@ class ActivityMetrics:
 class PermissionBenchmark:
     """
     Benchmarks BasicResourcePermissions vs OrdinoRResourcePermissions.
-    
+
     Computes coverage, precision/recall, group quality, and generalization metrics.
+
+    Supports two OrdinoR profiling modes:
+    - 'full_recall': Role-based generalization (recommended for simulation)
+    - 'overall_score': Context-aware profiling (precision-optimized)
     """
-    
+
     def __init__(
         self,
         log_path: Optional[str] = None,
         df: Optional[pd.DataFrame] = None,
         n_clusters: int = 10,
-        n_trace_clusters: int = 5,
         exclude_resources: Optional[List[str]] = None,
         filter_completed: bool = True,
-        sample_size: Optional[int] = None
+        sample_size: Optional[int] = None,
+        cache_path: Optional[str] = None,
+        profiling_mode: str = 'full_recall'
     ):
         """
         Initialize benchmark with Basic and OrdinoR permission systems.
-        
+
         Args:
             log_path: Path to XES event log.
             df: DataFrame with event log.
             n_clusters: Number of resource clusters (OrdinoR).
-            n_trace_clusters: Number of trace clusters (OrdinoR).
             exclude_resources: Resources to exclude (e.g., system users).
             filter_completed: Whether to filter out completed cases.
             sample_size: Number of events to sample (int). If provided, runs on subset.
+            cache_path: Path to cached OrdinoR model (.pkl). Required when using log_path.
+            profiling_mode: 'full_recall' (default) or 'overall_score'.
         """
         self.n_clusters = n_clusters
-        self.n_trace_clusters = n_trace_clusters
         self.exclude_resources = exclude_resources or []
         self.filter_completed = filter_completed
         self.sample_size = sample_size
-        
-        logger.info("Initializing benchmark systems...")
-        
+        self.profiling_mode = profiling_mode
+
+        logger.info(f"Initializing benchmark systems (mode={profiling_mode})...")
+
         # Load or set DataFrame
         if df is not None:
             self.df = df
         elif log_path is not None:
-            # BasicResourcePermissions can load from log_path and store df
             temp_basic = BasicResourcePermissions(log_path=log_path, filter_completed=filter_completed, exclude_resources=exclude_resources)
             self.df = temp_basic.df
         else:
@@ -87,21 +106,29 @@ class PermissionBenchmark:
         if self.sample_size and self.sample_size < len(self.df):
             logger.info(f"Sampling first {self.sample_size} events for quick verification...")
             self.df = self.df.head(self.sample_size)
-        
+
         # Initialize both systems with the (potentially sampled) DataFrame
         self.basic = BasicResourcePermissions(df=self.df, filter_completed=filter_completed, exclude_resources=exclude_resources)
-        self.advanced = OrdinoRResourcePermissions(df=self.df, filter_completed=filter_completed, exclude_resources=exclude_resources)
-        
-        # Discover OrdinoR model
-        logger.info(f"Discovering OrdinoR model (n_trace={n_trace_clusters}, n_resource={n_clusters})...")
-        self.advanced.discover_model(
-            n_trace_clusters=n_trace_clusters,
-            n_resource_clusters=n_clusters
+        self.advanced = OrdinoRResourcePermissions(
+            df=self.df,
+            filter_completed=filter_completed,
+            exclude_resources=exclude_resources,
+            profiling_mode=profiling_mode
         )
-        
-        # Store silhouette score? OrdinoR might not expose it easily exposed, 
-        # but we can check if the model has quality metrics attached.
-        self.silhouette_score = None # Placeholder if needed
+
+        # Load OrdinoR model from cache
+        if log_path and not cache_path:
+            raise ValueError("cache_path is required when using log_path.")
+
+        if cache_path:
+            if not os.path.exists(cache_path):
+                raise FileNotFoundError(f"Cached model not found at {cache_path}. Run discovery first to create it.")
+            logger.info(f"Loading cached OrdinoR model from {cache_path}...")
+            self.advanced.load_model(cache_path)
+        else:
+            # No cache provided and using DataFrame (testing scenario)
+            logger.warning("No cache_path provided - discovering model (only use this for testing with small datasets!)")
+            self.advanced.discover_model(n_resource_clusters=n_clusters)
 
         self.silhouette_score = getattr(self.advanced, '_silhouette_score', None)
         
@@ -182,45 +209,38 @@ class PermissionBenchmark:
     def compute_group_quality(self) -> Dict:
         """
         Compute metrics about the discovered groups.
-        Adapts to OrdinoR's OrganizationalModel structure.
+        Adapts to both FullRecall and OverallScore modes.
         """
-        # Access the OrdinoR model directly
-        model = self.advanced.model
-        if model is None:
-            return {
-                "n_groups": 0,
-                "size_stats": {"mean": 0, "std": 0, "min": 0, "max": 0},
-                "group_details": []
-            } 
-            
-        # Try to find all groups
-        try:
-            # Check available methods dynamically or assume find_all_groups
-            if hasattr(model, 'find_all_groups'):
-                groups = model.find_all_groups()
-            elif hasattr(model, 'find_group_ids'):
-                # access internal structure via group ids if needed?
-                # or just use internal dict if we must (bad practice but effective)
-                # Let's assume find_all_groups returns the list of group sets
-                groups = model.find_all_groups() # Retry/Hope
-            else:
-                # Fallback: assume we can't get them easily
-                groups = []
-        except Exception as e:
-            logger.warning(f"Could not retrieve groups from model: {e}")
-            groups = []
+        groups = []
+
+        # FullRecall mode: groups stored in _groups
+        if self.profiling_mode == 'full_recall' and hasattr(self.advanced, '_groups'):
+            groups = self.advanced._groups
+        # OverallScore mode: groups from OrdinoR model
+        elif self.advanced.model is not None:
+            try:
+                if hasattr(self.advanced.model, 'find_all_groups'):
+                    raw_groups = self.advanced.model.find_all_groups()
+                    # Extract actual resource sets from OrdinoR structure
+                    for g in raw_groups:
+                        if isinstance(g, (list, tuple)) and len(g) >= 2:
+                            groups.append(g[1])  # [group_id, frozenset(resources)]
+                        else:
+                            groups.append(g)
+            except Exception as e:
+                logger.warning(f"Could not retrieve groups from model: {e}")
 
         n_groups = len(groups)
-        
+
         if n_groups == 0:
-             return {
+            return {
                 "n_groups": 0,
                 "size_stats": {"mean": 0, "std": 0, "min": 0, "max": 0},
                 "group_details": []
             }
 
         group_sizes = [len(g) for g in groups]
-        
+
         # Build group details
         group_details = []
         for i, resources in enumerate(groups):
@@ -297,41 +317,36 @@ class PermissionBenchmark:
         logger.info(f"  Train: {len(train_cases)} cases, {len(train_df)} events")
         logger.info(f"  Test: {len(test_cases)} cases, {len(test_df)} events")
         
-        # Train both systems on train set
-        # Train both systems on train set
+        # Train Basic on train set (OrdinoR skipped - uses pre-trained cached model)
         basic_train = BasicResourcePermissions(df=train_df)
-        advanced_train = OrdinoRResourcePermissions(df=train_df)
-        advanced_train.discover_model(
-            n_trace_clusters=self.n_trace_clusters,
-            n_resource_clusters=self.n_clusters
-        )
-        
+
         # Evaluate on test set: for each (activity, resource) in test,
         # check if it would have been allowed
         test_pairs = test_df[["concept:name", "org:resource"]].drop_duplicates()
-        
+
         basic_hits = 0
         advanced_hits = 0
         total = 0
-        
+
         for _, row in test_pairs.iterrows():
             activity = row["concept:name"]
             resource = row["org:resource"]
-            
+
             if pd.isna(activity) or pd.isna(resource):
                 continue
-            
+
             total += 1
-            
+
             if resource in basic_train.get_eligible_resources(activity):
                 basic_hits += 1
-            
+
+            # Use pre-loaded OrdinoR model (trained on full data)
             try:
-                if resource in advanced_train.get_eligible_resources(activity):
+                if resource in self.advanced.get_eligible_resources(activity):
                     advanced_hits += 1
             except ValueError:
                 pass  # Activity not in model
-        
+
         return {
             "train_cases": len(train_cases),
             "test_cases": len(test_cases),
@@ -442,12 +457,13 @@ class PermissionBenchmark:
         avg_recall = np.mean(recalls) if recalls else 0
         
         # Generate report
+        mode_label = "FullRecall" if self.profiling_mode == 'full_recall' else "OverallScore"
         report = f"""# OrdinoR Benchmark Report
 
 Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 Log: {len(self.df)} events, {len(self._all_activities)} activities
-Configuration: OrdinoR (Trace Clustering + AHC + OverallScore)
-Params: n_trace_clusters={self.n_trace_clusters}, n_resource_clusters={self.n_clusters}
+Configuration: OrdinoR ({mode_label} profiling)
+Params: n_resource_clusters={self.n_clusters}, mode={self.profiling_mode}
 
 ## Coverage
 
@@ -584,24 +600,27 @@ def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Benchmark Basic vs OrdinoR Permissions")
     parser.add_argument("--log-path", required=True, help="Path to XES event log")
+    parser.add_argument("--cache-path", required=True, help="Path to cached OrdinoR model (.pkl file)")
+    parser.add_argument("--mode", choices=['full_recall', 'overall_score'], default='full_recall',
+                       help="Profiling mode: 'full_recall' (default) or 'overall_score'")
     parser.add_argument("--n-clusters", type=int, default=10, help="Number of resource clusters (default: 10)")
-    parser.add_argument("--n-trace-clusters", type=int, default=5, help="Number of trace clusters (default: 5)")
-    parser.add_argument("--output-dir", default="benchmark_results_ordinor", help="Output directory")
+    parser.add_argument("--output-dir", default="benchmark_results", help="Output directory")
     parser.add_argument("--exclude-resources", nargs="*", default=[], help="Resources to exclude (e.g., User_1)")
     parser.add_argument("--sample", type=int, help="Sample size for quick verification (e.g. 1000)")
-    
+
     args = parser.parse_args()
-    
+
     # Configure logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    
+
     # Run benchmark
     benchmark = PermissionBenchmark(
         log_path=args.log_path,
         n_clusters=args.n_clusters,
-        n_trace_clusters=args.n_trace_clusters,
         exclude_resources=args.exclude_resources,
-        sample_size=args.sample
+        sample_size=args.sample,
+        cache_path=args.cache_path,
+        profiling_mode=args.mode
     )
     
     results = benchmark.run_full_benchmark(args.output_dir)

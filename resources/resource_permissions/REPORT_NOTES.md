@@ -51,7 +51,7 @@ from resources.resource_allocation import ResourceAllocator
 resource_allocator = ResourceAllocator(
     log_path="path/to/BPIC2017.xes", # Only needed if cache missing or for availability
     permission_method='ordinor',
-    cache_path="resources/resource_permissions/ordinor_model.pkl"
+    cache_path="resources/resource_permissions/ordinor_fullrecall.pkl"
 )
 
 # In your event loop:
@@ -68,4 +68,4 @@ selected_resource = resource_allocator.allocate(
 
 - **Discovery**: 15-60 min (full BPIC2017)
 - **Allocation**: <1ms
-- **Caching**: Model pickled to `ordinor_model_full.pkl`
+- **Caching**: Model pickled to `ordinor_fullrecall.pkl`

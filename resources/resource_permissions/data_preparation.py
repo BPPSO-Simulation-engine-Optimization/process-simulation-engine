@@ -1,7 +1,7 @@
 """
 Data Preparation Module for Resource Permission Mining.
 
-Preprocesses BPIC2017 event log for organizational model discovery.
+Preprocesses BPIC17 EL for organizational model discovery.
 Key steps:
 1. Filter to completed activities only (lifecycle:transition = 'complete') (as was also done in the OrdinoR paper)
 2. Remove system resources (e.g., User_1)

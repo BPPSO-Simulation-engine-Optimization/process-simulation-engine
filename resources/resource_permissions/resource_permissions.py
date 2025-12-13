@@ -113,28 +113,45 @@ class BasicResourcePermissions:
 class OrdinoRResourcePermissions:
     """
     Advanced resource permission system using OrdinoR library (Yang et al. 2022).
-    
-    Implements the best performing configuration for BPIC2017:
-    Resource permissions using OrdinoR library with Trace Clustering.
+
+    Supports two profiling modes:
+    - 'full_recall': Groups inherit ALL activities from ANY member (recommended for simulation)
+    - 'overall_score': Original OrdinoR profiling with threshold (precision-optimized)
+
+    FullRecall provides principled generalization: if resources X and Y are clustered
+    together based on similar behavioral profiles, and Y performed activity A but X
+    never did, X is still permitted to do A based on role inference.
     """
-    
-    def __init__(self, log_path: str = None, df: pd.DataFrame = None, filter_completed: bool = True, exclude_resources: List[str] = None):
+
+    def __init__(self, log_path: str = None, df: pd.DataFrame = None,
+                 filter_completed: bool = True, exclude_resources: List[str] = None,
+                 profiling_mode: str = 'full_recall'):
         """
         Initialize OrdinoR permissions.
-        
+
         Args:
             log_path: Path to event log XES.
             df: Optional Pandas DataFrame (if log_path not provided).
             filter_completed: Whether to keep only completed events.
             exclude_resources: list of resources to exclude.
+            profiling_mode: 'full_recall' (default, for simulation) or 'overall_score' (strict).
         """
-        self.model = None
+        if profiling_mode not in ('full_recall', 'overall_score'):
+            raise ValueError(f"profiling_mode must be 'full_recall' or 'overall_score', got '{profiling_mode}'")
+
+        self.profiling_mode = profiling_mode
+        self.model = None  # OrdinoR OrganizationalModel (for overall_score mode)
         self.log_path = log_path
         self.df = None
-        
+
         self.filter_completed = filter_completed
         self.exclude_resources = exclude_resources or []
-        
+
+        # FullRecall mode structures
+        self._groups: List[Set[str]] = []  # List of resource groups
+        self._activity_to_groups: Dict[str, Set[int]] = {}  # activity -> set of group indices
+        self._resource_to_group: Dict[str, int] = {}  # resource -> group index
+
         # Mapping from case_id to case_type (cluster ID)
         self._case_to_cluster = {}
         
@@ -167,147 +184,211 @@ class OrdinoRResourcePermissions:
              
         return df_out
 
-    def discover_model(self, n_resource_clusters: int = 10, w1: float = 0.5, p: float = 0.5, 
+    def discover_model(self, n_resource_clusters: int = 10, w1: float = 0.5, p: float = 0.5,
                         case_type_column: str = 'case:LoanGoal'):
         """
         Discover organizational model using OrdinoR pipeline.
-        
+
         Uses case attributes (e.g., LoanGoal) directly for Case Type dimension
         instead of trace clustering. This approach is suitable for simulation because
         case attributes are known at case instantiation (before any activities occur).
-        
+
         Args:
             n_resource_clusters: Number of resource groups to discover (AHC).
-            w1: Profiling weight for Relative Stake (default 0.5).
-            p: Profiling threshold (default 0.5).
+            w1: Profiling weight for Relative Stake (default 0.5, only for overall_score mode).
+            p: Profiling threshold (default 0.5, only for overall_score mode).
             case_type_column: Column name for case type (default 'case:LoanGoal').
         """
         import time
         import threading
         import sys
-        
+
         n_events = len(self.df)
         n_resources = self.df['org:resource'].nunique()
         n_activities = self.df['concept:name'].nunique()
-        
+
+        mode_label = "FullRecall" if self.profiling_mode == 'full_recall' else "OverallScore"
+
         print(f"\n{'='*60}")
-        print(f"OrdinoR Discovery Pipeline")
+        print(f"OrdinoR Discovery Pipeline ({mode_label})")
         print(f"{'='*60}")
         print(f"Dataset: {n_events:,} events, {n_resources} resources, {n_activities} activities")
-        print(f"Config: Case Type from '{case_type_column}', {n_resource_clusters} resource clusters")
+        print(f"Config: {n_resource_clusters} resource clusters, mode={self.profiling_mode}")
         print(f"{'='*60}\n")
-        
-        logger.info("Starting OrdinoR discovery pipeline...")
-        
-        # Validate case type column
-        if case_type_column not in self.df.columns:
-            available = [c for c in self.df.columns if c.startswith('case:')]
-            raise ValueError(f"Column '{case_type_column}' not found. Available case columns: {available}")
-        
-        # Step 1: Extract Case Types from attributes
-        print(f"[1/4] Extracting Case Types from '{case_type_column}'...")
+
+        logger.info(f"Starting OrdinoR discovery pipeline (mode={self.profiling_mode})...")
+
+        # Step 1: Prepare DataFrame
+        print("[1/3] Preparing data...")
         start = time.time()
-        
+
         rl_df = self.df.copy()
-        rl_df['case_type'] = rl_df[case_type_column].astype(str)
-        
-        n_case_types = rl_df['case_type'].nunique()
-        case_type_values = rl_df['case_type'].unique().tolist()
-        print(f"      ✓ Found {n_case_types} case types: {case_type_values[:5]}{'...' if n_case_types > 5 else ''}")
-        print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
-        
-        # Step 2: Construct Execution Contexts (CT+AT+TT)
-        print("[2/4] Constructing Execution Contexts (CT+AT+TT)...")
-        start = time.time()
-        
         rl_df['activity_type'] = rl_df['concept:name']
-        
+
         if 'time:timestamp' in rl_df.columns:
             rl_df['time:timestamp'] = pd.to_datetime(rl_df['time:timestamp'], utc=True)
             rl_df['time_type'] = rl_df['time:timestamp'].dt.day_name()
         else:
             logger.warning("No timestamp found, using default time type")
             rl_df['time_type'] = "AnyTime"
-        
-        n_contexts = rl_df.groupby(['case_type', 'activity_type', 'time_type']).ngroups
-        print(f"      ✓ Created {n_contexts} unique execution contexts in {time.time() - start:.1f}s\n")
-        
-        # Step 3: Resource Profiling & Clustering
-        print("[3/4] Building Resource Profiles & Clustering (AHC)...")
+
+        # Case type (only needed for overall_score context matching)
+        if case_type_column in self.df.columns:
+            rl_df['case_type'] = rl_df[case_type_column].astype(str)
+        else:
+            rl_df['case_type'] = "Default"
+
+        print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
+
+        # Step 2: Resource Profiling & Clustering (shared between modes)
+        print("[2/3] Building Resource Profiles & Clustering (AHC)...")
         start = time.time()
         profiles = resource_features.direct_count(rl_df)
-        
+
         groups = group_discovery.ahc(
-            profiles, 
-            n_groups=n_resource_clusters, 
-            method='ward', 
+            profiles,
+            n_groups=n_resource_clusters,
+            method='ward',
             metric='euclidean'
         )
         print(f"      ✓ Discovered {len(groups)} groups in {time.time() - start:.1f}s\n")
-        
-        # Step 4: Group Profiling (computationally intensive)
-        print("[4/4] Profiling Groups (OverallScore)...")
-        est_minutes = n_events / 8000  # Empirical: ~8000 events/minute
-        print(f"      ⚠ Estimated time: ~{est_minutes:.0f} minutes for {n_events:,} events")
-        start = time.time()
-        
-        # Progress monitoring for long-running operations
-        stop_monitor = threading.Event()
-        
-        def monitor_progress():
-            elapsed = 0
-            while not stop_monitor.is_set():
-                time.sleep(5)
-                elapsed += 5
-                mins = elapsed / 60
-                progress = min(99, (mins / est_minutes) * 100)
-                eta = max(0, est_minutes - mins)
-                sys.stdout.write(f"\r      ⏱ Elapsed: {mins:.1f} min | Progress: ~{progress:.0f}% | ETA: ~{eta:.1f} min")
+
+        # Step 3: Profiling (mode-dependent)
+        if self.profiling_mode == 'full_recall':
+            print("[3/3] Building FullRecall capability map...")
+            start = time.time()
+            self._build_full_recall_model(groups, rl_df)
+            print(f"      ✓ Completed in {time.time() - start:.1f}s\n")
+        else:
+            # overall_score mode - computationally intensive
+            print("[3/3] Profiling Groups (OverallScore)...")
+            est_minutes = n_events / 8000  # Empirical: ~8000 events/minute
+            print(f"      ⚠ Estimated time: ~{est_minutes:.0f} minutes for {n_events:,} events")
+            start = time.time()
+
+            # Progress monitoring for long-running operations
+            stop_monitor = threading.Event()
+
+            def monitor_progress():
+                elapsed = 0
+                while not stop_monitor.is_set():
+                    time.sleep(5)
+                    elapsed += 5
+                    mins = elapsed / 60
+                    progress = min(99, (mins / est_minutes) * 100)
+                    eta = max(0, est_minutes - mins)
+                    sys.stdout.write(f"\r      ⏱ Elapsed: {mins:.1f} min | Progress: ~{progress:.0f}% | ETA: ~{eta:.1f} min")
+                    sys.stdout.flush()
+
+            monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+            monitor_thread.start()
+
+            try:
+                self.model = group_profiling.overall_score(
+                    groups, rl_df, w1=w1, p=p, auto_search=True
+                )
+            finally:
+                stop_monitor.set()
+                monitor_thread.join(timeout=1)
+                sys.stdout.write("\r" + " " * 100 + "\r")
                 sys.stdout.flush()
-        
-        monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
-        monitor_thread.start()
-        
-        try:
-            self.model = group_profiling.overall_score(
-                groups, rl_df, w1=w1, p=p, auto_search=True
-            )
-        finally:
-            stop_monitor.set()
-            monitor_thread.join(timeout=1)
-            sys.stdout.write("\r" + " " * 100 + "\r")
-            sys.stdout.flush()
-        
-        elapsed = time.time() - start
-        print(f"      ✓ Completed in {elapsed:.1f}s ({elapsed/60:.1f} min)\n")
-        
+
+            elapsed = time.time() - start
+            print(f"      ✓ Completed in {elapsed:.1f}s ({elapsed/60:.1f} min)\n")
+
         print(f"{'='*60}")
         print(f"Discovery Complete! Model has {len(groups)} resource groups.")
         print(f"{'='*60}\n")
         logger.info(f"Discovery complete. Model has {len(groups)} groups.")
 
+    def _build_full_recall_model(self, groups: List, rl_df: pd.DataFrame):
+        """
+        Build FullRecall capability model from discovered groups.
+
+        For each group, computes the union of all activities performed by any member.
+        This enables role-based generalization: if X and Y are in the same group and
+        Y did activity A, then X is also permitted to do A.
+        """
+        # Extract groups as sets of resources
+        self._groups = []
+        self._resource_to_group = {}
+
+        for idx, group in enumerate(groups):
+            # Group structure from OrdinoR: frozenset of resources
+            if isinstance(group, (set, frozenset)):
+                resources = set(group)
+            else:
+                # Might be a tuple or other structure
+                resources = set(group) if hasattr(group, '__iter__') else {group}
+
+            self._groups.append(resources)
+            for resource in resources:
+                self._resource_to_group[resource] = idx
+
+        # Build activity -> groups mapping based on historical performance
+        self._activity_to_groups = {}
+        activity_resource_map = rl_df.groupby('concept:name')['org:resource'].apply(set).to_dict()
+
+        for activity, performers in activity_resource_map.items():
+            eligible_groups = set()
+            for resource in performers:
+                if resource in self._resource_to_group:
+                    eligible_groups.add(self._resource_to_group[resource])
+            self._activity_to_groups[activity] = eligible_groups
+
+        # Log statistics
+        n_activities = len(self._activity_to_groups)
+        avg_groups_per_activity = sum(len(g) for g in self._activity_to_groups.values()) / n_activities if n_activities else 0
+        logger.info(f"FullRecall model: {len(self._groups)} groups, {n_activities} activities, "
+                   f"avg {avg_groups_per_activity:.1f} groups per activity")
+
     def get_eligible_resources(self, activity: str, timestamp: pd.Timestamp = None, case_type: str = None) -> List[str]:
         """
         Get resources eligible for a given activity, respecting context if provided.
-        
+
         Args:
             activity: The activity name.
-            timestamp: Optional timestamp to enforce Time Type context (derives day of week).
-            case_type: Optional Case Type (e.g., "Home improvement", "Car").
-            
+            timestamp: Optional timestamp (used for context in overall_score mode).
+            case_type: Optional Case Type (used for context in overall_score mode).
+
         Returns:
             List of resource IDs.
         """
-        if self.model is None:
-            logger.warning("Model not discovered yet!")
+        # FullRecall mode: simple group-based lookup
+        if self.profiling_mode == 'full_recall':
+            return self._get_eligible_full_recall(activity)
+
+        # OverallScore mode: context-aware lookup using OrdinoR model
+        return self._get_eligible_overall_score(activity, timestamp, case_type)
+
+    def _get_eligible_full_recall(self, activity: str) -> List[str]:
+        """Get eligible resources using FullRecall mode (group-based)."""
+        if not self._groups:
+            logger.warning("FullRecall model not built yet!")
             return []
-        
+
+        eligible_groups = self._activity_to_groups.get(activity, set())
+        if not eligible_groups:
+            return []
+
+        # Return all resources from all eligible groups
+        eligible_resources = set()
+        for group_idx in eligible_groups:
+            eligible_resources.update(self._groups[group_idx])
+
+        return list(eligible_resources)
+
+    def _get_eligible_overall_score(self, activity: str, timestamp: pd.Timestamp = None, case_type: str = None) -> List[str]:
+        """Get eligible resources using OverallScore mode (context-aware)."""
+        if self.model is None:
+            logger.warning("OverallScore model not discovered yet!")
+            return []
+
         # OrdinoR Execution Context is a tuple: (case_type, activity_type, time_type)
-        
+
         # 1. Determine constraints
         target_time_type = None
         if timestamp:
-            # Match the time type definition in discovery (Day Name)
             try:
                 if isinstance(timestamp, str):
                     ts = pd.to_datetime(timestamp)
@@ -317,43 +398,30 @@ class OrdinoRResourcePermissions:
             except Exception as e:
                 logger.warning(f"Failed to derive time type from {timestamp}: {e}")
 
-        # Case Type: Use explicit case_type if provided
-        target_case_type = None
-        if case_type:
-            target_case_type = str(case_type)
-        
+        target_case_type = str(case_type) if case_type else None
+
         all_contexts = self.model.find_all_execution_contexts()
-        
+
         matching_contexts = []
         for ctx in all_contexts:
-            # OrdinoR uses tuples for contexts: (case_type, activity_type, time_type)
-            # activity_type is at index 1
             if isinstance(ctx, tuple) and len(ctx) >= 3:
                 c_case, c_act, c_time = ctx[0], ctx[1], ctx[2]
-                
-                # Check Activity
+
                 if c_act != activity:
                     continue
-                    
-                # Check Time Context (if provided)
                 if target_time_type and c_time != "AnyTime" and c_time != target_time_type:
                     continue
-                    
-                # Check Case Context (if provided and known)
                 if target_case_type and c_case != target_case_type:
                     continue
-                    
+
                 matching_contexts.append(ctx)
-            elif isinstance(ctx, str):
-                # Fallback
-                if activity in ctx:
-                    matching_contexts.append(ctx)
-        
+            elif isinstance(ctx, str) and activity in ctx:
+                matching_contexts.append(ctx)
+
         eligible_resources = set()
         for ctx in matching_contexts:
             group_ids = self.model.find_candidate_groups(ctx)
             for gid in group_ids:
-                # OrdinoR might return the group (set of resources) or an ID
                 if isinstance(gid, (set, frozenset, list, tuple)):
                     eligible_resources.update(gid)
                 else:
@@ -361,17 +429,9 @@ class OrdinoRResourcePermissions:
                         members = self.model.find_group_members(gid)
                         eligible_resources.update(members)
                     except KeyError:
-                        # Fallback or strict error? 
-                        # If gid is not in _mem, maybe it's invalid ID?
                         logger.warning(f"Group ID {gid} not found in model members.")
-        
-        # Initialize cache if needed (e.g. if accessed before discovery, though unlikely)
-        if not hasattr(self, '_eligible_cache'):
-            self._eligible_cache = {}
-            
-        result = list(eligible_resources)
-        self._eligible_cache[activity] = result
-        return result
+
+        return list(eligible_resources)
 
     def get_coverage_stats(self) -> Dict[str, Any]:
         """
@@ -398,14 +458,29 @@ class OrdinoRResourcePermissions:
 
     def save_model(self, path: str):
         """Save the discovered model to a file."""
-        if self.model is None:
-            logger.warning("No model to save.")
-            return
-        
+        if self.profiling_mode == 'full_recall':
+            if not self._groups:
+                logger.warning("No FullRecall model to save.")
+                return
+            model_data = {
+                'profiling_mode': 'full_recall',
+                'groups': self._groups,
+                'activity_to_groups': self._activity_to_groups,
+                'resource_to_group': self._resource_to_group
+            }
+        else:
+            if self.model is None:
+                logger.warning("No OverallScore model to save.")
+                return
+            model_data = {
+                'profiling_mode': 'overall_score',
+                'model': self.model
+            }
+
         try:
             with open(path, 'wb') as f:
-                pickle.dump(self.model, f)
-            logger.info(f"Model saved to {path}")
+                pickle.dump(model_data, f)
+            logger.info(f"Model saved to {path} (mode={self.profiling_mode})")
         except Exception as e:
             logger.error(f"Failed to save model: {e}")
 
@@ -413,13 +488,31 @@ class OrdinoRResourcePermissions:
         """Load a discovered model from a file."""
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model cache not found: {path}")
-            
+
         try:
             with open(path, 'rb') as f:
-                self.model = pickle.load(f)
-            logger.info(f"Model loaded from {path}")
-            # Reset cache
-            self._eligible_cache = {}
+                data = pickle.load(f)
+
+            # Handle both old format (direct OrdinoR model) and new format (dict with mode)
+            if isinstance(data, dict) and 'profiling_mode' in data:
+                saved_mode = data['profiling_mode']
+
+                if saved_mode == 'full_recall':
+                    self._groups = data['groups']
+                    self._activity_to_groups = data['activity_to_groups']
+                    self._resource_to_group = data['resource_to_group']
+                    self.profiling_mode = 'full_recall'
+                    logger.info(f"FullRecall model loaded from {path}")
+                else:
+                    self.model = data['model']
+                    self.profiling_mode = 'overall_score'
+                    logger.info(f"OverallScore model loaded from {path}")
+            else:
+                # Legacy format: direct OrdinoR OrganizationalModel
+                self.model = data
+                self.profiling_mode = 'overall_score'
+                logger.info(f"Legacy OverallScore model loaded from {path}")
+
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
