@@ -227,6 +227,23 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         df['date'] = df['time:timestamp'].dt.date
         
         for resource in self.resources:
+            # Special handling for System User (User_1)
+            if resource == "User_1":
+                self.resource_patterns[resource] = {
+                    'working_start': 0,
+                    'working_end': 24,
+                    'working_days': {0, 1, 2, 3, 4, 5, 6},  # Mon-Sun
+                    'peak_hours': set(range(24)),
+                    'hour_probabilities': {h: 1.0 for h in range(24)},
+                    'dow_probabilities': {d: 1.0 for d in range(7)},
+                    'first_activity': df['time:timestamp'].min(),
+                    'last_activity': df['time:timestamp'].max(),
+                    'total_activities': 999999, # Artificially high
+                    'activity_intensity': 999.0,
+                    'active_days': 365,
+                }
+                continue
+
             resource_df = df[df['org:resource'] == resource]
             
             if len(resource_df) < self.min_activity_threshold:
@@ -631,12 +648,12 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         instance = cls(
             event_log_df,
             interval_days=config['interval_days'],
+            workday_start_hour=config['workday_start_hour'],
             workday_end_hour=config['workday_end_hour'],
             working_cycle_days=set(config['working_cycle_days']),
             enable_pattern_mining=False,
             enable_lifecycle_tracking=False,
             min_activity_threshold=config['min_activity_threshold'],
-            use_cache=False  # IMPORTANT: Prevent infinite recursion during loading
         )
         
         instance.cycle_start_date = model_data['cycle_start_date']
