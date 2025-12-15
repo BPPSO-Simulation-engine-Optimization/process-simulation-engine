@@ -115,7 +115,7 @@ available = model.get_available_resources(check_time)
 | 4 | 34 | 7:00-20:00 | Extended hours |
 
 **Top Resources:**
-- User_1: 148,404 activities (24/7 - likely automated)
+- User_1: 148,404 activities (24/7 - automated)
 - User_3: 26,342 activities (5:00-21:00)
 - User_5: 22,900 activities (5:00-21:00)
 

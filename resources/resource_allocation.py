@@ -7,7 +7,7 @@ import logging
 import os
 
 from resources.resource_permissions.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
-from resources.resource_availabilities.resource_availabilities import ResourceAvailabilityModel
+from resources.resource_availabilities.resource_availabilities import AdvancedResourceAvailabilityModel
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class ResourceAllocator:
     Serves as the central entry point for resource management in the simulation.
     Orchestrates:
     1. Permission Model (Basic, OrdinoR-FullRecall, or OrdinoR-OverallScore) - Who is qualified?
-    2. Availability Model (Working Hours) - Who is free?
+    2. Availability Model (Advanced) - Who is free based on mined patterns?
 
     Permission Methods:
     - 'basic': Simple historical lookup (resource did activity before)
@@ -29,7 +29,8 @@ class ResourceAllocator:
     def __init__(self, log_path: str = None, permission_method: str = 'ordinor',
                  n_resource_clusters: int = 10,
                  use_sample: int = None, cache_path: str = None, df: pd.DataFrame = None,
-                 permissions_model = None):
+                 permissions_model = None, availability_model = None,
+                 availability_config: dict = None):
         """
         Initialize the ResourceAllocator.
 
@@ -45,6 +46,8 @@ class ResourceAllocator:
                         Defaults to 'resources/resource_permissions/ordinor_fullrecall.pkl' for 'ordinor' method.
             df: Optional pre-loaded DataFrame. If provided, log_path is ignored.
             permissions_model: Optional pre-initialized permissions object (Dependency Injection).
+            availability_model: Optional pre-initialized availability object (Dependency Injection).
+            availability_config: Config dict for AdvancedResourceAvailabilityModel.
         """
         self.log_path = log_path
         self.permission_method = permission_method.lower()
@@ -59,25 +62,28 @@ class ResourceAllocator:
              self.df = df
         elif log_path:
              self.df = self._load_log(log_path, use_sample)
-        elif permissions_model is None:
+        elif permissions_model is None and availability_model is None:
              # Only raise if we need to load data ourselves. 
-             # If permissions_model is provided, we might not strictly need df/log_path immediately 
-             # unless availability model needs it.
-             raise ValueError("Either log_path, df, or permissions_model must be provided.")
+             # If models are provided, we might not strictly need df/log_path immediately 
+             raise ValueError("Either log_path, df, or pre-initialized models must be provided.")
         else:
              self.df = None
         
         # 2. Initialize Availability Model
-        logger.info("Initializing Resource Availability Model...")
-        if self.df is not None:
-            self.availability = ResourceAvailabilityModel(event_log_df=self.df)
-        elif permissions_model:
-            # If mocking, we might mock availability too, or need to handle this case.
-            # For now, let's assume if DI is used, we might want to inject availability too?
-            # Keeping it simple: If DI is used (tests), we might mock availability or 
-            # the availability definition below might fail if self.df is None.
-            # But the Original test mocks availability separately.
-            pass
+        if availability_model:
+            self.availability = availability_model
+        else:
+            logger.info("Initializing Advanced Resource Availability Model...")
+            if self.df is not None:
+                config = availability_config or {}
+                self.availability = AdvancedResourceAvailabilityModel(
+                    event_log_df=self.df,
+                    **config
+                )
+            else:
+                # Fallback if no df and no model provided (though check above should catch this)
+                logger.warning("No DataFrame available to initialize Availability Model.")
+                self.availability = None
 
         # 3. Initialize Permission Model
         if permissions_model:
@@ -175,6 +181,6 @@ class ResourceAllocator:
             # logger.debug(f"No available resources found for activity '{activity}' at {timestamp}.")
             return None
 
-        # 3. Selection (Random for now)
+        # 3. Selection (Random for now, TODO improve in optimization?)
         selected_resource = random.choice(available_resources)
         return selected_resource
