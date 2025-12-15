@@ -136,10 +136,10 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         workday_start_hour: int = 8,
         workday_end_hour: int = 17,
         working_cycle_days: Optional[Set[int]] = None,
-        enable_pattern_mining: bool = True,
-        enable_lifecycle_tracking: bool = True,
+        enable_pattern_mining: bool = False,
+        enable_lifecycle_tracking: bool = False,
         min_activity_threshold: int = 10,
-        model_cache_path: str = "models/resource_availability_cache.pkl",
+        model_cache_path: Optional[str] = None,
         use_cache: bool = True,
     ):
         """
@@ -151,12 +151,16 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             workday_start_hour: Default start hour
             workday_end_hour: Default end hour
             working_cycle_days: Default working days
-            enable_pattern_mining: Whether to mine resource patterns from data
-            enable_lifecycle_tracking: Whether to track busy periods from lifecycle data
+            enable_pattern_mining: Whether to mine resource patterns from data (default: False, loads from cache)
+            enable_lifecycle_tracking: Whether to track busy periods from lifecycle data (default: False, loads from cache)
             min_activity_threshold: Minimum activities required to mine patterns
-            model_cache_path: Path to save/load cached model (default: models/resource_availability_cache.pkl)
+            model_cache_path: Path to save/load cached model (default: models/bpic2017_resource_model.pkl)
             use_cache: If True, try to load from cache first, otherwise always train (default: True)
         """
+        # Set default cache path to the standard location
+        if model_cache_path is None:
+            model_cache_path = str(Path(__file__).parent.parent / "models" / "bpic2017_resource_model.pkl")
+        
         # Check if we should load from cache
         if use_cache and Path(model_cache_path).exists():
             print(f"[AUTO-LOAD] Found cached model at {model_cache_path}")
@@ -175,6 +179,9 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         if use_cache and not Path(model_cache_path).exists():
             print(f"[AUTO-TRAIN] No cached model found at {model_cache_path}")
             print(f"             Training from scratch (this may take 10-30 seconds)...")
+            # Enable training
+            enable_pattern_mining = True
+            enable_lifecycle_tracking = True
         
         super().__init__(
             event_log_df, 
@@ -204,11 +211,11 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         if enable_lifecycle_tracking and 'lifecycle:transition' in event_log_df.columns:
             self._extract_busy_periods()
         
-        # Auto-save to cache after training
+        # Auto-save to cache after training (only if we actually trained)
         if use_cache and (enable_pattern_mining or enable_lifecycle_tracking):
             print(f"[AUTO-SAVE] Saving trained model to {model_cache_path} for future use...")
             self.save_model(model_cache_path)
-            print(f"[AUTO-SAVE] Next time initialization will be much faster!")
+            print(f"[AUTO-SAVE] Model saved! Next time initialization will be much faster!")
 
     def _mine_resource_patterns(self):
         """Mine work patterns for each resource from historical event log."""
