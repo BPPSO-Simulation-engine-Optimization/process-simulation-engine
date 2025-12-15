@@ -70,12 +70,12 @@ class SimulationEngineClass:
         
         # Initialize processing time predictor if not already initialized
         if self.processing_time_predictor is None:
-            print("Initializing processing time predictor...")
-            # Use original data (before preparation) for processing time prediction
-            # as we need raw timestamps and lifecycle transitions
-            data_for_extraction = self.originalDataLogDf if self.originalDataLogDf is not None else self.dataLogDf
+            print("Initializing processing time predictor (loading model from disk)...")
+            # Processing time model must be trained beforehand and saved to disk
+            # using `train_processing_time_model.py`. We load it here.
             self.processing_time_predictor = ProcessingTimePredictionClass(
-                data_for_extraction, method=self.processing_time_method
+                method=self.processing_time_method,
+                model_path="models/processing_time_model"
             )
 
         #Simulation
