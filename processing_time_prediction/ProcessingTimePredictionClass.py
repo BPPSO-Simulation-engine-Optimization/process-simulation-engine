@@ -53,6 +53,8 @@ class ProcessingTimePredictionClass:
         self.lifecycle_encoder: Optional[LabelEncoder] = None
         self.resource_encoder: Optional[LabelEncoder] = None
         self.event_history: List[Dict] = []
+        self.y_mean: Optional[float] = None
+        self.y_std: Optional[float] = None
 
         base_path = model_path or "models/processing_time_model"
         self.load_model(base_path)
@@ -185,11 +187,19 @@ class ProcessingTimePredictionClass:
             if not TF_AVAILABLE:
                 raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
             
-            model_path = f"{filepath}_lstm_model.h5"
+            model_path_h5 = f"{filepath}_lstm_model.h5"
+            model_path_keras = f"{filepath}_lstm_model.keras"
             encoders_path = f"{filepath}_encoders.joblib"
             
-            if not all(os.path.exists(p) for p in [model_path, encoders_path]):
-                raise FileNotFoundError(f"Probabilistic ML model files not found at {filepath}")
+            if os.path.exists(model_path_keras):
+                model_path = model_path_keras
+            elif os.path.exists(model_path_h5):
+                model_path = model_path_h5
+            else:
+                raise FileNotFoundError(f"Probabilistic ML model file not found at {filepath}")
+            
+            if not os.path.exists(encoders_path):
+                raise FileNotFoundError(f"Encoders file not found at {encoders_path}")
             
             self.lstm_model = keras.models.load_model(model_path, compile=False)
             encoders = joblib.load(encoders_path)
@@ -197,8 +207,10 @@ class ProcessingTimePredictionClass:
             self.lifecycle_encoder = encoders['lifecycle_encoder']
             self.resource_encoder = encoders['resource_encoder']
             self.sequence_length = metadata.get('sequence_length', 10)
+            self.y_mean = metadata.get('y_mean', 0.0)
+            self.y_std = metadata.get('y_std', 1.0)
             
-            print(f"Probabilistic ML model loaded from {filepath}_*.joblib and {filepath}_lstm_model.h5")
+            print(f"Probabilistic ML model loaded from {filepath}_*.joblib and {model_path}")
 
     def predict(
         self,
@@ -256,9 +268,11 @@ class ProcessingTimePredictionClass:
                 )
                 
                 pred = self.lstm_model.predict([seq_input, ctx_input], verbose=0)
-                mean_pred_val = max(0.0, float(pred[0, 0]))
-                log_var_pred = pred[0, 1]
-                std_pred = np.sqrt(np.exp(log_var_pred) + 1e-6)
+                mean_pred_norm = pred[0, 0]
+                log_var_pred = np.clip(pred[0, 1], -10, 10)
+                mean_pred_log = mean_pred_norm * self.y_std + self.y_mean
+                mean_pred_val = max(0.0, float(np.exp(mean_pred_log) - 1.0))
+                std_pred = np.sqrt(np.exp(log_var_pred) + 1e-6) * np.exp(mean_pred_log)
                 
                 sample = np.random.normal(mean_pred_val, std_pred)
                 sample = max(0.0, float(sample))
@@ -376,34 +390,80 @@ class ProcessingTimePredictionClass:
         if context is None:
             context = {}
         
+        num_activities = len(self.activity_encoder.classes_)
+        num_lifecycles = len(self.lifecycle_encoder.classes_)
+        num_resources = len(self.resource_encoder.classes_)
+        feature_dim = num_activities + num_lifecycles + num_resources
+        
         sequence = []
         for event in self.event_history[-self.sequence_length:]:
             try:
                 activity_idx = self.activity_encoder.transform([event['activity']])[0]
+            except (ValueError, KeyError):
+                activity_idx = None
+            
+            try:
                 lifecycle_idx = self.lifecycle_encoder.transform([event['lifecycle']])[0]
+            except (ValueError, KeyError):
+                lifecycle_idx = None
+            
+            try:
                 resource_idx = self.resource_encoder.transform([event['resource']])[0]
-                sequence.append([activity_idx, lifecycle_idx, resource_idx])
-            except:
-                sequence.append([0, 0, 0])
+            except (ValueError, KeyError):
+                resource_idx = None
+            
+            activity_onehot = np.zeros(num_activities)
+            if activity_idx is not None:
+                activity_onehot[activity_idx] = 1.0
+            
+            lifecycle_onehot = np.zeros(num_lifecycles)
+            if lifecycle_idx is not None:
+                lifecycle_onehot[lifecycle_idx] = 1.0
+            
+            resource_onehot = np.zeros(num_resources)
+            if resource_idx is not None:
+                resource_onehot[resource_idx] = 1.0
+            
+            combined_onehot = np.concatenate([activity_onehot, lifecycle_onehot, resource_onehot])
+            sequence.append(combined_onehot)
         
         try:
             activity_idx = self.activity_encoder.transform([prev_activity])[0]
-        except:
-            activity_idx = 0
+        except (ValueError, KeyError):
+            warnings.warn(f"Unknown activity '{prev_activity}' not in training data. Using all-zeros encoding.")
+            activity_idx = None
+        
         try:
             lifecycle_idx = self.lifecycle_encoder.transform([prev_lifecycle])[0]
-        except:
-            lifecycle_idx = 0
+        except (ValueError, KeyError):
+            warnings.warn(f"Unknown lifecycle '{prev_lifecycle}' not in training data. Using all-zeros encoding.")
+            lifecycle_idx = None
+        
         try:
             resource = context.get('resource_1', 'unknown') if context else 'unknown'
             resource_idx = self.resource_encoder.transform([resource])[0]
-        except:
-            resource_idx = 0
+        except (ValueError, KeyError):
+            warnings.warn(f"Unknown resource '{resource}' not in training data. Using all-zeros encoding.")
+            resource_idx = None
         
-        sequence.append([activity_idx, lifecycle_idx, resource_idx])
+        activity_onehot = np.zeros(num_activities)
+        if activity_idx is not None:
+            activity_onehot[activity_idx] = 1.0
         
+        lifecycle_onehot = np.zeros(num_lifecycles)
+        if lifecycle_idx is not None:
+            lifecycle_onehot[lifecycle_idx] = 1.0
+        
+        resource_onehot = np.zeros(num_resources)
+        if resource_idx is not None:
+            resource_onehot[resource_idx] = 1.0
+        
+        combined_onehot = np.concatenate([activity_onehot, lifecycle_onehot, resource_onehot])
+        sequence.append(combined_onehot)
+        
+        padding = np.zeros(feature_dim)
         while len(sequence) < self.sequence_length:
-            sequence = [[0, 0, 0]] + sequence
+            sequence = [padding] + sequence
         
         sequence = sequence[-self.sequence_length:]
         seq_array = np.array([sequence])
@@ -487,9 +547,11 @@ class ProcessingTimePredictionClass:
             )
             
             pred = self.lstm_model.predict([seq_input, ctx_input], verbose=0)
-            mean_pred_val = max(0.0, float(pred[0, 0]))
-            log_var_pred = pred[0, 1]
-            std_pred = np.sqrt(np.exp(log_var_pred) + 1e-6)
+            mean_pred_norm = pred[0, 0]
+            log_var_pred = np.clip(pred[0, 1], -10, 10)
+            mean_pred_log = mean_pred_norm * self.y_std + self.y_mean
+            mean_pred_val = max(0.0, float(np.exp(mean_pred_log) - 1.0))
+            std_pred = np.sqrt(np.exp(log_var_pred) + 1e-6) * np.exp(mean_pred_log)
             
             return {
                 'mean': mean_pred_val,

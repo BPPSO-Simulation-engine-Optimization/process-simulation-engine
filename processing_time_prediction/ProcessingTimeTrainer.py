@@ -13,9 +13,11 @@ try:
     import tensorflow as tf
     from tensorflow import keras
     from tensorflow.keras import layers
+    from tensorflow.keras.layers import Lambda
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
+    Lambda = None
 
 
 class ProcessingTimeTrainer:
@@ -72,6 +74,8 @@ class ProcessingTimeTrainer:
         self.activity_encoder: Optional[LabelEncoder] = None
         self.lifecycle_encoder: Optional[LabelEncoder] = None
         self.resource_encoder: Optional[LabelEncoder] = None
+        self.y_mean: Optional[float] = None
+        self.y_std: Optional[float] = None
 
     def fit_distributions(self):
         """
@@ -505,6 +509,10 @@ class ProcessingTimeTrainer:
             
             case_start_time = case_data["time:timestamp"].min()
             
+            num_activities = len(self.activity_encoder.classes_)
+            num_lifecycles = len(self.lifecycle_encoder.classes_)
+            num_resources = len(self.resource_encoder.classes_)
+            
             case_sequence = []
             case_contexts = []
             case_targets = []
@@ -523,7 +531,17 @@ class ProcessingTimeTrainer:
                 lifecycle_idx = self.lifecycle_encoder.transform([lifecycle])[0]
                 resource_idx = self.resource_encoder.transform([resource])[0]
                 
-                case_sequence.append([activity_idx, lifecycle_idx, resource_idx])
+                activity_onehot = np.zeros(num_activities)
+                activity_onehot[activity_idx] = 1.0
+                
+                lifecycle_onehot = np.zeros(num_lifecycles)
+                lifecycle_onehot[lifecycle_idx] = 1.0
+                
+                resource_onehot = np.zeros(num_resources)
+                resource_onehot[resource_idx] = 1.0
+                
+                combined_onehot = np.concatenate([activity_onehot, lifecycle_onehot, resource_onehot])
+                case_sequence.append(combined_onehot)
                 
                 timestamp = event["time:timestamp"]
                 time_since_start = (timestamp - case_start_time).total_seconds()
@@ -562,15 +580,36 @@ class ProcessingTimeTrainer:
                 else:
                     case_targets.append(None)
             
+            num_activities = len(self.activity_encoder.classes_)
+            num_lifecycles = len(self.lifecycle_encoder.classes_)
+            num_resources = len(self.resource_encoder.classes_)
+            feature_dim = num_activities + num_lifecycles + num_resources
+            padding = np.zeros(feature_dim)
+            
+            all_targets = []
+            for i in range(len(case_sequence) - 1):
+                if case_targets[i] is not None:
+                    all_targets.append(case_targets[i])
+            
+            if not all_targets:
+                continue
+            
+            mean_y = np.mean(all_targets)
+            std_y = np.std(all_targets)
+            outlier_threshold = mean_y + 3 * std_y
+            
             for i in range(len(case_sequence) - 1):
                 if case_targets[i] is None:
+                    continue
+                
+                if case_targets[i] > outlier_threshold:
                     continue
                 
                 seq_start = max(0, i + 1 - self.sequence_length)
                 seq = case_sequence[seq_start:i+1]
                 
                 while len(seq) < self.sequence_length:
-                    seq = [[0, 0, 0]] + seq
+                    seq = [padding] + seq
                 
                 sequences.append(seq)
                 contexts.append(case_contexts[i])
@@ -579,10 +618,92 @@ class ProcessingTimeTrainer:
         if not sequences:
             raise ValueError("No valid sequences found in event log!")
         
-        X_seq = np.array(sequences)
-        X_ctx = np.array(contexts)
-        y = np.array(targets)
+        print(f"Converting {len(sequences)} sequences to numpy arrays (this may take a moment)...")
+        try:
+            X_seq = np.array(sequences, dtype=np.float32)
+            X_ctx = np.array(contexts, dtype=np.float32)
+            y = np.array(targets, dtype=np.float32)
+        except MemoryError:
+            print("Memory error during array conversion. Trying batch processing...")
+            batch_size = 100000
+            X_seq_batches = []
+            X_ctx_batches = []
+            y_batches = []
+            
+            for i in range(0, len(sequences), batch_size):
+                batch_end = min(i + batch_size, len(sequences))
+                X_seq_batches.append(np.array(sequences[i:batch_end], dtype=np.float32))
+                X_ctx_batches.append(np.array(contexts[i:batch_end], dtype=np.float32))
+                y_batches.append(np.array(targets[i:batch_end], dtype=np.float32))
+            
+            X_seq = np.concatenate(X_seq_batches, axis=0)
+            X_ctx = np.concatenate(X_ctx_batches, axis=0)
+            y = np.concatenate(y_batches, axis=0)
         
+        return X_seq, X_ctx, y
+
+    def _load_cached_sequences(self, cache_path: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        cache_file = f"{cache_path}_sequences_cache.joblib"
+        if os.path.exists(cache_file):
+            try:
+                cache_data = joblib.load(cache_file)
+                X_seq = cache_data['X_seq']
+                X_ctx = cache_data['X_ctx']
+                y = cache_data['y']
+                self.activity_encoder = cache_data['activity_encoder']
+                self.lifecycle_encoder = cache_data['lifecycle_encoder']
+                self.resource_encoder = cache_data['resource_encoder']
+                print(f"Loaded cached sequences from {cache_file}")
+                return X_seq, X_ctx, y
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Re-extracting sequences...")
+        return None
+
+    def _save_cached_sequences(self, cache_path: str, X_seq: np.ndarray, X_ctx: np.ndarray, y: np.ndarray):
+        cache_file = f"{cache_path}_sequences_cache.joblib"
+        try:
+            num_activities = len(self.activity_encoder.classes_)
+            num_lifecycles = len(self.lifecycle_encoder.classes_)
+            num_resources = len(self.resource_encoder.classes_)
+            feature_dim = num_activities + num_lifecycles + num_resources
+            
+            joblib.dump({
+                'X_seq': X_seq.astype(np.float32),
+                'X_ctx': X_ctx.astype(np.float32),
+                'y': y.astype(np.float32),
+                'activity_encoder': self.activity_encoder,
+                'lifecycle_encoder': self.lifecycle_encoder,
+                'resource_encoder': self.resource_encoder,
+                'feature_dim': feature_dim
+            }, cache_file)
+            print(f"Saved sequences cache to {cache_file}")
+        except Exception as e:
+            print(f"Failed to save cache: {e}")
+
+    def train_probabilistic_ml_model(self, cache_path: Optional[str] = None, force_recompute: bool = False):
+        if not TF_AVAILABLE:
+            raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
+        
+        print("="*80)
+        print("Training Gaussian LSTM Model for Processing Time Prediction")
+        print("="*80)
+        
+        cache_file_path = cache_path or "models/processing_time_model_lstm"
+        
+        print("\n[1/4] Extracting sequences from event log...")
+        cached = self._load_cached_sequences(cache_file_path) if not force_recompute else None
+        
+        if cached is None:
+            X_seq, X_ctx, y = self._extract_sequences()
+            self._save_cached_sequences(cache_file_path, X_seq, X_ctx, y)
+        else:
+            X_seq, X_ctx, y = cached
+        
+        print(f"Extracted {len(X_seq)} sequences")
+        print(f"Sequence shape: {X_seq.shape}, Context shape: {X_ctx.shape}")
+        print(f"Target statistics: mean={np.mean(y):.2f}s, median={np.median(y):.2f}s, std={np.std(y):.2f}s")
+        
+        print("\n[2/4] Removing outliers and splitting data...")
         mean_y = np.mean(y)
         std_y = np.std(y)
         outlier_threshold = mean_y + 3 * std_y
@@ -591,24 +712,9 @@ class ProcessingTimeTrainer:
         X_ctx = X_ctx[valid_mask]
         y = y[valid_mask]
         
-        return X_seq, X_ctx, y
-
-    def train_probabilistic_ml_model(self):
-        if not TF_AVAILABLE:
-            raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
-        
-        print("="*80)
-        print("Training Gaussian LSTM Model for Processing Time Prediction")
-        print("="*80)
-        
-        print("\n[1/4] Extracting sequences from event log...")
-        X_seq, X_ctx, y = self._extract_sequences()
-        
-        print(f"Extracted {len(X_seq)} sequences")
-        print(f"Sequence shape: {X_seq.shape}, Context shape: {X_ctx.shape}")
+        print(f"After outlier removal: {len(X_seq)} sequences")
         print(f"Target statistics: mean={np.mean(y):.2f}s, median={np.median(y):.2f}s, std={np.std(y):.2f}s")
         
-        print("\n[2/4] Splitting data into train/validation sets...")
         X_seq_train, X_seq_val, X_ctx_train, X_ctx_val, y_train, y_val = train_test_split(
             X_seq, X_ctx, y, test_size=0.2, random_state=42, shuffle=True
         )
@@ -616,31 +722,38 @@ class ProcessingTimeTrainer:
         print(f"Training samples: {len(X_seq_train)}")
         print(f"Validation samples: {len(X_seq_val)}")
         
-        print("\n[3/4] Building LSTM model...")
+        print("\n[3/4] Normalizing targets (using log transform for robustness)...")
+        y_train_log = np.log(y_train + 1.0)
+        y_val_log = np.log(y_val + 1.0)
+        self.y_mean = float(np.mean(y_train_log))
+        self.y_std = float(np.std(y_train_log)) + 1e-6
+        y_train_norm = (y_train_log - self.y_mean) / self.y_std
+        y_val_norm = (y_val_log - self.y_mean) / self.y_std
+        
+        print(f"Log-normalized target: mean={self.y_mean:.4f}, std={self.y_std:.4f}")
+        
+        print("\n[4/4] Building LSTM model...")
         
         num_activities = len(self.activity_encoder.classes_)
         num_lifecycles = len(self.lifecycle_encoder.classes_)
         num_resources = len(self.resource_encoder.classes_)
+        feature_dim = num_activities + num_lifecycles + num_resources
         
-        seq_input = keras.Input(shape=(self.sequence_length, 3), name='sequence')
+        seq_input = keras.Input(shape=(self.sequence_length, feature_dim), name='sequence')
         
-        activity_embed = layers.Embedding(num_activities, 16, mask_zero=True)(seq_input[:, :, 0])
-        lifecycle_embed = layers.Embedding(num_lifecycles, 8, mask_zero=True)(seq_input[:, :, 1])
-        resource_embed = layers.Embedding(num_resources, 16, mask_zero=True)(seq_input[:, :, 2])
-        
-        combined = layers.Concatenate()([activity_embed, lifecycle_embed, resource_embed])
-        
-        lstm_out = layers.LSTM(64, return_sequences=False)(combined)
+        lstm_out = layers.LSTM(128, return_sequences=False, dropout=0.3, recurrent_dropout=0.2)(seq_input)
         
         ctx_input = keras.Input(shape=(X_ctx.shape[1],), name='context')
-        ctx_dense = layers.Dense(32, activation='relu')(ctx_input)
+        ctx_dense = layers.Dense(64, activation='relu')(ctx_input)
+        ctx_dense = layers.Dropout(0.3)(ctx_dense)
         
         merged = layers.Concatenate()([lstm_out, ctx_dense])
-        hidden = layers.Dense(64, activation='relu')(merged)
-        hidden = layers.Dropout(0.2)(hidden)
-        hidden = layers.Dense(32, activation='relu')(hidden)
+        hidden = layers.Dense(128, activation='relu')(merged)
+        hidden = layers.Dropout(0.4)(hidden)
+        hidden = layers.Dense(64, activation='relu')(hidden)
+        hidden = layers.Dropout(0.3)(hidden)
         
-        mean_output = layers.Dense(1, activation='relu', name='mean')(hidden)
+        mean_output = layers.Dense(1, name='mean')(hidden)
         log_var_output = layers.Dense(1, name='log_variance')(hidden)
         
         combined_output = layers.Concatenate()([mean_output, log_var_output])
@@ -648,25 +761,69 @@ class ProcessingTimeTrainer:
         
         def gaussian_loss(y_true, y_pred):
             mean_pred = y_pred[:, 0:1]
-            log_var_pred = y_pred[:, 1:2]
-            var_pred = tf.exp(log_var_pred) + 1e-6
-            return tf.reduce_mean(0.5 * (tf.math.log(var_pred) + tf.square(y_true - mean_pred) / var_pred))
+            log_var_pred = tf.clip_by_value(y_pred[:, 1:2], -3, 3)
+            var_pred = tf.exp(log_var_pred)
+            target = y_true[:, 0:1]
+            diff = target - mean_pred
+            loss = 0.5 * log_var_pred + 0.5 * tf.square(diff) / var_pred
+            return tf.reduce_mean(loss)
         
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0005),
             loss=gaussian_loss
         )
         
-        print("\n[4/4] Training LSTM model...")
-        y_train_combined = np.column_stack([y_train, np.zeros_like(y_train)])
-        y_val_combined = np.column_stack([y_val, np.zeros_like(y_val)])
+        print("\n[5/5] Training LSTM model...")
+        
+        def data_generator(X_seq, X_ctx, y_norm, batch_size=128):
+            n_samples = len(X_seq)
+            indices = np.arange(n_samples)
+            np.random.shuffle(indices)
+            
+            while True:
+                for i in range(0, n_samples, batch_size):
+                    batch_indices = indices[i:i+batch_size]
+                    batch_X_seq = X_seq[batch_indices].astype(np.float32)
+                    batch_X_ctx = X_ctx[batch_indices].astype(np.float32)
+                    batch_y = y_norm[batch_indices].astype(np.float32)
+                    batch_y_combined = np.column_stack([batch_y, np.zeros_like(batch_y)]).astype(np.float32)
+                    yield (batch_X_seq, batch_X_ctx), batch_y_combined
+        
+        steps_per_epoch = (len(X_seq_train) + 127) // 128
+        validation_steps = (len(X_seq_val) + 127) // 128
+        
+        output_signature = (
+            (
+                tf.TensorSpec(shape=(None, self.sequence_length, X_seq_train.shape[2]), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, X_ctx_train.shape[1]), dtype=tf.float32)
+            ),
+            tf.TensorSpec(shape=(None, 2), dtype=tf.float32)
+        )
+        
+        train_ds = tf.data.Dataset.from_generator(
+            lambda: data_generator(X_seq_train, X_ctx_train, y_train_norm, batch_size=128),
+            output_signature=output_signature
+        )
+        
+        val_ds = tf.data.Dataset.from_generator(
+            lambda: data_generator(X_seq_val, X_ctx_val, y_val_norm, batch_size=128),
+            output_signature=output_signature
+        )
+        
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            restore_best_weights=True,
+            verbose=1
+        )
         
         history = model.fit(
-            [X_seq_train, X_ctx_train],
-            y_train_combined,
-            validation_data=([X_seq_val, X_ctx_val], y_val_combined),
-            epochs=20,
-            batch_size=128,
+            train_ds,
+            steps_per_epoch=steps_per_epoch,
+            validation_data=val_ds,
+            validation_steps=validation_steps,
+            epochs=50,
+            callbacks=[early_stopping],
             verbose=1
         )
         
@@ -674,15 +831,33 @@ class ProcessingTimeTrainer:
         print("Model Evaluation")
         print("-"*80)
         
-        train_pred = model.predict([X_seq_train, X_ctx_train], verbose=0)
-        train_pred_mean = train_pred[:, 0]
-        train_pred_logvar = train_pred[:, 1]
-        train_pred_std = np.sqrt(np.exp(train_pred_logvar) + 1e-6)
+        print("Computing predictions in batches...")
+        eval_batch_size = 10000
+        train_pred_mean_list = []
+        train_pred_std_list = []
         
-        val_pred = model.predict([X_seq_val, X_ctx_val], verbose=0)
-        val_pred_mean = val_pred[:, 0]
-        val_pred_logvar = val_pred[:, 1]
-        val_pred_std = np.sqrt(np.exp(val_pred_logvar) + 1e-6)
+        for i in range(0, len(X_seq_train), eval_batch_size):
+            batch_end = min(i + eval_batch_size, len(X_seq_train))
+            batch_pred = model.predict([X_seq_train[i:batch_end], X_ctx_train[i:batch_end]], verbose=0)
+            batch_pred_mean_norm = batch_pred[:, 0] * self.y_std + self.y_mean
+            train_pred_mean_list.append(np.exp(batch_pred_mean_norm) - 1.0)
+            train_pred_std_list.append(np.sqrt(np.exp(np.clip(batch_pred[:, 1], -10, 10)) + 1e-6) * np.exp(batch_pred_mean_norm))
+        
+        train_pred_mean = np.concatenate(train_pred_mean_list)
+        train_pred_std = np.concatenate(train_pred_std_list)
+        
+        val_pred_mean_list = []
+        val_pred_std_list = []
+        
+        for i in range(0, len(X_seq_val), eval_batch_size):
+            batch_end = min(i + eval_batch_size, len(X_seq_val))
+            batch_pred = model.predict([X_seq_val[i:batch_end], X_ctx_val[i:batch_end]], verbose=0)
+            batch_pred_mean_norm = batch_pred[:, 0] * self.y_std + self.y_mean
+            val_pred_mean_list.append(np.exp(batch_pred_mean_norm) - 1.0)
+            val_pred_std_list.append(np.sqrt(np.exp(np.clip(batch_pred[:, 1], -10, 10)) + 1e-6) * np.exp(batch_pred_mean_norm))
+        
+        val_pred_mean = np.concatenate(val_pred_mean_list)
+        val_pred_std = np.concatenate(val_pred_std_list)
         
         train_mae = mean_absolute_error(y_train, train_pred_mean)
         train_rmse = np.sqrt(mean_squared_error(y_train, train_pred_mean))
@@ -708,16 +883,20 @@ class ProcessingTimeTrainer:
         print("Model training completed!")
         print("="*80)
 
-    def train(self):
+    def train(self, cache_path: Optional[str] = None, force_recompute: bool = False):
         """
         Train/fit the model based on the specified method.
+        
+        Args:
+            cache_path: Path for caching sequences (only used for probabilistic_ml)
+            force_recompute: Force re-extraction of sequences even if cache exists
         """
         if self.method == "distribution":
             self.fit_distributions()
         elif self.method == "ml":
             self.train_ml_model()
         elif self.method == "probabilistic_ml":
-            self.train_probabilistic_ml_model()
+            self.train_probabilistic_ml_model(cache_path=cache_path, force_recompute=force_recompute)
         else:
             raise ValueError(f"Unknown method: {self.method}. Use 'distribution', 'ml', or 'probabilistic_ml'.")
 
@@ -756,7 +935,7 @@ class ProcessingTimeTrainer:
             if self.lstm_model is None:
                 raise ValueError("No model to save. Train model first.")
             
-            model_path = f"{filepath}_lstm_model.h5"
+            model_path = f"{filepath}_lstm_model.keras"
             encoders_path = f"{filepath}_encoders.joblib"
             metadata_path = f"{filepath}_metadata.joblib"
             
@@ -770,10 +949,12 @@ class ProcessingTimeTrainer:
                 'sequence_length': self.sequence_length,
                 'fallback_mean': self.fallback_mean,
                 'fallback_std': self.fallback_std,
+                'y_mean': self.y_mean,
+                'y_std': self.y_std,
                 'method': 'probabilistic_ml'
             }, metadata_path)
             
-            print(f"Model saved to {filepath}_*.joblib and {filepath}_lstm_model.h5")
+            print(f"Model saved to {filepath}_*.joblib and {filepath}_lstm_model.keras")
             
         elif self.method == "ml":
             if self.ml_model is None:
