@@ -8,7 +8,7 @@ Here is a clean, copy-paste-ready **README.md** snippet in Markdown based on wha
 
 ## 1. Activate Virtual Environment
 ```bat
-venv\Scripts\activate
+.venv\Scripts\activate
 ````
 
 Or create one if it doesn't exist:

@@ -5,6 +5,8 @@ from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict
 import holidays
 from sklearn.cluster import KMeans
+import pickle
+from pathlib import Path
 
 
 class ResourceAvailabilityModel:
@@ -137,6 +139,8 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         enable_pattern_mining: bool = True,
         enable_lifecycle_tracking: bool = True,
         min_activity_threshold: int = 10,
+        model_cache_path: str = "models/resource_availability_cache.pkl",
+        use_cache: bool = True,
     ):
         """
         Initialize the advanced resource availability model with pattern mining.
@@ -150,7 +154,28 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             enable_pattern_mining: Whether to mine resource patterns from data
             enable_lifecycle_tracking: Whether to track busy periods from lifecycle data
             min_activity_threshold: Minimum activities required to mine patterns
+            model_cache_path: Path to save/load cached model (default: models/resource_availability_cache.pkl)
+            use_cache: If True, try to load from cache first, otherwise always train (default: True)
         """
+        # Check if we should load from cache
+        if use_cache and Path(model_cache_path).exists():
+            print(f"[AUTO-LOAD] Found cached model at {model_cache_path}")
+            print(f"            Loading pre-trained model (fast)...")
+            
+            # Load the cached model
+            loaded_instance = self.load_model(model_cache_path, event_log_df)
+            
+            # Copy all attributes to self
+            self.__dict__.update(loaded_instance.__dict__)
+            
+            print(f"[AUTO-LOAD] Model loaded successfully!")
+            return
+        
+        # No cache available or use_cache=False, train from scratch
+        if use_cache and not Path(model_cache_path).exists():
+            print(f"[AUTO-TRAIN] No cached model found at {model_cache_path}")
+            print(f"             Training from scratch (this may take 10-30 seconds)...")
+        
         super().__init__(
             event_log_df, 
             interval_days, 
@@ -162,6 +187,7 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         self.enable_pattern_mining = enable_pattern_mining
         self.enable_lifecycle_tracking = enable_lifecycle_tracking
         self.min_activity_threshold = min_activity_threshold
+        self.model_cache_path = model_cache_path
         
         # Resource-specific patterns
         self.resource_patterns: Dict[str, Dict] = {}
@@ -177,6 +203,12 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         
         if enable_lifecycle_tracking and 'lifecycle:transition' in event_log_df.columns:
             self._extract_busy_periods()
+        
+        # Auto-save to cache after training
+        if use_cache and (enable_pattern_mining or enable_lifecycle_tracking):
+            print(f"[AUTO-SAVE] Saving trained model to {model_cache_path} for future use...")
+            self.save_model(model_cache_path)
+            print(f"[AUTO-SAVE] Next time initialization will be much faster!")
 
     def _mine_resource_patterns(self):
         """Mine work patterns for each resource from historical event log."""
@@ -508,6 +540,142 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             )
         
         return pattern
+
+    def save_model(self, filepath: str):
+        """
+        Save the trained model to disk.
+        
+        Args:
+            filepath: Path where to save the model (e.g., 'models/resource_model.pkl')
+        """
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        
+        model_data = {
+            'version': '1.0',
+            'config': {
+                'interval_days': self.interval_days,
+                'workday_start_hour': self.workday_start_hour,
+                'workday_end_hour': self.workday_end_hour,
+                'working_cycle_days': self.working_cycle_days,
+                'enable_pattern_mining': self.enable_pattern_mining,
+                'enable_lifecycle_tracking': self.enable_lifecycle_tracking,
+                'min_activity_threshold': self.min_activity_threshold,
+            },
+            'cycle_start_date': self.cycle_start_date,
+            'resources': self.resources,
+            'resource_patterns': self._serialize_patterns(self.resource_patterns),
+            'resource_clusters': self.resource_clusters,
+            'cluster_profiles': self._serialize_patterns(self.cluster_profiles),
+            'resource_busy_periods': self._serialize_busy_periods(self.resource_busy_periods),
+            'nl_holidays': list(self.nl_holidays),
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        print(f"[SAVED] Model saved to: {filepath}")
+        print(f"        - {len(self.resource_patterns)} resource patterns")
+        print(f"        - {len(self.resource_clusters)} clustered resources")
+        print(f"        - {sum(len(p) for p in self.resource_busy_periods.values())} busy periods")
+    
+    def _serialize_patterns(self, patterns: Dict) -> Dict:
+        """Convert patterns to serializable format."""
+        serialized = {}
+        for key, pattern in patterns.items():
+            serialized_pattern = {}
+            for k, v in pattern.items():
+                if isinstance(v, set):
+                    serialized_pattern[k] = list(v)
+                elif isinstance(v, (pd.Timestamp, datetime)):
+                    serialized_pattern[k] = v.isoformat() if pd.notna(v) else None
+                else:
+                    serialized_pattern[k] = v
+            serialized[key] = serialized_pattern
+        return serialized
+    
+    def _serialize_busy_periods(self, busy_periods: Dict) -> Dict:
+        """Convert busy periods to serializable format."""
+        serialized = {}
+        for resource, periods in busy_periods.items():
+            serialized[resource] = [
+                (start.isoformat(), end.isoformat(), activity)
+                for start, end, activity in periods
+            ]
+        return serialized
+    
+    @classmethod
+    def load_model(cls, filepath: str, event_log_df: pd.DataFrame) -> 'AdvancedResourceAvailabilityModel':
+        """
+        Load a previously saved model from disk.
+        
+        Args:
+            filepath: Path to the saved model file
+            event_log_df: Event log DataFrame (needed for base class)
+        
+        Returns:
+            Loaded AdvancedResourceAvailabilityModel instance
+        """
+        print(f"[LOADING] Loading model from: {filepath}")
+        
+        with open(filepath, 'rb') as f:
+            model_data = pickle.load(f)
+        
+        config = model_data['config']
+        instance = cls(
+            event_log_df,
+            interval_days=config['interval_days'],
+            workday_start_hour=config['workday_start_hour'],
+            workday_end_hour=config['workday_end_hour'],
+            working_cycle_days=set(config['working_cycle_days']),
+            enable_pattern_mining=False,
+            enable_lifecycle_tracking=False,
+            min_activity_threshold=config['min_activity_threshold'],
+        )
+        
+        instance.cycle_start_date = model_data['cycle_start_date']
+        instance.resources = model_data['resources']
+        instance.resource_patterns = cls._deserialize_patterns(model_data['resource_patterns'])
+        instance.resource_clusters = model_data['resource_clusters']
+        instance.cluster_profiles = cls._deserialize_patterns(model_data['cluster_profiles'])
+        instance.resource_busy_periods = cls._deserialize_busy_periods(model_data['resource_busy_periods'])
+        instance.nl_holidays = set(model_data['nl_holidays'])
+        
+        instance.enable_pattern_mining = config['enable_pattern_mining']
+        instance.enable_lifecycle_tracking = config['enable_lifecycle_tracking']
+        
+        print(f"[SUCCESS] Model loaded")
+        print(f"          - {len(instance.resource_patterns)} resource patterns")
+        print(f"          - {len(instance.resource_clusters)} clustered resources")
+        print(f"          - {sum(len(p) for p in instance.resource_busy_periods.values())} busy periods")
+        
+        return instance
+    
+    @staticmethod
+    def _deserialize_patterns(serialized: Dict) -> Dict:
+        """Convert serialized patterns back to original format."""
+        deserialized = {}
+        for key, pattern in serialized.items():
+            deserialized_pattern = {}
+            for k, v in pattern.items():
+                if k in ['working_days', 'peak_hours', 'common_working_days', 'common_peak_hours']:
+                    deserialized_pattern[k] = set(v) if v else set()
+                elif k in ['first_activity', 'last_activity']:
+                    deserialized_pattern[k] = pd.Timestamp(v) if v else None
+                else:
+                    deserialized_pattern[k] = v
+            deserialized[key] = deserialized_pattern
+        return deserialized
+    
+    @staticmethod
+    def _deserialize_busy_periods(serialized: Dict) -> Dict:
+        """Convert serialized busy periods back to original format."""
+        deserialized = {}
+        for resource, periods in serialized.items():
+            deserialized[resource] = [
+                (pd.Timestamp(start), pd.Timestamp(end), activity)
+                for start, end, activity in periods
+            ]
+        return deserialized
 
     def get_available_resources(self, current_time: datetime, 
                                use_probabilistic: bool = False) -> List[str]:
