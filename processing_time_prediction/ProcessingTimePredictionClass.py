@@ -7,6 +7,11 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 import joblib
 import os
+try:
+    from tensorflow import keras
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
 
 
 class ProcessingTimePredictionClass:
@@ -23,7 +28,7 @@ class ProcessingTimePredictionClass:
         Initialize the prediction class by loading a model from disk.
 
         Args:
-            method: Method to use ("distribution" for probability distributions, "ml" for machine learning).
+            method: Method to use ("distribution", "ml", or "probabilistic_ml").
             model_path: Base path of the saved model (without suffixes like _model.joblib);
                         if None, a default path ``models/processing_time_model`` is used.
         """
@@ -41,6 +46,13 @@ class ProcessingTimePredictionClass:
         self.categorical_features: List[str] = []
         self.numerical_features: List[str] = []
         self.feature_defaults: Dict[str, any] = {}
+        
+        self.lstm_model: Optional[keras.Model] = None
+        self.sequence_length: int = 10
+        self.activity_encoder: Optional[LabelEncoder] = None
+        self.lifecycle_encoder: Optional[LabelEncoder] = None
+        self.resource_encoder: Optional[LabelEncoder] = None
+        self.event_history: List[Dict] = []
 
         base_path = model_path or "models/processing_time_model"
         self.load_model(base_path)
@@ -168,6 +180,25 @@ class ProcessingTimePredictionClass:
             self.feature_defaults = metadata['feature_defaults']
             
             print(f"ML model loaded from {filepath}_*.joblib")
+            
+        elif self.method == "probabilistic_ml":
+            if not TF_AVAILABLE:
+                raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
+            
+            model_path = f"{filepath}_lstm_model.h5"
+            encoders_path = f"{filepath}_encoders.joblib"
+            
+            if not all(os.path.exists(p) for p in [model_path, encoders_path]):
+                raise FileNotFoundError(f"Probabilistic ML model files not found at {filepath}")
+            
+            self.lstm_model = keras.models.load_model(model_path, compile=False)
+            encoders = joblib.load(encoders_path)
+            self.activity_encoder = encoders['activity_encoder']
+            self.lifecycle_encoder = encoders['lifecycle_encoder']
+            self.resource_encoder = encoders['resource_encoder']
+            self.sequence_length = metadata.get('sequence_length', 10)
+            
+            print(f"Probabilistic ML model loaded from {filepath}_*.joblib and {filepath}_lstm_model.h5")
 
     def predict(
         self,
@@ -213,6 +244,39 @@ class ProcessingTimePredictionClass:
                 return max(0.0, float(sample))
             
             return self.fallback_mean if self.fallback_mean else 3600.0
+        
+        elif self.method == "probabilistic_ml":
+            if self.lstm_model is None:
+                warnings.warn("LSTM model not loaded. Using fallback.")
+                return self.fallback_mean if self.fallback_mean else 3600.0
+            
+            try:
+                seq_input, ctx_input = self._prepare_lstm_input(
+                    prev_activity, prev_lifecycle, curr_activity, curr_lifecycle, context
+                )
+                
+                pred = self.lstm_model.predict([seq_input, ctx_input], verbose=0)
+                mean_pred_val = max(0.0, float(pred[0, 0]))
+                log_var_pred = pred[0, 1]
+                std_pred = np.sqrt(np.exp(log_var_pred) + 1e-6)
+                
+                sample = np.random.normal(mean_pred_val, std_pred)
+                sample = max(0.0, float(sample))
+                
+                event_info = {
+                    'activity': prev_activity,
+                    'lifecycle': prev_lifecycle,
+                    'resource': context.get('resource_1', 'unknown') if context else 'unknown'
+                }
+                self.event_history.append(event_info)
+                if len(self.event_history) > self.sequence_length * 2:
+                    self.event_history = self.event_history[-self.sequence_length:]
+                
+                return sample
+                
+            except Exception as e:
+                warnings.warn(f"Error in probabilistic ML prediction: {e}. Using fallback.")
+                return self.fallback_mean if self.fallback_mean else 3600.0
         
         else:
             if self.ml_model is None:
@@ -301,6 +365,72 @@ class ProcessingTimePredictionClass:
         
         return features
 
+    def _prepare_lstm_input(
+        self,
+        prev_activity: str,
+        prev_lifecycle: str,
+        curr_activity: str,
+        curr_lifecycle: str,
+        context: Optional[Dict] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if context is None:
+            context = {}
+        
+        sequence = []
+        for event in self.event_history[-self.sequence_length:]:
+            try:
+                activity_idx = self.activity_encoder.transform([event['activity']])[0]
+                lifecycle_idx = self.lifecycle_encoder.transform([event['lifecycle']])[0]
+                resource_idx = self.resource_encoder.transform([event['resource']])[0]
+                sequence.append([activity_idx, lifecycle_idx, resource_idx])
+            except:
+                sequence.append([0, 0, 0])
+        
+        try:
+            activity_idx = self.activity_encoder.transform([prev_activity])[0]
+        except:
+            activity_idx = 0
+        try:
+            lifecycle_idx = self.lifecycle_encoder.transform([prev_lifecycle])[0]
+        except:
+            lifecycle_idx = 0
+        try:
+            resource = context.get('resource_1', 'unknown') if context else 'unknown'
+            resource_idx = self.resource_encoder.transform([resource])[0]
+        except:
+            resource_idx = 0
+        
+        sequence.append([activity_idx, lifecycle_idx, resource_idx])
+        
+        while len(sequence) < self.sequence_length:
+            sequence = [[0, 0, 0]] + sequence
+        
+        sequence = sequence[-self.sequence_length:]
+        seq_array = np.array([sequence])
+        
+        from datetime import datetime
+        if 'hour' in context:
+            hour = context['hour'] / 24.0
+            weekday = context.get('weekday', 0) / 7.0
+            month = context.get('month', 1) / 12.0
+            day_of_year = context.get('day_of_year', (context.get('month', 1) - 1) * 30 + 15) / 365.0
+        else:
+            now = datetime.now()
+            hour = now.hour / 24.0
+            weekday = now.weekday() / 7.0
+            month = now.month / 12.0
+            day_of_year = now.timetuple().tm_yday / 365.0
+        
+        event_pos = context.get('event_position_in_case', 1) / 100.0
+        case_duration = context.get('case_duration_so_far', 0.0) / 86400.0
+        
+        loan_goal = 1.0 if str(context.get('case:LoanGoal', '')) == 'Car' else 0.0
+        app_type = 1.0 if str(context.get('case:ApplicationType', '')) == 'New' else 0.0
+        
+        ctx_array = np.array([[hour, weekday, month, day_of_year, event_pos, case_duration, loan_goal, app_type]])
+        
+        return seq_array, ctx_array
+
     def get_distribution_info(self, transition_key: Optional[Tuple[str, str, str, str]] = None) -> Dict:
         """
         Get information about fitted distributions.
@@ -336,3 +466,35 @@ class ProcessingTimePredictionClass:
                 return info
             else:
                 return {'error': f'Transition {transition_key} not found'}
+    
+    def get_probabilistic_distribution(
+        self,
+        prev_activity: str,
+        prev_lifecycle: str,
+        curr_activity: str,
+        curr_lifecycle: str,
+        context: Optional[Dict] = None
+    ) -> Dict:
+        if self.method != "probabilistic_ml":
+            return {'error': 'Method is not probabilistic_ml'}
+        
+        if self.lstm_model is None:
+            return {'error': 'LSTM model not loaded'}
+        
+        try:
+            seq_input, ctx_input = self._prepare_lstm_input(
+                prev_activity, prev_lifecycle, curr_activity, curr_lifecycle, context
+            )
+            
+            pred = self.lstm_model.predict([seq_input, ctx_input], verbose=0)
+            mean_pred_val = max(0.0, float(pred[0, 0]))
+            log_var_pred = pred[0, 1]
+            std_pred = np.sqrt(np.exp(log_var_pred) + 1e-6)
+            
+            return {
+                'mean': mean_pred_val,
+                'std': float(std_pred),
+                'distribution_type': 'gaussian'
+            }
+        except Exception as e:
+            return {'error': str(e)}
