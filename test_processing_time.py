@@ -155,11 +155,153 @@ def test_distribution_fitting(df: pd.DataFrame):
     print("="*80)
 
 
+def test_ml_prediction(df: pd.DataFrame):
+    """
+    Test the ProcessingTimePredictionClass ML method.
+    
+    Args:
+        df: DataFrame with event log data
+    """
+    print("\n" + "="*80)
+    print("Testing ProcessingTimePredictionClass ML Prediction")
+    print("="*80)
+    
+    # Initialize the predictor with ML method
+    print("\nInitializing ProcessingTimePredictionClass with ML method...")
+    print("(This will train the model - may take a few minutes)")
+    predictor = ProcessingTimePredictionClass(df, method="ml")
+    
+    # Test predictions with context
+    print("\n" + "-"*80)
+    print("Testing Predictions with Context")
+    print("-"*80)
+    
+    # Get some example activities from the data
+    sample_activities = df["concept:name"].unique()[:5]
+    
+    if len(sample_activities) >= 2:
+        prev_activity = str(sample_activities[0])
+        curr_activity = str(sample_activities[1])
+        
+        # Test with full context
+        context = {
+            'resource_1': 'User_1',
+            'resource_2': 'User_2',
+            'case:RequestedAmount': 20000,
+            'CreditScore': 700,
+            'hour': 10,
+            'weekday': 1,
+            'month': 6,
+        }
+        
+        print(f"\nTesting prediction: {prev_activity} -> {curr_activity}")
+        prediction = predictor.predict(
+            prev_activity=prev_activity,
+            prev_lifecycle="complete",
+            curr_activity=curr_activity,
+            curr_lifecycle="start",
+            context=context
+        )
+        
+        print(f"Prediction: {prediction:.2f} seconds ({prediction/3600:.2f} hours)")
+        
+        # Test with minimal context
+        minimal_context = {
+            'resource_1': 'User_1',
+            'resource_2': 'User_2',
+        }
+        
+        print(f"\nTesting with minimal context...")
+        prediction_minimal = predictor.predict(
+            prev_activity=prev_activity,
+            prev_lifecycle="complete",
+            curr_activity=curr_activity,
+            curr_lifecycle="start",
+            context=minimal_context
+        )
+        
+        print(f"Prediction (minimal context): {prediction_minimal:.2f} seconds ({prediction_minimal/3600:.2f} hours)")
+        
+        # Test with no context
+        print(f"\nTesting with no context...")
+        prediction_no_context = predictor.predict(
+            prev_activity=prev_activity,
+            prev_lifecycle="complete",
+            curr_activity=curr_activity,
+            curr_lifecycle="start",
+            context=None
+        )
+        
+        print(f"Prediction (no context): {prediction_no_context:.2f} seconds ({prediction_no_context/3600:.2f} hours)")
+    
+    # Test model persistence
+    print("\n" + "-"*80)
+    print("Testing Model Persistence")
+    print("-"*80)
+    
+    import tempfile
+    import os
+    temp_dir = tempfile.mkdtemp()
+    model_path = os.path.join(temp_dir, "test_model")
+    
+    try:
+        # Save model
+        print("\nSaving model...")
+        predictor.save_model(model_path)
+        print("Model saved successfully")
+        
+        # Load model
+        print("Loading model...")
+        new_predictor = ProcessingTimePredictionClass(df, method="ml")
+        new_predictor.load_model(model_path)
+        print("Model loaded successfully")
+        
+        # Test that loaded model works
+        if len(sample_activities) >= 2:
+            loaded_prediction = new_predictor.predict(
+                prev_activity=str(sample_activities[0]),
+                prev_lifecycle="complete",
+                curr_activity=str(sample_activities[1]),
+                curr_lifecycle="start",
+                context=context
+            )
+            print(f"Loaded model prediction: {loaded_prediction:.2f} seconds")
+        
+    finally:
+        # Cleanup
+        import shutil
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+    
+    print("\n" + "="*80)
+    print("ML Prediction Test completed successfully!")
+    print("="*80)
+
+
 def main():
     
     try:
-        df = load_xes_file("Dataset/BPI Challenge 2017.xes")
+        # Try to load from CSV cache first
+        csv_path = "event_log.csv"
+        if os.path.exists(csv_path):
+            print(f"Loading from CSV cache: {csv_path}")
+            df = pd.read_csv(csv_path)
+            if "time:timestamp" in df.columns:
+                df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], errors="coerce")
+        else:
+            df = load_xes_file("Dataset/BPI Challenge 2017.xes")
+        
+        # Test distribution method
         test_distribution_fitting(df)
+        
+        # Test ML method (optional - comment out if too slow)
+        import sys
+        if "--ml" in sys.argv or "--all" in sys.argv:
+            test_ml_prediction(df)
+        else:
+            print("\n" + "="*80)
+            print("Note: ML tests skipped. Run with --ml flag to test ML method.")
+            print("="*80)
         
     except Exception as e:
         print(f"\nError during testing: {e}")
