@@ -9,6 +9,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import joblib
 import os
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
 
 
 class ProcessingTimeTrainer:
@@ -30,7 +37,7 @@ class ProcessingTimeTrainer:
         """
         Args:
             data_log_df: DataFrame with event log data 
-            method: "distribution" for probability distributions, "ml" for machine learning
+            method: "distribution", "ml", or "probabilistic_ml"
             min_observations: Minimum number of observations required to fit a distribution
             n_estimators: Number of trees in the forest (higher = better performance but slower training)
             max_depth: Maximum depth of trees (None for unlimited)
@@ -59,6 +66,12 @@ class ProcessingTimeTrainer:
         self.categorical_features: List[str] = []
         self.numerical_features: List[str] = []
         self.feature_defaults: Dict[str, any] = {}
+        
+        self.lstm_model: Optional[keras.Model] = None
+        self.sequence_length: int = 10
+        self.activity_encoder: Optional[LabelEncoder] = None
+        self.lifecycle_encoder: Optional[LabelEncoder] = None
+        self.resource_encoder: Optional[LabelEncoder] = None
 
     def fit_distributions(self):
         """
@@ -432,6 +445,269 @@ class ProcessingTimeTrainer:
         print("Model training completed!")
         print("="*80)
 
+    def _extract_sequences(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if not TF_AVAILABLE:
+            raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
+        
+        if "time:timestamp" in self.data_log_df.columns:
+            self.data_log_df["time:timestamp"] = pd.to_datetime(
+                self.data_log_df["time:timestamp"], errors="coerce"
+            )
+        
+        df_sorted = self.data_log_df.sort_values(
+            ["case:concept:name", "time:timestamp"]
+        ).copy()
+        
+        required_cols = ["case:concept:name", "concept:name", "lifecycle:transition", "time:timestamp"]
+        missing_cols = [col for col in required_cols if col not in df_sorted.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+        
+        df_sorted = df_sorted.dropna(subset=["time:timestamp"])
+        
+        all_activities = []
+        all_lifecycles = []
+        all_resources = []
+        
+        for case_id, case_data in df_sorted.groupby("case:concept:name"):
+            case_data = case_data.reset_index(drop=True)
+            for _, event in case_data.iterrows():
+                all_activities.append(str(event["concept:name"]) if not pd.isna(event["concept:name"]) else "unknown")
+                all_lifecycles.append(str(event.get("lifecycle:transition", "complete")) if not pd.isna(event.get("lifecycle:transition")) else "complete")
+                all_resources.append(str(event.get("org:resource", "unknown")) if not pd.isna(event.get("org:resource")) else "unknown")
+        
+        self.activity_encoder = LabelEncoder()
+        self.lifecycle_encoder = LabelEncoder()
+        self.resource_encoder = LabelEncoder()
+        
+        activity_encoded = self.activity_encoder.fit_transform(all_activities)
+        lifecycle_encoded = self.lifecycle_encoder.fit_transform(all_lifecycles)
+        resource_encoded = self.resource_encoder.fit_transform(all_resources)
+        
+        sequences = []
+        contexts = []
+        targets = []
+        
+        for case_id, case_data in df_sorted.groupby("case:concept:name"):
+            case_data = case_data.reset_index(drop=True)
+            
+            if len(case_data) < 2:
+                continue
+            
+            case_attrs = {}
+            case_attr_cols = ["case:LoanGoal", "case:ApplicationType"]
+            for col in case_attr_cols:
+                if col in case_data.columns:
+                    val = case_data[col].iloc[0] if len(case_data) > 0 else None
+                    case_attrs[col] = val if not pd.isna(val) else None
+                else:
+                    case_attrs[col] = None
+            
+            case_start_time = case_data["time:timestamp"].min()
+            
+            case_sequence = []
+            case_contexts = []
+            case_targets = []
+            
+            for i in range(len(case_data)):
+                event = case_data.iloc[i]
+                
+                if pd.isna(event["time:timestamp"]):
+                    continue
+                
+                activity = str(event["concept:name"]) if not pd.isna(event["concept:name"]) else "unknown"
+                lifecycle = str(event.get("lifecycle:transition", "complete")) if not pd.isna(event.get("lifecycle:transition")) else "complete"
+                resource = str(event.get("org:resource", "unknown")) if not pd.isna(event.get("org:resource")) else "unknown"
+                
+                activity_idx = self.activity_encoder.transform([activity])[0]
+                lifecycle_idx = self.lifecycle_encoder.transform([lifecycle])[0]
+                resource_idx = self.resource_encoder.transform([resource])[0]
+                
+                case_sequence.append([activity_idx, lifecycle_idx, resource_idx])
+                
+                timestamp = event["time:timestamp"]
+                time_since_start = (timestamp - case_start_time).total_seconds()
+                
+                context = [
+                    timestamp.hour / 24.0,
+                    timestamp.weekday() / 7.0,
+                    timestamp.month / 12.0,
+                    timestamp.timetuple().tm_yday / 365.0,
+                    (i + 1) / 100.0,
+                    time_since_start / 86400.0
+                ]
+                
+                if case_attrs.get("case:LoanGoal"):
+                    context.append(1.0 if str(case_attrs["case:LoanGoal"]) == "Car" else 0.0)
+                else:
+                    context.append(0.0)
+                
+                if case_attrs.get("case:ApplicationType"):
+                    context.append(1.0 if str(case_attrs["case:ApplicationType"]) == "New" else 0.0)
+                else:
+                    context.append(0.0)
+                
+                case_contexts.append(context)
+                
+                if i < len(case_data) - 1:
+                    next_event = case_data.iloc[i + 1]
+                    if not pd.isna(next_event["time:timestamp"]):
+                        time_diff = (next_event["time:timestamp"] - timestamp).total_seconds()
+                        if 0 < time_diff <= 31536000:
+                            case_targets.append(time_diff)
+                        else:
+                            case_targets.append(None)
+                    else:
+                        case_targets.append(None)
+                else:
+                    case_targets.append(None)
+            
+            for i in range(len(case_sequence) - 1):
+                if case_targets[i] is None:
+                    continue
+                
+                seq_start = max(0, i + 1 - self.sequence_length)
+                seq = case_sequence[seq_start:i+1]
+                
+                while len(seq) < self.sequence_length:
+                    seq = [[0, 0, 0]] + seq
+                
+                sequences.append(seq)
+                contexts.append(case_contexts[i])
+                targets.append(case_targets[i])
+        
+        if not sequences:
+            raise ValueError("No valid sequences found in event log!")
+        
+        X_seq = np.array(sequences)
+        X_ctx = np.array(contexts)
+        y = np.array(targets)
+        
+        mean_y = np.mean(y)
+        std_y = np.std(y)
+        outlier_threshold = mean_y + 3 * std_y
+        valid_mask = y <= outlier_threshold
+        X_seq = X_seq[valid_mask]
+        X_ctx = X_ctx[valid_mask]
+        y = y[valid_mask]
+        
+        return X_seq, X_ctx, y
+
+    def train_probabilistic_ml_model(self):
+        if not TF_AVAILABLE:
+            raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
+        
+        print("="*80)
+        print("Training Gaussian LSTM Model for Processing Time Prediction")
+        print("="*80)
+        
+        print("\n[1/4] Extracting sequences from event log...")
+        X_seq, X_ctx, y = self._extract_sequences()
+        
+        print(f"Extracted {len(X_seq)} sequences")
+        print(f"Sequence shape: {X_seq.shape}, Context shape: {X_ctx.shape}")
+        print(f"Target statistics: mean={np.mean(y):.2f}s, median={np.median(y):.2f}s, std={np.std(y):.2f}s")
+        
+        print("\n[2/4] Splitting data into train/validation sets...")
+        X_seq_train, X_seq_val, X_ctx_train, X_ctx_val, y_train, y_val = train_test_split(
+            X_seq, X_ctx, y, test_size=0.2, random_state=42, shuffle=True
+        )
+        
+        print(f"Training samples: {len(X_seq_train)}")
+        print(f"Validation samples: {len(X_seq_val)}")
+        
+        print("\n[3/4] Building LSTM model...")
+        
+        num_activities = len(self.activity_encoder.classes_)
+        num_lifecycles = len(self.lifecycle_encoder.classes_)
+        num_resources = len(self.resource_encoder.classes_)
+        
+        seq_input = keras.Input(shape=(self.sequence_length, 3), name='sequence')
+        
+        activity_embed = layers.Embedding(num_activities, 16, mask_zero=True)(seq_input[:, :, 0])
+        lifecycle_embed = layers.Embedding(num_lifecycles, 8, mask_zero=True)(seq_input[:, :, 1])
+        resource_embed = layers.Embedding(num_resources, 16, mask_zero=True)(seq_input[:, :, 2])
+        
+        combined = layers.Concatenate()([activity_embed, lifecycle_embed, resource_embed])
+        
+        lstm_out = layers.LSTM(64, return_sequences=False)(combined)
+        
+        ctx_input = keras.Input(shape=(X_ctx.shape[1],), name='context')
+        ctx_dense = layers.Dense(32, activation='relu')(ctx_input)
+        
+        merged = layers.Concatenate()([lstm_out, ctx_dense])
+        hidden = layers.Dense(64, activation='relu')(merged)
+        hidden = layers.Dropout(0.2)(hidden)
+        hidden = layers.Dense(32, activation='relu')(hidden)
+        
+        mean_output = layers.Dense(1, activation='relu', name='mean')(hidden)
+        log_var_output = layers.Dense(1, name='log_variance')(hidden)
+        
+        combined_output = layers.Concatenate()([mean_output, log_var_output])
+        model = keras.Model(inputs=[seq_input, ctx_input], outputs=combined_output)
+        
+        def gaussian_loss(y_true, y_pred):
+            mean_pred = y_pred[:, 0:1]
+            log_var_pred = y_pred[:, 1:2]
+            var_pred = tf.exp(log_var_pred) + 1e-6
+            return tf.reduce_mean(0.5 * (tf.math.log(var_pred) + tf.square(y_true - mean_pred) / var_pred))
+        
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss=gaussian_loss
+        )
+        
+        print("\n[4/4] Training LSTM model...")
+        y_train_combined = np.column_stack([y_train, np.zeros_like(y_train)])
+        y_val_combined = np.column_stack([y_val, np.zeros_like(y_val)])
+        
+        history = model.fit(
+            [X_seq_train, X_ctx_train],
+            y_train_combined,
+            validation_data=([X_seq_val, X_ctx_val], y_val_combined),
+            epochs=20,
+            batch_size=128,
+            verbose=1
+        )
+        
+        print("\n" + "-"*80)
+        print("Model Evaluation")
+        print("-"*80)
+        
+        train_pred = model.predict([X_seq_train, X_ctx_train], verbose=0)
+        train_pred_mean = train_pred[:, 0]
+        train_pred_logvar = train_pred[:, 1]
+        train_pred_std = np.sqrt(np.exp(train_pred_logvar) + 1e-6)
+        
+        val_pred = model.predict([X_seq_val, X_ctx_val], verbose=0)
+        val_pred_mean = val_pred[:, 0]
+        val_pred_logvar = val_pred[:, 1]
+        val_pred_std = np.sqrt(np.exp(val_pred_logvar) + 1e-6)
+        
+        train_mae = mean_absolute_error(y_train, train_pred_mean)
+        train_rmse = np.sqrt(mean_squared_error(y_train, train_pred_mean))
+        val_mae = mean_absolute_error(y_val, val_pred_mean)
+        val_rmse = np.sqrt(mean_squared_error(y_val, val_pred_mean))
+        
+        print(f"\nTraining Set:")
+        print(f"  MAE:  {train_mae:.2f} seconds ({train_mae/3600:.2f} hours)")
+        print(f"  RMSE: {train_rmse:.2f} seconds ({train_rmse/3600:.2f} hours)")
+        print(f"  Mean predicted std: {np.mean(train_pred_std):.2f}s")
+        
+        print(f"\nValidation Set:")
+        print(f"  MAE:  {val_mae:.2f} seconds ({val_mae/3600:.2f} hours)")
+        print(f"  RMSE: {val_rmse:.2f} seconds ({val_rmse/3600:.2f} hours)")
+        print(f"  Mean predicted std: {np.mean(val_pred_std):.2f}s")
+        
+        self.lstm_model = model
+        self.fallback_mean = float(np.median(y))
+        self.fallback_std = float(np.std(y))
+        
+        print(f"\nFallback statistics: mean={self.fallback_mean:.2f}s, std={self.fallback_std:.2f}s")
+        print("="*80)
+        print("Model training completed!")
+        print("="*80)
+
     def train(self):
         """
         Train/fit the model based on the specified method.
@@ -440,8 +716,10 @@ class ProcessingTimeTrainer:
             self.fit_distributions()
         elif self.method == "ml":
             self.train_ml_model()
+        elif self.method == "probabilistic_ml":
+            self.train_probabilistic_ml_model()
         else:
-            raise ValueError(f"Unknown method: {self.method}. Use 'distribution' or 'ml'.")
+            raise ValueError(f"Unknown method: {self.method}. Use 'distribution', 'ml', or 'probabilistic_ml'.")
 
     def save_model(self, filepath: str):
         """
@@ -473,6 +751,29 @@ class ProcessingTimeTrainer:
             }, metadata_path)
             
             print(f"Model saved to {filepath}_*.joblib")
+            
+        elif self.method == "probabilistic_ml":
+            if self.lstm_model is None:
+                raise ValueError("No model to save. Train model first.")
+            
+            model_path = f"{filepath}_lstm_model.h5"
+            encoders_path = f"{filepath}_encoders.joblib"
+            metadata_path = f"{filepath}_metadata.joblib"
+            
+            self.lstm_model.save(model_path)
+            joblib.dump({
+                'activity_encoder': self.activity_encoder,
+                'lifecycle_encoder': self.lifecycle_encoder,
+                'resource_encoder': self.resource_encoder
+            }, encoders_path)
+            joblib.dump({
+                'sequence_length': self.sequence_length,
+                'fallback_mean': self.fallback_mean,
+                'fallback_std': self.fallback_std,
+                'method': 'probabilistic_ml'
+            }, metadata_path)
+            
+            print(f"Model saved to {filepath}_*.joblib and {filepath}_lstm_model.h5")
             
         elif self.method == "ml":
             if self.ml_model is None:
