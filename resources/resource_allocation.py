@@ -178,6 +178,9 @@ class ResourceAllocator:
         ]
 
         if not available_resources:
+            # Fallback: Use User_1 as 24/7 system resource when no other resource is available
+            if 'User_1' in eligible_resources and self.availability.is_available('User_1', timestamp):
+                return 'User_1'
             # logger.debug(f"No available resources found for activity '{activity}' at {timestamp}.")
             return None
 

@@ -412,8 +412,9 @@ class OrdinoRResourcePermissions:
             resources = self._get_eligible_full_recall(activity)
         # Apply exceptions (for activities with no complete events)
         if activity in self.INCOMPLETE_ACTIVITY_MD:
-            return list(set(resources).union(self.INCOMPLETE_ACTIVITY_MD[activity]))
-            
+            resources = list(set(resources).union(self.INCOMPLETE_ACTIVITY_MD[activity]))
+        
+        # Apply system user logic (adds User_1 for specific activities)
         return self._apply_system_user_logic(activity, resources)
 
     def _get_eligible_full_recall(self, activity: str) -> List[str]:

@@ -1,3 +1,4 @@
+
 import pandas as pd
 import pm4py
 import logging
@@ -83,6 +84,7 @@ def run_simulation_mockup(log_path):
 
         # Evaluate
         status = ""
+        failure_reason = ""
         if allocated_resource == actual_resource:
             correct_picks += 1
             eligible_picks += 1 # If it's the actual one, it must be eligible
@@ -99,10 +101,36 @@ def run_simulation_mockup(log_path):
         else:
             availability_misses += 1
             status = "NO AVAIL"
+            
+            # Diagnose WHY allocation failed
+            eligible_list = allocator.permissions.get_eligible_resources(activity, timestamp, case_type)
+            if not eligible_list:
+                failure_reason = "NO PERMISSIONS (no eligible resources)"
+            else:
+                # Check how many are available
+                available_count = sum(1 for res in eligible_list if allocator.availability.is_available(res, timestamp))
+                
+                # Check User_1 specifically
+                user1_eligible = 'User_1' in eligible_list
+                user1_available = allocator.availability.is_available('User_1', timestamp) if user1_eligible else False
+                
+                if available_count == 0:
+                    failure_reason = f"NO AVAILABILITY (0/{len(eligible_list)} eligible resources available)"
+                    failure_reason += f" | User_1 eligible: {user1_eligible}"
+                    if user1_eligible:
+                        failure_reason += f", User_1 available: {user1_available}"
+                else:
+                    failure_reason = f"UNKNOWN ({available_count}/{len(eligible_list)} should be available!)"
+                    failure_reason += f" | User_1 eligible: {user1_eligible}"
+                    if user1_eligible:
+                        failure_reason += f", User_1 available: {user1_available}"
 
-        # Print first 10 rows or specific interesting ones
-        if total_events <= 10:
-            print(f"{str(timestamp):<25} | {activity[:28]:<30} | {str(case_type)[:13]:<15} | {str(actual_resource):<15} | {str(allocated_resource):<15} | {status}")
+        # Print first 10 rows and ALL "NO AVAIL" cases (failed to allocate)
+        if total_events <= 10 or status == "NO AVAIL":
+            line = f"{str(timestamp):<25} | {activity[:28]:<30} | {str(case_type)[:13]:<15} | {str(actual_resource):<15} | {str(allocated_resource):<15} | {status}"
+            if failure_reason:
+                line += f" - {failure_reason}"
+            print(line)
 
     # Metrics Summary
     accuracy = (correct_picks / total_events * 100) if total_events > 0 else 0
