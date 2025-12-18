@@ -9,7 +9,5 @@ data/
 DataSet/*
 Docs/*
 .venv
-eventlog.xes.gz
 .DS_Store
 .claude
-sanity_check/
