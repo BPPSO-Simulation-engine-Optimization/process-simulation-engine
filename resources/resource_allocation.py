@@ -5,11 +5,16 @@ from typing import Optional, List
 import random
 import logging
 import os
+from pathlib import Path
 
 from resources.resource_permissions.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
 from resources.resource_availabilities.resource_availabilities import AdvancedResourceAvailabilityModel
 
 logger = logging.getLogger(__name__)
+
+# Default cache paths
+DEFAULT_AVAILABILITY_CACHE = Path(__file__).parent / "resource_availabilities" / "bpic2017_resource_model.pkl"
+DEFAULT_PERMISSIONS_CACHE = Path(__file__).parent / "resource_permissions" / "ordinor_fullrecall.pkl"
 
 class ResourceAllocator:
     """
@@ -30,7 +35,8 @@ class ResourceAllocator:
                  n_resource_clusters: int = 10,
                  use_sample: int = None, cache_path: str = None, df: pd.DataFrame = None,
                  permissions_model = None, availability_model = None,
-                 availability_config: dict = None):
+                 availability_config: dict = None,
+                 availability_cache_path: str = None):
         """
         Initialize the ResourceAllocator.
 
@@ -48,46 +54,63 @@ class ResourceAllocator:
             permissions_model: Optional pre-initialized permissions object (Dependency Injection).
             availability_model: Optional pre-initialized availability object (Dependency Injection).
             availability_config: Config dict for AdvancedResourceAvailabilityModel.
+            availability_cache_path: Path to availability model cache.
         """
         self.log_path = log_path
         self.permission_method = permission_method.lower()
-        
-        # Set default cache path if not provided for OrdinoR methods
+
+        # Set default cache paths if not provided
         if cache_path is None and self.permission_method in ('ordinor', 'ordinor-fullrecall'):
-            cache_path = 'resources/resource_permissions/ordinor_fullrecall.pkl'
-        
-        # 1. Unified Log Loading
+            cache_path = str(DEFAULT_PERMISSIONS_CACHE)
+        if availability_cache_path is None:
+            availability_cache_path = str(DEFAULT_AVAILABILITY_CACHE)
+
+        # Check if we can load from cache (skip log loading if both caches exist)
+        availability_cache_exists = Path(availability_cache_path).exists()
+        permissions_cache_exists = cache_path and Path(cache_path).exists()
+        can_use_permissions_cache = self.permission_method.startswith('ordinor') and permissions_cache_exists
+
+        # Determine if we need to load the log
+        need_log = False
+        if permissions_model is None and availability_model is None:
+            if df is not None:
+                need_log = False  # DataFrame already provided
+            elif not availability_cache_exists:
+                need_log = True  # Need log to train availability model
+            elif not can_use_permissions_cache and self.permission_method != 'basic':
+                need_log = True  # Need log to train permissions model
+            elif self.permission_method == 'basic':
+                need_log = True  # Basic method always needs the log
+
+        # 1. Unified Log Loading (only if needed)
         logger.info(f"Initializing ResourceAllocator with method='{self.permission_method}'")
         if df is not None:
-             self.df = df
-        elif log_path:
-             self.df = self._load_log(log_path, use_sample)
-        elif permissions_model is None and availability_model is None:
-             # Only raise if we need to load data ourselves. 
-             # If models are provided, we might not strictly need df/log_path immediately 
-             raise ValueError("Either log_path, df, or pre-initialized models must be provided.")
+            self.df = df
+        elif need_log and log_path:
+            self.df = self._load_log(log_path, use_sample)
+        elif need_log and not log_path:
+            raise ValueError("log_path is required when cache files are not available")
         else:
-             self.df = None
+            # Both caches exist, no need to load log
+            logger.info("Using cached models - skipping event log loading")
+            self.df = None
         
         # 2. Initialize Availability Model
         if availability_model:
             self.availability = availability_model
         else:
             logger.info("Initializing Advanced Resource Availability Model...")
-            if self.df is not None:
-                config = availability_config or {}
-                self.availability = AdvancedResourceAvailabilityModel(
-                    event_log_df=self.df,
-                    **config
-                )
-            else:
-                # Fallback if no df and no model provided (though check above should catch this)
-                logger.warning("No DataFrame available to initialize Availability Model.")
-                self.availability = None
+            config = availability_config or {}
+            # Pass cache path; model will load from cache if available (even without df)
+            config.setdefault('model_cache_path', availability_cache_path)
+            self.availability = AdvancedResourceAvailabilityModel(
+                event_log_df=self.df,  # Can be None if loading from cache
+                **config
+            )
 
         # 3. Initialize Permission Model
         if permissions_model:
-             self.permissions = permissions_model
+            self.permissions = permissions_model
         else:
             logger.info("Initializing Resource Permission Model...")
 
@@ -100,22 +123,29 @@ class ResourceAllocator:
                 profiling_mode = None  # Not OrdinoR
 
             if self.permission_method.startswith('ordinor'):
-                self.permissions = OrdinoRResourcePermissions(
-                    df=self.df,
-                    profiling_mode=profiling_mode
-                )
-
-                # Check for cache
+                # Check if we can load from cache (without needing df)
                 loaded_from_cache = False
-                if cache_path and os.path.exists(cache_path):
+                if can_use_permissions_cache:
                     try:
-                        logger.info(f"Loading cached model from {cache_path}...")
+                        logger.info(f"Loading cached permissions model from {cache_path}...")
+                        # Create instance without loading data, then load from cache
+                        self.permissions = OrdinoRResourcePermissions(
+                            profiling_mode=profiling_mode,
+                            _skip_init=True
+                        )
                         self.permissions.load_model(cache_path)
                         loaded_from_cache = True
                     except Exception as e:
                         logger.warning(f"Failed to load cache: {e}. Falling back to discovery.")
 
                 if not loaded_from_cache:
+                    # Need to train from data
+                    if self.df is None:
+                        raise ValueError("DataFrame is required to train permissions model (no cache available)")
+                    self.permissions = OrdinoRResourcePermissions(
+                        df=self.df,
+                        profiling_mode=profiling_mode
+                    )
                     logger.info(f"Discovering OrdinoR model (mode={profiling_mode})...")
                     self.permissions.discover_model(
                         n_resource_clusters=n_resource_clusters
@@ -124,9 +154,11 @@ class ResourceAllocator:
                         self.permissions.save_model(cache_path)
 
             elif self.permission_method == 'basic':
+                if self.df is None:
+                    raise ValueError("DataFrame is required for 'basic' permission method")
                 self.permissions = BasicResourcePermissions(df=self.df)
             else:
-                raise ValueError(f"Unknown permission method: '{permission_method}'. "
+                raise ValueError(f"Unknown permission method: '{self.permission_method}'. "
                                f"Valid options: 'basic', 'ordinor', 'ordinor-strict'")
             
     def _load_log(self, log_path: str, sample_size: Optional[int]) -> pd.DataFrame:

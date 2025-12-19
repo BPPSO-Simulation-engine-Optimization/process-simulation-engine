@@ -125,7 +125,7 @@ class OrdinoRResourcePermissions:
 
     def __init__(self, log_path: str = None, df: pd.DataFrame = None,
                  filter_completed: bool = True, exclude_resources: List[str] = None,
-                 profiling_mode: str = 'full_recall'):
+                 profiling_mode: str = 'full_recall', _skip_init: bool = False):
         """
         Initialize OrdinoR permissions.
 
@@ -135,6 +135,7 @@ class OrdinoRResourcePermissions:
             filter_completed: Whether to keep only completed events.
             exclude_resources: list of resources to exclude.
             profiling_mode: 'full_recall' (default, for simulation) or 'overall_score' (strict).
+            _skip_init: Internal flag to skip data loading (used when loading from cache).
         """
         if profiling_mode not in ('full_recall', 'overall_score'):
             raise ValueError(f"profiling_mode must be 'full_recall' or 'overall_score', got '{profiling_mode}'")
@@ -145,22 +146,21 @@ class OrdinoRResourcePermissions:
         self.df = None
 
         self.filter_completed = filter_completed
-        self.filter_completed = filter_completed
         self.exclude_resources = exclude_resources or []
-        
+
         # Activities where system user (User_1) must be included
         self.SYSTEM_USER_ACTIVITIES = {
             "A_Cancelled", "A_Concept", "A_Create Application", "A_Submitted",
             "O_Cancelled",
-            "W_Assess potential fraud", "W_Call after offers", "W_Call incomplete files", 
+            "W_Assess potential fraud", "W_Call after offers", "W_Call incomplete files",
             "W_Complete application", "W_Handle leads", "W_Validate application"
         }
 
         # Activities with ONLY incomplete events (hardcoded to avoid parsing raw log)
         self.INCOMPLETE_ACTIVITY_MD = {
             "W_Shortened completion ": {
-                "User_43", "User_11", "User_18", "User_42", "User_2", "User_28", 
-                "User_49", "User_5", "User_53", "User_106", "User_75", "User_124", 
+                "User_43", "User_11", "User_18", "User_42", "User_2", "User_28",
+                "User_49", "User_5", "User_53", "User_106", "User_75", "User_124",
                 "User_30", "User_77", "User_79"
             },
             "W_Personal Loan collection": {
@@ -175,19 +175,23 @@ class OrdinoRResourcePermissions:
 
         # Mapping from case_id to case_type (cluster ID)
         self._case_to_cluster = {}
-        
+
+        # Skip data loading if loading from cache
+        if _skip_init:
+            return
+
         # Load and preprocess
         if df is not None:
-             self.df = self._preprocess(df)
+            self.df = self._preprocess(df)
         elif log_path is not None:
-             prep = ResourceDataPreparation(log_path=log_path)
-             self.df = prep.prepare(
-                 filter_completed=filter_completed,
-                 exclude_resources=self.exclude_resources,
-                 drop_na=True
-             )
+            prep = ResourceDataPreparation(log_path=log_path)
+            self.df = prep.prepare(
+                filter_completed=filter_completed,
+                exclude_resources=self.exclude_resources,
+                drop_na=True
+            )
         else:
-             raise ValueError("Either log_path or df must be provided to OrdinoRResourcePermissions")
+            raise ValueError("Either log_path or df must be provided to OrdinoRResourcePermissions")
 
     def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply preprocessing manually."""

@@ -136,7 +136,7 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
 
     def __init__(
         self,
-        event_log_df: pd.DataFrame,
+        event_log_df: pd.DataFrame = None,
         interval_days: int = 14,
         workday_start_hour: int = 8,
         workday_end_hour: int = 17,
@@ -146,12 +146,13 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         min_activity_threshold: int = 10,
         model_cache_path: Optional[str] = None,
         use_cache: bool = True,
+        _skip_base_init: bool = False,
     ):
         """
         Initialize the advanced resource availability model with pattern mining.
-        
+
         Args:
-            event_log_df: Event log DataFrame
+            event_log_df: Event log DataFrame (optional if loading from cache)
             interval_days: Cycle length in days
             workday_start_hour: Default start hour
             workday_end_hour: Default end hour
@@ -161,25 +162,26 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             min_activity_threshold: Minimum activities required to mine patterns
             model_cache_path: Path to save/load cached model (default: resources/resource_availabilities/bpic2017_resource_model.pkl)
             use_cache: If True, try to load from cache first, otherwise always train (default: True)
+            _skip_base_init: Internal flag to skip base class init when loading from cache
         """
         # Set default cache path to the standard location
         if model_cache_path is None:
             model_cache_path = str(Path(__file__).parent / "bpic2017_resource_model.pkl")
-        
+
         # Check if we should load from cache
         if use_cache and Path(model_cache_path).exists():
             print(f"[AUTO-LOAD] Found cached model at {model_cache_path}")
             print(f"            Loading pre-trained model (fast)...")
-            
-            # Load the cached model
-            loaded_instance = self.load_model(model_cache_path, event_log_df)
-            
+
+            # Load the cached model (no DataFrame needed)
+            loaded_instance = self.load_model(model_cache_path)
+
             # Copy all attributes to self
             self.__dict__.update(loaded_instance.__dict__)
-            
+
             print(f"[AUTO-LOAD] Model loaded successfully!")
             return
-        
+
         # No cache available or use_cache=False, train from scratch
         if use_cache and not Path(model_cache_path).exists():
             print(f"[AUTO-TRAIN] No cached model found at {model_cache_path}")
@@ -187,14 +189,18 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             # Enable training
             enable_pattern_mining = True
             enable_lifecycle_tracking = True
-        
-        super().__init__(
-            event_log_df, 
-            interval_days, 
-            workday_start_hour, 
-            workday_end_hour, 
-            working_cycle_days
-        )
+
+        # For training, we need the DataFrame
+        if not _skip_base_init:
+            if event_log_df is None:
+                raise ValueError("event_log_df is required when not loading from cache")
+            super().__init__(
+                event_log_df,
+                interval_days,
+                workday_start_hour,
+                workday_end_hour,
+                working_cycle_days
+            )
         
         self.enable_pattern_mining = enable_pattern_mining
         self.enable_lifecycle_tracking = enable_lifecycle_tracking
@@ -637,25 +643,26 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         return serialized
     
     @classmethod
-    def load_model(cls, filepath: str, event_log_df: pd.DataFrame) -> 'AdvancedResourceAvailabilityModel':
+    def load_model(cls, filepath: str) -> 'AdvancedResourceAvailabilityModel':
         """
         Load a previously saved model from disk.
-        
+
         Args:
             filepath: Path to the saved model file
-            event_log_df: Event log DataFrame (needed for base class)
-        
+
         Returns:
             Loaded AdvancedResourceAvailabilityModel instance
         """
         print(f"[LOADING] Loading model from: {filepath}")
-        
+
         with open(filepath, 'rb') as f:
             model_data = pickle.load(f)
-        
+
         config = model_data['config']
+
+        # Create instance without calling base class __init__ (no DataFrame needed)
         instance = cls(
-            event_log_df,
+            event_log_df=None,
             interval_days=config['interval_days'],
             workday_start_hour=config['workday_start_hour'],
             workday_end_hour=config['workday_end_hour'],
@@ -664,15 +671,22 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
             enable_lifecycle_tracking=False,
             min_activity_threshold=config['min_activity_threshold'],
             use_cache=False,  # Prevent recursion
+            _skip_base_init=True,  # Don't call parent __init__
         )
-        
+
+        # Set all attributes from cached data
+        instance.event_log_df = None  # Not available when loaded from cache
+        instance.interval_days = config['interval_days']
+        instance.workday_start_hour = config['workday_start_hour']
+        instance.workday_end_hour = config['workday_end_hour']
+        instance.working_cycle_days = set(config['working_cycle_days'])
         instance.cycle_start_date = model_data['cycle_start_date']
         instance.resources = model_data['resources']
+        instance.nl_holidays = set(model_data['nl_holidays'])
         instance.resource_patterns = cls._deserialize_patterns(model_data['resource_patterns'])
         instance.resource_clusters = model_data['resource_clusters']
         instance.cluster_profiles = cls._deserialize_patterns(model_data['cluster_profiles'])
         instance.resource_busy_periods = cls._deserialize_busy_periods(model_data['resource_busy_periods'])
-        instance.nl_holidays = set(model_data['nl_holidays'])
         
         instance.enable_pattern_mining = config['enable_pattern_mining']
         instance.enable_lifecycle_tracking = config['enable_lifecycle_tracking']
