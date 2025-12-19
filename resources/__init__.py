@@ -8,6 +8,7 @@ Provides:
 
 Logging is configured here for all resource-related modules.
 """
+from .resource_allocation import ResourceAllocator
 import logging
 import os
 
