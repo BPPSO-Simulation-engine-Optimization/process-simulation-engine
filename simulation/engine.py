@@ -374,40 +374,57 @@ if __name__ == "__main__":
     import sys
     import os
     from datetime import datetime
-    
+
     # Add project root to path for imports
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from resources import ResourceAllocator
-    
+    from simulation.log_exporter import LogExporter
+
     # Enable logging
     logging.basicConfig(level=logging.INFO, format='%(message)s')
-    
+
+    print("Starting simulation...")
+
     # Initialize resource allocator
     log_path = "eventlog/eventlog.xes.gz"
     print(f"Loading ResourceAllocator from {log_path}...")
     allocator = ResourceAllocator(log_path=log_path)
-    
-    # Run simulation
+
+    # Run simulation (use 2016 start time to match availability model training data: Jan 2016 - Feb 2017)
+    start_time = datetime(2016, 1, 4, 8, 0)  # Monday 8am, Jan 2016
     engine = DESEngine(
         resource_allocator=allocator,
-        start_time=datetime(2024, 1, 1, 9, 0)
+        start_time=start_time,
     )
-    
+
     events = engine.run(num_cases=2)
-    
+
     print(f"\n{'='*60}")
     print(f"Generated {len(events)} events for 2 cases")
     print(f"Stats: {engine.stats}")
     print(f"{'='*60}\n")
-    
+
+    # Export to output folder
+    output_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    csv_path = os.path.join(output_dir, "simulated_log.csv")
+    xes_path = os.path.join(output_dir, "simulated_log.xes")
+
+    LogExporter.to_csv(events, csv_path)
+    print(f"Exported CSV to: {csv_path}")
+
+    LogExporter.to_xes(events, xes_path)
+    print(f"Exported XES to: {xes_path}")
+
     # Show events grouped by case
     from collections import defaultdict
     by_case = defaultdict(list)
     for e in events:
         by_case[e['case:concept:name']].append(e)
-    
+
     for case_id, case_events in by_case.items():
-        print(f"Case: {case_id}")
+        print(f"\nCase: {case_id}")
         print(f"  LoanGoal: {case_events[0].get('case:LoanGoal')}")
         print(f"  Activities:")
         for e in case_events:
