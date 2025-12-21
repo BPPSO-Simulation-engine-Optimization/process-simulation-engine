@@ -1,17 +1,26 @@
 import random
+from .bpmn_parser import BPMNParser
+from .log_analyzer import LogAnalyzer
 
 
 class BranchPredictor:
     def __init__(self):
         self.probabilities = {}
         self.gateway_branches = {}
+        self.gateway_connections = {}
 
-    def set_probabilities(self, probabilities, gateway_connections):
-        self.probabilities = probabilities
+    def fit(self, bpmn_path, log_path):
+        parser = BPMNParser(bpmn_path)
+        self.gateway_connections = parser.get_gateway_connections()
         self.gateway_branches = {
             gw_id: conn['branches']
-            for gw_id, conn in gateway_connections.items()
+            for gw_id, conn in self.gateway_connections.items()
         }
+
+        analyzer = LogAnalyzer(log_path)
+        counts = analyzer.count_transitions(self.gateway_connections)
+        self.probabilities = analyzer.calculate_probabilities(counts)
+        return self
 
     def predict(self, gateway_id, preceding_activity):
         key = (gateway_id, preceding_activity)
@@ -26,4 +35,8 @@ class BranchPredictor:
         branches = list(probs.keys())
         weights = list(probs.values())
         return random.choices(branches, weights=weights)[0]
+
+    def get_probabilities(self, gateway_id, preceding_activity):
+        key = (gateway_id, preceding_activity)
+        return self.probabilities.get(key, {})
 
