@@ -44,3 +44,10 @@ class BPMNParser:
             target = flow.get('targetRef')
             self.flows[flow_id] = {'source': source, 'target': target}
 
+    def get_xor_decision_points(self):
+        decision_points = []
+        for gw_id, gw_data in self.gateways.items():
+            if gw_data['direction'] == 'Diverging' and len(gw_data['outgoing']) >= 2:
+                decision_points.append(gw_id)
+        return decision_points
+
