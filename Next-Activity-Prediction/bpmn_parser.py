@@ -7,7 +7,9 @@ class BPMNParser:
         self.root = self.tree.getroot()
         self.ns = self._detect_namespace()
         self.tasks = {}
+        self.gateways = {}
         self._parse_tasks()
+        self._parse_gateways()
 
     def _detect_namespace(self):
         tag = self.root.tag
@@ -20,4 +22,16 @@ class BPMNParser:
             task_id = task.get('id')
             task_name = task.get('name', task_id)
             self.tasks[task_id] = task_name
+
+    def _parse_gateways(self):
+        for gw in self.root.iter(f'{{{self.ns}}}exclusiveGateway'):
+            gw_id = gw.get('id')
+            direction = gw.get('gatewayDirection', 'Unspecified')
+            incoming = [e.text for e in gw.findall(f'{{{self.ns}}}incoming')]
+            outgoing = [e.text for e in gw.findall(f'{{{self.ns}}}outgoing')]
+            self.gateways[gw_id] = {
+                'direction': direction,
+                'incoming': incoming,
+                'outgoing': outgoing
+            }
 
