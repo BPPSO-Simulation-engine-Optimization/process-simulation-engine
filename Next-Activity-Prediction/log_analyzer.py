@@ -44,3 +44,14 @@ class LogAnalyzer:
 
         return dict(counts)
 
+    def calculate_probabilities(self, transition_counts):
+        probabilities = {}
+        for key, branch_counts in transition_counts.items():
+            total = sum(branch_counts.values())
+            if total > 0:
+                probabilities[key] = {
+                    branch: count / total
+                    for branch, count in branch_counts.items()
+                }
+        return probabilities
+
