@@ -1,4 +1,5 @@
 import pm4py
+from collections import defaultdict
 
 
 class LogAnalyzer:
@@ -17,4 +18,29 @@ class LogAnalyzer:
     def iter_traces(self):
         for trace in self.log:
             yield self.get_trace_activities(trace)
+
+    def count_transitions(self, gateway_connections):
+        activity_to_gateways = {}
+        for gw_id, conn in gateway_connections.items():
+            for act in conn['preceding']:
+                if act not in activity_to_gateways:
+                    activity_to_gateways[act] = []
+                activity_to_gateways[act].append({
+                    'gateway': gw_id,
+                    'branches': conn['branches']
+                })
+
+        counts = defaultdict(lambda: defaultdict(int))
+        for activities in self.iter_traces():
+            for i in range(len(activities) - 1):
+                current = activities[i]
+                next_act = activities[i + 1]
+                if current not in activity_to_gateways:
+                    continue
+                for gw_info in activity_to_gateways[current]:
+                    if next_act in gw_info['branches']:
+                        key = (gw_info['gateway'], current)
+                        counts[key][next_act] += 1
+
+        return dict(counts)
 
