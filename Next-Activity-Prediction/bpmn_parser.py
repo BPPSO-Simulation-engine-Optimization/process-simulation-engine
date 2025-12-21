@@ -8,8 +8,10 @@ class BPMNParser:
         self.ns = self._detect_namespace()
         self.tasks = {}
         self.gateways = {}
+        self.flows = {}
         self._parse_tasks()
         self._parse_gateways()
+        self._parse_flows()
 
     def _detect_namespace(self):
         tag = self.root.tag
@@ -34,4 +36,11 @@ class BPMNParser:
                 'incoming': incoming,
                 'outgoing': outgoing
             }
+
+    def _parse_flows(self):
+        for flow in self.root.iter(f'{{{self.ns}}}sequenceFlow'):
+            flow_id = flow.get('id')
+            source = flow.get('sourceRef')
+            target = flow.get('targetRef')
+            self.flows[flow_id] = {'source': source, 'target': target}
 
