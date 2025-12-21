@@ -51,3 +51,38 @@ class BPMNParser:
                 decision_points.append(gw_id)
         return decision_points
 
+    def _trace_preceding(self, incoming_flows, visited):
+        preceding = []
+        for flow_id in incoming_flows:
+            if flow_id not in self.flows or flow_id in visited:
+                continue
+            visited.add(flow_id)
+            source_id = self.flows[flow_id]['source']
+            if source_id in self.tasks:
+                preceding.append(self.tasks[source_id])
+            elif source_id in self.gateways:
+                preceding.extend(self._trace_preceding(self.gateways[source_id]['incoming'], visited))
+        return list(set(preceding))
+
+    def _trace_succeeding(self, outgoing_flows, visited):
+        succeeding = []
+        for flow_id in outgoing_flows:
+            if flow_id not in self.flows or flow_id in visited:
+                continue
+            visited.add(flow_id)
+            target_id = self.flows[flow_id]['target']
+            if target_id in self.tasks:
+                succeeding.append(self.tasks[target_id])
+            elif target_id in self.gateways:
+                succeeding.extend(self._trace_succeeding(self.gateways[target_id]['outgoing'], visited))
+        return list(set(succeeding))
+
+    def get_gateway_connections(self):
+        connections = {}
+        for gw_id in self.get_xor_decision_points():
+            gw_data = self.gateways[gw_id]
+            connections[gw_id] = {
+                'preceding': self._trace_preceding(gw_data['incoming'], set()),
+                'branches': self._trace_succeeding(gw_data['outgoing'], set())
+            }
+        return connections
