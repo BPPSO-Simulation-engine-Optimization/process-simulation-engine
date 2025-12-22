@@ -1,496 +1,117 @@
+"""
+Processing Time Trainer - Prefix-based Cumulative Time Prediction
+
+Trains models to predict cumulative elapsed time given a prefix of events.
+Input: Sequence of activities from the start of a trace (prefix)
+Output: Total elapsed time from case start to current event
+"""
+
 from typing import Dict, Tuple, Optional, List
 import pandas as pd
 import numpy as np
-from scipy import stats
-import warnings
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
 import joblib
 import os
+
 try:
     import tensorflow as tf
     from tensorflow import keras
     from tensorflow.keras import layers
-    from tensorflow.keras.layers import Lambda
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
-    Lambda = None
+
+
+def setup_gpu():
+    """Configure GPU if available."""
+    if not TF_AVAILABLE:
+        return False
+    
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"GPU detected: {len(gpus)} device(s)")
+            return True
+        except RuntimeError as e:
+            print(f"GPU setup error: {e}")
+    print("Using CPU")
+    return False
 
 
 class ProcessingTimeTrainer:
     """
-    training and fitting of processing time prediction models.
+    Trains models to predict cumulative time given event prefixes.
+    
+    Methods:
+        - 'ml': Random Forest on prefix features
+        - 'lstm': LSTM on prefix sequences
     """
-
+    
     def __init__(
-        self, 
-        data_log_df: pd.DataFrame, 
-        method: str = "distribution", 
-        min_observations: int = 2,
-        n_estimators: int = 500,
-        max_depth: Optional[int] = 30,
-        min_samples_split: int = 10,
-        min_samples_leaf: int = 5,
-        max_features: str = 'sqrt'
+        self,
+        df: pd.DataFrame,
+        method: str = "lstm",
+        max_prefix_length: int = 50,
+        embedding_dim: int = 32,
+        lstm_units: int = 64,
+        dropout_rate: float = 0.2,
+        batch_size: int = 128,
+        epochs: int = 100,
+        learning_rate: float = 0.001
     ):
-        """
-        Args:
-            data_log_df: DataFrame with event log data 
-            method: "distribution", "ml", or "probabilistic_ml"
-            min_observations: Minimum number of observations required to fit a distribution
-            n_estimators: Number of trees in the forest (higher = better performance but slower training)
-            max_depth: Maximum depth of trees (None for unlimited)
-            min_samples_split: Minimum samples required to split a node
-            min_samples_leaf: Minimum samples required at a leaf node
-            max_features: Number of features to consider for best split
-        """
-        self.data_log_df = data_log_df.copy()
+        self.df = df.copy()
         self.method = method
-        self.min_observations = min_observations
+        self.max_prefix_length = max_prefix_length
+        self.embedding_dim = embedding_dim
+        self.lstm_units = lstm_units
+        self.dropout_rate = dropout_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.learning_rate = learning_rate
         
-        self.n_estimators = n_estimators
-        self.max_depth = max_depth
-        self.min_samples_split = min_samples_split
-        self.min_samples_leaf = min_samples_leaf
-        self.max_features = max_features
-        
-        self.distributions: Dict[Tuple[str, str, str, str], Dict] = {}
-        self.fallback_mean: Optional[float] = None
-        self.fallback_std: Optional[float] = None
-        
-        self.ml_model: Optional[RandomForestRegressor] = None
-        self.label_encoders: Dict[str, LabelEncoder] = {}
-        self.scaler: Optional[MinMaxScaler] = None
-        self.feature_names: List[str] = []
-        self.categorical_features: List[str] = []
-        self.numerical_features: List[str] = []
-        self.feature_defaults: Dict[str, any] = {}
-        
-        self.lstm_model: Optional[keras.Model] = None
-        self.sequence_length: int = 10
         self.activity_encoder: Optional[LabelEncoder] = None
-        self.lifecycle_encoder: Optional[LabelEncoder] = None
-        self.resource_encoder: Optional[LabelEncoder] = None
-        self.y_mean: Optional[float] = None
-        self.y_std: Optional[float] = None
+        self.num_activities = 0
+        
+        self.model = None
+        self.scaler: Optional[StandardScaler] = None
+        
+        self.y_mean = 0.0
+        self.y_std = 1.0
+        self.fallback_mean = 0.0
 
-    def fit_distributions(self):
+    def _extract_prefixes(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Fit log-normal probability distributions for processing times between consecutive events.
-        Processing time is the time until the next activity, grouped by activity pairs and lifecycle transitions.
+        Extract prefixes and cumulative times from event log.
+        
+        For each event in each case, creates a training sample:
+        - X: prefix of activities up to and including current event
+        - y: cumulative time from case start to current event
         """
-        if "time:timestamp" in self.data_log_df.columns:
-            self.data_log_df["time:timestamp"] = pd.to_datetime(
-                self.data_log_df["time:timestamp"], errors="coerce"
-            )
+        print("Extracting prefixes from event log...")
         
-        df_sorted = self.data_log_df.sort_values(
-            ["case:concept:name", "time:timestamp"]
-        ).copy()
+        self.df["time:timestamp"] = pd.to_datetime(self.df["time:timestamp"], errors="coerce")
+        df_sorted = self.df.sort_values(["case:concept:name", "time:timestamp"]).copy()
+        df_sorted = df_sorted.dropna(subset=["time:timestamp", "concept:name"])
         
-        required_cols = ["case:concept:name", "concept:name", "lifecycle:transition", "time:timestamp"]
-        missing_cols = [col for col in required_cols if col not in df_sorted.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
-        
-        df_sorted = df_sorted.dropna(subset=["time:timestamp"])
-        
-        processing_times_by_transition: Dict[Tuple[str, str, str, str], list] = {}
-        
-        for case_id, case_data in df_sorted.groupby("case:concept:name"):
-            case_data = case_data.reset_index(drop=True)
-            
-            if len(case_data) < 2:
-                continue
-            
-            for i in range(len(case_data) - 1):
-                prev_event = case_data.iloc[i]
-                curr_event = case_data.iloc[i + 1]
-                
-                if pd.isna(prev_event["time:timestamp"]) or pd.isna(curr_event["time:timestamp"]):
-                    continue
-                
-                prev_activity = str(prev_event["concept:name"])
-                prev_lifecycle = "complete" if pd.isna(prev_event.get("lifecycle:transition")) else str(prev_event["lifecycle:transition"])
-                curr_activity = str(curr_event["concept:name"])
-                curr_lifecycle = "complete" if pd.isna(curr_event.get("lifecycle:transition")) else str(curr_event["lifecycle:transition"])
-                
-                time_diff = (curr_event["time:timestamp"] - prev_event["time:timestamp"]).total_seconds()
-                
-                if time_diff <= 0:
-                    continue
-                
-                transition_key = (prev_activity, prev_lifecycle, curr_activity, curr_lifecycle)
-                
-                if transition_key not in processing_times_by_transition:
-                    processing_times_by_transition[transition_key] = []
-                
-                processing_times_by_transition[transition_key].append(time_diff)
-        
-        print(f"Found {len(processing_times_by_transition)} unique transition patterns")
-        
-        all_processing_times = []
-        
-        for transition_key, times in processing_times_by_transition.items():
-            if len(times) < self.min_observations:
-                continue
-            
-            all_processing_times.extend(times)
-            
-            log_times = np.log(times)
-            mu = np.mean(log_times)
-            sigma = np.std(log_times, ddof=1)
-            
-            if sigma < 1e-6:
-                sigma = 1e-6
-            
-            dist = stats.lognorm(s=sigma, scale=np.exp(mu))
-            
-            self.distributions[transition_key] = {
-                'distribution': dist,
-                'mu': mu,
-                'sigma': sigma,
-                'count': len(times),
-                'mean': np.mean(times),
-                'std': np.std(times),
-                'median': np.median(times)
-            }
-        
-        if all_processing_times:
-            self.fallback_mean = np.mean(all_processing_times)
-            self.fallback_std = np.std(all_processing_times)
-            print(f"Fitted {len(self.distributions)} distributions")
-            print(f"Fallback statistics: mean={self.fallback_mean:.2f}s, std={self.fallback_std:.2f}s")
-        else:
-            warnings.warn("No valid processing times found in event log!")
-            self.fallback_mean = 3600.0
-            self.fallback_std = 1800.0
-
-    def _extract_training_data(self) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Extract training data with features and target (processing times) from event log.
-        
-        Returns:
-            Tuple of (features DataFrame, target Series with processing times in seconds)
-        """
-        if "time:timestamp" in self.data_log_df.columns:
-            self.data_log_df["time:timestamp"] = pd.to_datetime(
-                self.data_log_df["time:timestamp"], errors="coerce"
-            )
-        
-        df_sorted = self.data_log_df.sort_values(
-            ["case:concept:name", "time:timestamp"]
-        ).copy()
-        
-        required_cols = ["case:concept:name", "concept:name", "lifecycle:transition", "time:timestamp"]
-        missing_cols = [col for col in required_cols if col not in df_sorted.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
-        
-        df_sorted = df_sorted.dropna(subset=["time:timestamp"])
-        
-        training_samples = []
-        
-        for case_id, case_data in df_sorted.groupby("case:concept:name"):
-            case_data = case_data.reset_index(drop=True)
-            
-            if len(case_data) < 2:
-                continue
-            
-            case_attrs = {}
-            case_attr_cols = ["case:LoanGoal", "case:ApplicationType"]
-            for col in case_attr_cols:
-                if col in case_data.columns:
-                    val = case_data[col].iloc[0] if len(case_data) > 0 else None
-                    case_attrs[col] = val if not pd.isna(val) else None
-                else:
-                    case_attrs[col] = None
-            
-            case_start_time = case_data["time:timestamp"].min()
-            
-            for i in range(len(case_data) - 1):
-                prev_event = case_data.iloc[i]
-                curr_event = case_data.iloc[i + 1]
-                
-                if pd.isna(prev_event["time:timestamp"]) or pd.isna(curr_event["time:timestamp"]):
-                    continue
-                
-                time_diff = (curr_event["time:timestamp"] - prev_event["time:timestamp"]).total_seconds()
-                
-                if time_diff <= 0 or time_diff > 31536000:
-                    continue
-                
-                sample = {}
-                
-                sample['prev_activity'] = str(prev_event["concept:name"]) if not pd.isna(prev_event["concept:name"]) else "unknown"
-                sample['prev_lifecycle'] = str(prev_event["lifecycle:transition"]) if not pd.isna(prev_event.get("lifecycle:transition")) else "complete"
-                sample['curr_activity'] = str(curr_event["concept:name"]) if not pd.isna(curr_event["concept:name"]) else "unknown"
-                sample['curr_lifecycle'] = str(curr_event["lifecycle:transition"]) if not pd.isna(curr_event.get("lifecycle:transition")) else "complete"
-                
-                sample['prev_resource'] = str(prev_event.get("org:resource", "unknown")) if not pd.isna(prev_event.get("org:resource")) else "unknown"
-                sample['curr_resource'] = str(curr_event.get("org:resource", "unknown")) if not pd.isna(curr_event.get("org:resource")) else "unknown"
-                
-                for col, val in case_attrs.items():
-                    sample[col] = val
-                
-                event_attr_cols = ["Accepted", "Selected"]
-                for col in event_attr_cols:
-                    if col in curr_event.index:
-                        val = curr_event[col]
-                        sample[col] = val if not pd.isna(val) else None
-                    else:
-                        sample[col] = None
-                
-                timestamp = curr_event["time:timestamp"]
-                sample['hour'] = timestamp.hour
-                sample['weekday'] = timestamp.weekday()
-                sample['month'] = timestamp.month
-                sample['day_of_year'] = timestamp.timetuple().tm_yday
-                
-                time_since_start = (prev_event["time:timestamp"] - case_start_time).total_seconds()
-                sample['event_position_in_case'] = i + 1
-                sample['case_duration_so_far'] = time_since_start
-                
-                sample['processing_time'] = time_diff
-                
-                training_samples.append(sample)
-        
-        if not training_samples:
-            raise ValueError("No valid training samples found in event log!")
-        
-        df_training = pd.DataFrame(training_samples)
-        
-        target = df_training['processing_time']
-        features = df_training.drop(columns=['processing_time'])
-        
-        print(f"Extracted {len(features)} training samples")
-        print(f"Features shape: {features.shape}")
-        
-        return features, target
-
-    def _prepare_features(self, df_features: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:
-        """
-        Prepare features for ML model: encoding, scaling, imputation.
-        
-        Args:
-            df_features: DataFrame with raw features
-            is_training: If True, fit encoders/scalers; if False, use existing ones
-        
-        Returns:
-            DataFrame with prepared features
-        """
-        df = df_features.copy()
-        
-        categorical_cols = ['prev_activity', 'prev_lifecycle', 'curr_activity', 'curr_lifecycle',
-                           'prev_resource', 'curr_resource', 'case:LoanGoal', 'case:ApplicationType']
-        numerical_cols = ['hour', 'weekday', 'month', 'day_of_year',
-                        'event_position_in_case', 'case_duration_so_far']
-        boolean_cols = ['Accepted', 'Selected']
-        
-        categorical_cols = [c for c in categorical_cols if c in df.columns]
-        numerical_cols = [c for c in numerical_cols if c in df.columns]
-        boolean_cols = [c for c in boolean_cols if c in df.columns]
-        
-        for col in boolean_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna(0).astype(int)
-                if col not in numerical_cols:
-                    numerical_cols.append(col)
-        
-        for col in numerical_cols:
-            if col in df.columns:
-                if is_training:
-                    median_val = df[col].median()
-                    self.feature_defaults[col] = median_val if not pd.isna(median_val) else 0.0
-                df[col] = df[col].fillna(self.feature_defaults.get(col, 0.0))
-        
-        for col in categorical_cols:
-            if col in df.columns:
-                if is_training:
-                    mode_val = df[col].mode()
-                    default_val = mode_val.iloc[0] if len(mode_val) > 0 else "unknown"
-                    self.feature_defaults[col] = default_val
-                df[col] = df[col].fillna(self.feature_defaults.get(col, "unknown"))
-                df[col] = df[col].astype(str)
-        
-        if is_training:
-            self.categorical_features = categorical_cols
-            self.numerical_features = numerical_cols
-            
-            for col in categorical_cols:
-                le = LabelEncoder()
-                df[col] = le.fit_transform(df[col].astype(str))
-                self.label_encoders[col] = le
-        else:
-            for col in categorical_cols:
-                if col in self.label_encoders:
-                    le = self.label_encoders[col]
-                    df[col] = df[col].astype(str)
-                    unique_vals = set(df[col].unique())
-                    known_classes = set(le.classes_)
-                    unknown_vals = unique_vals - known_classes
-                    
-                    if unknown_vals:
-                        default_idx = 0
-                        df[col] = df[col].apply(
-                            lambda x: le.transform([x])[0] if x in known_classes else default_idx
-                        )
-                    else:
-                        df[col] = le.transform(df[col])
-                else:
-                    df[col] = 0
-        
-        if is_training:
-            self.scaler = MinMaxScaler()
-            df[numerical_cols] = self.scaler.fit_transform(df[numerical_cols])
-        else:
-            if self.scaler is not None:
-                missing_num_cols = [c for c in numerical_cols if c not in df.columns]
-                for col in missing_num_cols:
-                    df[col] = self.feature_defaults.get(col, 0.0)
-                
-                cols_to_scale = [c for c in numerical_cols if c in df.columns]
-                if cols_to_scale:
-                    df[cols_to_scale] = self.scaler.transform(df[cols_to_scale])
-        
-        if is_training:
-            self.feature_names = list(df.columns)
-        
-        return df
-
-    def train_ml_model(self):
-        """
-        Train Random Forest Regressor model on extracted features.
-        """
-        print("="*80)
-        print("Training ML Model for Processing Time Prediction")
-        print("="*80)
-        
-        print("\n[1/4] Extracting training data from event log...")
-        X_raw, y = self._extract_training_data()
-        
-        print("\n[2/4] Preparing features (encoding, scaling, imputation)...")
-        X = self._prepare_features(X_raw, is_training=True)
-        
-        mean_y = y.mean()
-        std_y = y.std()
-        outlier_threshold = mean_y + 3 * std_y
-        valid_mask = y <= outlier_threshold
-        X = X[valid_mask]
-        y = y[valid_mask]
-        
-        print(f"After outlier removal: {len(X)} samples")
-        print(f"Target statistics: mean={y.mean():.2f}s, median={y.median():.2f}s, std={y.std():.2f}s")
-        
-        print("\n[3/4] Splitting data into train/validation sets...")
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=42, shuffle=True
-        )
-        
-        print(f"Training samples: {len(X_train)}")
-        print(f"Validation samples: {len(X_val)}")
-        
-        print(f"\n[4/4] Training Random Forest Regressor (n_estimators={self.n_estimators})...")
-        self.ml_model = RandomForestRegressor(
-            n_estimators=self.n_estimators,
-            max_depth=self.max_depth,
-            min_samples_split=self.min_samples_split,
-            min_samples_leaf=self.min_samples_leaf,
-            max_features=self.max_features,
-            random_state=42,
-            n_jobs=-1,
-            verbose=1
-        )
-        
-        self.ml_model.fit(X_train, y_train)
-        
-        print("\n" + "-"*80)
-        print("Model Evaluation")
-        print("-"*80)
-        
-        y_train_pred = self.ml_model.predict(X_train)
-        y_val_pred = self.ml_model.predict(X_val)
-        
-        train_mae = mean_absolute_error(y_train, y_train_pred)
-        train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
-        train_r2 = r2_score(y_train, y_train_pred)
-        
-        val_mae = mean_absolute_error(y_val, y_val_pred)
-        val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
-        val_r2 = r2_score(y_val, y_val_pred)
-        
-        print(f"\nTraining Set:")
-        print(f"  MAE:  {train_mae:.2f} seconds ({train_mae/3600:.2f} hours)")
-        print(f"  RMSE: {train_rmse:.2f} seconds ({train_rmse/3600:.2f} hours)")
-        print(f"  R²:   {train_r2:.4f}")
-        
-        print(f"\nValidation Set:")
-        print(f"  MAE:  {val_mae:.2f} seconds ({val_mae/3600:.2f} hours)")
-        print(f"  RMSE: {val_rmse:.2f} seconds ({val_rmse/3600:.2f} hours)")
-        print(f"  R²:   {val_r2:.4f}")
-        
-        feature_importance = pd.DataFrame({
-            'feature': self.feature_names,
-            'importance': self.ml_model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        
-        print(f"\nTop 10 Most Important Features:")
-        for idx, row in feature_importance.head(10).iterrows():
-            print(f"  {row['feature']}: {row['importance']:.4f}")
-        
-        self.fallback_mean = float(y.median())
-        self.fallback_std = float(y.std())
-        
-        print(f"\nFallback statistics: mean={self.fallback_mean:.2f}s, std={self.fallback_std:.2f}s")
-        print("="*80)
-        print("Model training completed!")
-        print("="*80)
-
-    def _extract_sequences(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if not TF_AVAILABLE:
-            raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
-        
-        if "time:timestamp" in self.data_log_df.columns:
-            self.data_log_df["time:timestamp"] = pd.to_datetime(
-                self.data_log_df["time:timestamp"], errors="coerce"
-            )
-        
-        df_sorted = self.data_log_df.sort_values(
-            ["case:concept:name", "time:timestamp"]
-        ).copy()
-        
-        required_cols = ["case:concept:name", "concept:name", "lifecycle:transition", "time:timestamp"]
-        missing_cols = [col for col in required_cols if col not in df_sorted.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
-        
-        df_sorted = df_sorted.dropna(subset=["time:timestamp"])
-        
-        all_activities = []
-        all_lifecycles = []
-        all_resources = []
-        
-        for case_id, case_data in df_sorted.groupby("case:concept:name"):
-            case_data = case_data.reset_index(drop=True)
-            for _, event in case_data.iterrows():
-                all_activities.append(str(event["concept:name"]) if not pd.isna(event["concept:name"]) else "unknown")
-                all_lifecycles.append(str(event.get("lifecycle:transition", "complete")) if not pd.isna(event.get("lifecycle:transition")) else "complete")
-                all_resources.append(str(event.get("org:resource", "unknown")) if not pd.isna(event.get("org:resource")) else "unknown")
+        # Collect all activities
+        all_activities = set(["<PAD>"])
+        for act in df_sorted["concept:name"].unique():
+            all_activities.add(str(act))
         
         self.activity_encoder = LabelEncoder()
-        self.lifecycle_encoder = LabelEncoder()
-        self.resource_encoder = LabelEncoder()
+        self.activity_encoder.fit(list(all_activities))
+        self.num_activities = len(self.activity_encoder.classes_)
         
-        activity_encoded = self.activity_encoder.fit_transform(all_activities)
-        lifecycle_encoded = self.lifecycle_encoder.fit_transform(all_lifecycles)
-        resource_encoded = self.resource_encoder.fit_transform(all_resources)
+        pad_idx = self.activity_encoder.transform(["<PAD>"])[0]
         
-        sequences = []
-        contexts = []
-        targets = []
+        prefixes = []
+        prefix_lengths = []
+        cumulative_times = []
         
         for case_id, case_data in df_sorted.groupby("case:concept:name"):
             case_data = case_data.reset_index(drop=True)
@@ -498,231 +119,95 @@ class ProcessingTimeTrainer:
             if len(case_data) < 2:
                 continue
             
-            case_attrs = {}
-            case_attr_cols = ["case:LoanGoal", "case:ApplicationType"]
-            for col in case_attr_cols:
-                if col in case_data.columns:
-                    val = case_data[col].iloc[0] if len(case_data) > 0 else None
-                    case_attrs[col] = val if not pd.isna(val) else None
-                else:
-                    case_attrs[col] = None
+            case_start = case_data["time:timestamp"].iloc[0]
             
-            case_start_time = case_data["time:timestamp"].min()
-            
-            num_activities = len(self.activity_encoder.classes_)
-            num_lifecycles = len(self.lifecycle_encoder.classes_)
-            num_resources = len(self.resource_encoder.classes_)
-            
-            case_sequence = []
-            case_contexts = []
-            case_targets = []
-            
-            for i in range(len(case_data)):
-                event = case_data.iloc[i]
+            # For each position in the trace, create a prefix sample
+            for i in range(1, len(case_data)):
+                current_time = case_data["time:timestamp"].iloc[i]
+                elapsed = (current_time - case_start).total_seconds()
                 
-                if pd.isna(event["time:timestamp"]):
+                if elapsed < 0 or elapsed > 365 * 24 * 3600:
                     continue
                 
-                activity = str(event["concept:name"]) if not pd.isna(event["concept:name"]) else "unknown"
-                lifecycle = str(event.get("lifecycle:transition", "complete")) if not pd.isna(event.get("lifecycle:transition")) else "complete"
-                resource = str(event.get("org:resource", "unknown")) if not pd.isna(event.get("org:resource")) else "unknown"
+                # Get activities up to position i (prefix)
+                activities = []
+                for j in range(i + 1):
+                    act = str(case_data["concept:name"].iloc[j])
+                    activities.append(self.activity_encoder.transform([act])[0])
                 
-                activity_idx = self.activity_encoder.transform([activity])[0]
-                lifecycle_idx = self.lifecycle_encoder.transform([lifecycle])[0]
-                resource_idx = self.resource_encoder.transform([resource])[0]
+                # Truncate or pad
+                if len(activities) > self.max_prefix_length:
+                    activities = activities[-self.max_prefix_length:]
                 
-                activity_onehot = np.zeros(num_activities)
-                activity_onehot[activity_idx] = 1.0
+                prefix_len = len(activities)
                 
-                lifecycle_onehot = np.zeros(num_lifecycles)
-                lifecycle_onehot[lifecycle_idx] = 1.0
+                while len(activities) < self.max_prefix_length:
+                    activities = [pad_idx] + activities
                 
-                resource_onehot = np.zeros(num_resources)
-                resource_onehot[resource_idx] = 1.0
-                
-                combined_onehot = np.concatenate([activity_onehot, lifecycle_onehot, resource_onehot])
-                case_sequence.append(combined_onehot)
-                
-                timestamp = event["time:timestamp"]
-                time_since_start = (timestamp - case_start_time).total_seconds()
-                
-                context = [
-                    timestamp.hour / 24.0,
-                    timestamp.weekday() / 7.0,
-                    timestamp.month / 12.0,
-                    timestamp.timetuple().tm_yday / 365.0,
-                    (i + 1) / 100.0,
-                    time_since_start / 86400.0
-                ]
-                
-                if case_attrs.get("case:LoanGoal"):
-                    context.append(1.0 if str(case_attrs["case:LoanGoal"]) == "Car" else 0.0)
-                else:
-                    context.append(0.0)
-                
-                if case_attrs.get("case:ApplicationType"):
-                    context.append(1.0 if str(case_attrs["case:ApplicationType"]) == "New" else 0.0)
-                else:
-                    context.append(0.0)
-                
-                case_contexts.append(context)
-                
-                if i < len(case_data) - 1:
-                    next_event = case_data.iloc[i + 1]
-                    if not pd.isna(next_event["time:timestamp"]):
-                        time_diff = (next_event["time:timestamp"] - timestamp).total_seconds()
-                        if 0 < time_diff <= 31536000:
-                            case_targets.append(time_diff)
-                        else:
-                            case_targets.append(None)
-                    else:
-                        case_targets.append(None)
-                else:
-                    case_targets.append(None)
-            
-            num_activities = len(self.activity_encoder.classes_)
-            num_lifecycles = len(self.lifecycle_encoder.classes_)
-            num_resources = len(self.resource_encoder.classes_)
-            feature_dim = num_activities + num_lifecycles + num_resources
-            padding = np.zeros(feature_dim)
-            
-            all_targets = []
-            for i in range(len(case_sequence) - 1):
-                if case_targets[i] is not None:
-                    all_targets.append(case_targets[i])
-            
-            if not all_targets:
-                continue
-            
-            mean_y = np.mean(all_targets)
-            std_y = np.std(all_targets)
-            outlier_threshold = mean_y + 3 * std_y
-            
-            for i in range(len(case_sequence) - 1):
-                if case_targets[i] is None:
-                    continue
-                
-                if case_targets[i] > outlier_threshold:
-                    continue
-                
-                seq_start = max(0, i + 1 - self.sequence_length)
-                seq = case_sequence[seq_start:i+1]
-                
-                while len(seq) < self.sequence_length:
-                    seq = [padding] + seq
-                
-                sequences.append(seq)
-                contexts.append(case_contexts[i])
-                targets.append(case_targets[i])
+                prefixes.append(activities)
+                prefix_lengths.append(prefix_len)
+                cumulative_times.append(elapsed)
         
-        if not sequences:
-            raise ValueError("No valid sequences found in event log!")
+        X = np.array(prefixes, dtype=np.int32)
+        lengths = np.array(prefix_lengths, dtype=np.int32)
+        y = np.array(cumulative_times, dtype=np.float32)
         
-        print(f"Converting {len(sequences)} sequences to numpy arrays (this may take a moment)...")
-        try:
-            X_seq = np.array(sequences, dtype=np.float32)
-            X_ctx = np.array(contexts, dtype=np.float32)
-            y = np.array(targets, dtype=np.float32)
-        except MemoryError:
-            print("Memory error during array conversion. Trying batch processing...")
-            batch_size = 100000
-            X_seq_batches = []
-            X_ctx_batches = []
-            y_batches = []
-            
-            for i in range(0, len(sequences), batch_size):
-                batch_end = min(i + batch_size, len(sequences))
-                X_seq_batches.append(np.array(sequences[i:batch_end], dtype=np.float32))
-                X_ctx_batches.append(np.array(contexts[i:batch_end], dtype=np.float32))
-                y_batches.append(np.array(targets[i:batch_end], dtype=np.float32))
-            
-            X_seq = np.concatenate(X_seq_batches, axis=0)
-            X_ctx = np.concatenate(X_ctx_batches, axis=0)
-            y = np.concatenate(y_batches, axis=0)
+        print(f"Extracted {len(y)} prefix samples")
+        print(f"Cumulative times: mean={np.mean(y)/3600:.1f}h, median={np.median(y)/3600:.1f}h")
         
-        return X_seq, X_ctx, y
+        return X, lengths, y
 
-    def _load_cached_sequences(self, cache_path: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        cache_file = f"{cache_path}_sequences_cache.joblib"
-        if os.path.exists(cache_file):
-            try:
-                cache_data = joblib.load(cache_file)
-                X_seq = cache_data['X_seq']
-                X_ctx = cache_data['X_ctx']
-                y = cache_data['y']
-                self.activity_encoder = cache_data['activity_encoder']
-                self.lifecycle_encoder = cache_data['lifecycle_encoder']
-                self.resource_encoder = cache_data['resource_encoder']
-                print(f"Loaded cached sequences from {cache_file}")
-                return X_seq, X_ctx, y
-            except Exception as e:
-                print(f"Failed to load cache: {e}. Re-extracting sequences...")
-        return None
+    def _build_lstm_model(self):
+        """Build LSTM model for prefix-based prediction."""
+        
+        prefix_input = keras.Input(shape=(self.max_prefix_length,), dtype='int32', name='prefix')
+        
+        # Embedding layer
+        x = layers.Embedding(
+            self.num_activities, 
+            self.embedding_dim,
+            mask_zero=True,
+            name='embedding'
+        )(prefix_input)
+        
+        # LSTM layers
+        x = layers.LSTM(self.lstm_units, return_sequences=True, dropout=self.dropout_rate)(x)
+        x = layers.LSTM(self.lstm_units, dropout=self.dropout_rate)(x)
+        
+        # Dense layers
+        x = layers.Dense(64, activation='relu')(x)
+        x = layers.Dropout(self.dropout_rate)(x)
+        x = layers.Dense(32, activation='relu')(x)
+        
+        # Output
+        output = layers.Dense(1, name='cumulative_time')(x)
+        
+        model = keras.Model(inputs=prefix_input, outputs=output)
+        return model
 
-    def _save_cached_sequences(self, cache_path: str, X_seq: np.ndarray, X_ctx: np.ndarray, y: np.ndarray):
-        cache_file = f"{cache_path}_sequences_cache.joblib"
-        try:
-            num_activities = len(self.activity_encoder.classes_)
-            num_lifecycles = len(self.lifecycle_encoder.classes_)
-            num_resources = len(self.resource_encoder.classes_)
-            feature_dim = num_activities + num_lifecycles + num_resources
-            
-            joblib.dump({
-                'X_seq': X_seq.astype(np.float32),
-                'X_ctx': X_ctx.astype(np.float32),
-                'y': y.astype(np.float32),
-                'activity_encoder': self.activity_encoder,
-                'lifecycle_encoder': self.lifecycle_encoder,
-                'resource_encoder': self.resource_encoder,
-                'feature_dim': feature_dim
-            }, cache_file)
-            print(f"Saved sequences cache to {cache_file}")
-        except Exception as e:
-            print(f"Failed to save cache: {e}")
-
-    def train_probabilistic_ml_model(self, cache_path: Optional[str] = None, force_recompute: bool = False):
-        if not TF_AVAILABLE:
-            raise ImportError("TensorFlow is required for probabilistic_ml method. Install with: pip install tensorflow")
+    def train(self, save_path: Optional[str] = None):
+        """Train the model."""
         
-        print("="*80)
-        print("Training Gaussian LSTM Model for Processing Time Prediction")
-        print("="*80)
+        print("=" * 70)
+        print(f"Training {self.method.upper()} Model - Prefix Cumulative Time")
+        print("=" * 70)
         
-        cache_file_path = cache_path or "models/processing_time_model_lstm"
+        # Extract data
+        X, lengths, y = self._extract_prefixes()
         
-        print("\n[1/4] Extracting sequences from event log...")
-        cached = self._load_cached_sequences(cache_file_path) if not force_recompute else None
+        # Remove outliers
+        mean_y, std_y = np.mean(y), np.std(y)
+        valid = y <= mean_y + 3 * std_y
+        X, lengths, y = X[valid], lengths[valid], y[valid]
+        print(f"After outlier removal: {len(y)} samples")
         
-        if cached is None:
-            X_seq, X_ctx, y = self._extract_sequences()
-            self._save_cached_sequences(cache_file_path, X_seq, X_ctx, y)
-        else:
-            X_seq, X_ctx, y = cached
-        
-        print(f"Extracted {len(X_seq)} sequences")
-        print(f"Sequence shape: {X_seq.shape}, Context shape: {X_ctx.shape}")
-        print(f"Target statistics: mean={np.mean(y):.2f}s, median={np.median(y):.2f}s, std={np.std(y):.2f}s")
-        
-        print("\n[2/4] Removing outliers and splitting data...")
-        mean_y = np.mean(y)
-        std_y = np.std(y)
-        outlier_threshold = mean_y + 3 * std_y
-        valid_mask = y <= outlier_threshold
-        X_seq = X_seq[valid_mask]
-        X_ctx = X_ctx[valid_mask]
-        y = y[valid_mask]
-        
-        print(f"After outlier removal: {len(X_seq)} sequences")
-        print(f"Target statistics: mean={np.mean(y):.2f}s, median={np.median(y):.2f}s, std={np.std(y):.2f}s")
-        
-        X_seq_train, X_seq_val, X_ctx_train, X_ctx_val, y_train, y_val = train_test_split(
-            X_seq, X_ctx, y, test_size=0.2, random_state=42, shuffle=True
+        # Split
+        X_train, X_val, len_train, len_val, y_train, y_val = train_test_split(
+            X, lengths, y, test_size=0.2, random_state=42
         )
+        print(f"Train: {len(y_train)}, Validation: {len(y_val)}")
         
-        print(f"Training samples: {len(X_seq_train)}")
-        print(f"Validation samples: {len(X_seq_val)}")
-        
-        print("\n[3/4] Normalizing targets (using log transform for robustness)...")
+        # Normalize targets (log transform)
         y_train_log = np.log(y_train + 1.0)
         y_val_log = np.log(y_val + 1.0)
         self.y_mean = float(np.mean(y_train_log))
@@ -730,253 +215,117 @@ class ProcessingTimeTrainer:
         y_train_norm = (y_train_log - self.y_mean) / self.y_std
         y_val_norm = (y_val_log - self.y_mean) / self.y_std
         
-        print(f"Log-normalized target: mean={self.y_mean:.4f}, std={self.y_std:.4f}")
-        
-        print("\n[4/4] Building LSTM model...")
-        
-        num_activities = len(self.activity_encoder.classes_)
-        num_lifecycles = len(self.lifecycle_encoder.classes_)
-        num_resources = len(self.resource_encoder.classes_)
-        feature_dim = num_activities + num_lifecycles + num_resources
-        
-        seq_input = keras.Input(shape=(self.sequence_length, feature_dim), name='sequence')
-        
-        lstm_out = layers.LSTM(128, return_sequences=False, dropout=0.3, recurrent_dropout=0.2)(seq_input)
-        
-        ctx_input = keras.Input(shape=(X_ctx.shape[1],), name='context')
-        ctx_dense = layers.Dense(64, activation='relu')(ctx_input)
-        ctx_dense = layers.Dropout(0.3)(ctx_dense)
-        
-        merged = layers.Concatenate()([lstm_out, ctx_dense])
-        hidden = layers.Dense(128, activation='relu')(merged)
-        hidden = layers.Dropout(0.4)(hidden)
-        hidden = layers.Dense(64, activation='relu')(hidden)
-        hidden = layers.Dropout(0.3)(hidden)
-        
-        mean_output = layers.Dense(1, name='mean')(hidden)
-        log_var_output = layers.Dense(1, name='log_variance')(hidden)
-        
-        combined_output = layers.Concatenate()([mean_output, log_var_output])
-        model = keras.Model(inputs=[seq_input, ctx_input], outputs=combined_output)
-        
-        def gaussian_loss(y_true, y_pred):
-            mean_pred = y_pred[:, 0:1]
-            log_var_pred = tf.clip_by_value(y_pred[:, 1:2], -3, 3)
-            var_pred = tf.exp(log_var_pred)
-            target = y_true[:, 0:1]
-            diff = target - mean_pred
-            loss = 0.5 * log_var_pred + 0.5 * tf.square(diff) / var_pred
-            return tf.reduce_mean(loss)
-        
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.0005),
-            loss=gaussian_loss
-        )
-        
-        print("\n[5/5] Training LSTM model...")
-        
-        def data_generator(X_seq, X_ctx, y_norm, batch_size=128):
-            n_samples = len(X_seq)
-            indices = np.arange(n_samples)
-            np.random.shuffle(indices)
-            
-            while True:
-                for i in range(0, n_samples, batch_size):
-                    batch_indices = indices[i:i+batch_size]
-                    batch_X_seq = X_seq[batch_indices].astype(np.float32)
-                    batch_X_ctx = X_ctx[batch_indices].astype(np.float32)
-                    batch_y = y_norm[batch_indices].astype(np.float32)
-                    batch_y_combined = np.column_stack([batch_y, np.zeros_like(batch_y)]).astype(np.float32)
-                    yield (batch_X_seq, batch_X_ctx), batch_y_combined
-        
-        steps_per_epoch = (len(X_seq_train) + 127) // 128
-        validation_steps = (len(X_seq_val) + 127) // 128
-        
-        output_signature = (
-            (
-                tf.TensorSpec(shape=(None, self.sequence_length, X_seq_train.shape[2]), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, X_ctx_train.shape[1]), dtype=tf.float32)
-            ),
-            tf.TensorSpec(shape=(None, 2), dtype=tf.float32)
-        )
-        
-        train_ds = tf.data.Dataset.from_generator(
-            lambda: data_generator(X_seq_train, X_ctx_train, y_train_norm, batch_size=128),
-            output_signature=output_signature
-        )
-        
-        val_ds = tf.data.Dataset.from_generator(
-            lambda: data_generator(X_seq_val, X_ctx_val, y_val_norm, batch_size=128),
-            output_signature=output_signature
-        )
-        
-        early_stopping = keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=5,
-            restore_best_weights=True,
-            verbose=1
-        )
-        
-        history = model.fit(
-            train_ds,
-            steps_per_epoch=steps_per_epoch,
-            validation_data=val_ds,
-            validation_steps=validation_steps,
-            epochs=50,
-            callbacks=[early_stopping],
-            verbose=1
-        )
-        
-        print("\n" + "-"*80)
-        print("Model Evaluation")
-        print("-"*80)
-        
-        print("Computing predictions in batches...")
-        eval_batch_size = 10000
-        train_pred_mean_list = []
-        train_pred_std_list = []
-        
-        for i in range(0, len(X_seq_train), eval_batch_size):
-            batch_end = min(i + eval_batch_size, len(X_seq_train))
-            batch_pred = model.predict([X_seq_train[i:batch_end], X_ctx_train[i:batch_end]], verbose=0)
-            batch_pred_mean_norm = batch_pred[:, 0] * self.y_std + self.y_mean
-            train_pred_mean_list.append(np.exp(batch_pred_mean_norm) - 1.0)
-            train_pred_std_list.append(np.sqrt(np.exp(np.clip(batch_pred[:, 1], -10, 10)) + 1e-6) * np.exp(batch_pred_mean_norm))
-        
-        train_pred_mean = np.concatenate(train_pred_mean_list)
-        train_pred_std = np.concatenate(train_pred_std_list)
-        
-        val_pred_mean_list = []
-        val_pred_std_list = []
-        
-        for i in range(0, len(X_seq_val), eval_batch_size):
-            batch_end = min(i + eval_batch_size, len(X_seq_val))
-            batch_pred = model.predict([X_seq_val[i:batch_end], X_ctx_val[i:batch_end]], verbose=0)
-            batch_pred_mean_norm = batch_pred[:, 0] * self.y_std + self.y_mean
-            val_pred_mean_list.append(np.exp(batch_pred_mean_norm) - 1.0)
-            val_pred_std_list.append(np.sqrt(np.exp(np.clip(batch_pred[:, 1], -10, 10)) + 1e-6) * np.exp(batch_pred_mean_norm))
-        
-        val_pred_mean = np.concatenate(val_pred_mean_list)
-        val_pred_std = np.concatenate(val_pred_std_list)
-        
-        train_mae = mean_absolute_error(y_train, train_pred_mean)
-        train_rmse = np.sqrt(mean_squared_error(y_train, train_pred_mean))
-        val_mae = mean_absolute_error(y_val, val_pred_mean)
-        val_rmse = np.sqrt(mean_squared_error(y_val, val_pred_mean))
-        
-        print(f"\nTraining Set:")
-        print(f"  MAE:  {train_mae:.2f} seconds ({train_mae/3600:.2f} hours)")
-        print(f"  RMSE: {train_rmse:.2f} seconds ({train_rmse/3600:.2f} hours)")
-        print(f"  Mean predicted std: {np.mean(train_pred_std):.2f}s")
-        
-        print(f"\nValidation Set:")
-        print(f"  MAE:  {val_mae:.2f} seconds ({val_mae/3600:.2f} hours)")
-        print(f"  RMSE: {val_rmse:.2f} seconds ({val_rmse/3600:.2f} hours)")
-        print(f"  Mean predicted std: {np.mean(val_pred_std):.2f}s")
-        
-        self.lstm_model = model
         self.fallback_mean = float(np.median(y))
-        self.fallback_std = float(np.std(y))
         
-        print(f"\nFallback statistics: mean={self.fallback_mean:.2f}s, std={self.fallback_std:.2f}s")
-        print("="*80)
-        print("Model training completed!")
-        print("="*80)
-
-    def train(self, cache_path: Optional[str] = None, force_recompute: bool = False):
-        """
-        Train/fit the model based on the specified method.
-        
-        Args:
-            cache_path: Path for caching sequences (only used for probabilistic_ml)
-            force_recompute: Force re-extraction of sequences even if cache exists
-        """
-        if self.method == "distribution":
-            self.fit_distributions()
-        elif self.method == "ml":
-            self.train_ml_model()
-        elif self.method == "probabilistic_ml":
-            self.train_probabilistic_ml_model(cache_path=cache_path, force_recompute=force_recompute)
+        if self.method == "lstm":
+            self._train_lstm(X_train, X_val, y_train_norm, y_val_norm, y_train, y_val)
         else:
-            raise ValueError(f"Unknown method: {self.method}. Use 'distribution', 'ml', or 'probabilistic_ml'.")
-
-    def save_model(self, filepath: str):
-        """
-        Save trained model and preprocessors to disk.
+            self._train_rf(X_train, X_val, len_train, len_val, y_train, y_val)
         
-        Args:
-            filepath: Base path for saving (will create multiple files)
-        """
-        if self.method == "distribution":
-            distributions_path = f"{filepath}_distributions.joblib"
-            metadata_path = f"{filepath}_metadata.joblib"
-            
-            distributions_serializable = {}
-            for key, value in self.distributions.items():
-                distributions_serializable[key] = {
-                    'mu': value['mu'],
-                    'sigma': value['sigma'],
-                    'count': value['count'],
-                    'mean': value['mean'],
-                    'std': value['std'],
-                    'median': value['median']
-                }
-            
-            joblib.dump(distributions_serializable, distributions_path)
-            joblib.dump({
-                'fallback_mean': self.fallback_mean,
-                'fallback_std': self.fallback_std,
-                'method': 'distribution'
-            }, metadata_path)
-            
-            print(f"Model saved to {filepath}_*.joblib")
-            
-        elif self.method == "probabilistic_ml":
-            if self.lstm_model is None:
-                raise ValueError("No model to save. Train model first.")
-            
-            model_path = f"{filepath}_lstm_model.keras"
-            encoders_path = f"{filepath}_encoders.joblib"
-            metadata_path = f"{filepath}_metadata.joblib"
-            
-            self.lstm_model.save(model_path)
-            joblib.dump({
-                'activity_encoder': self.activity_encoder,
-                'lifecycle_encoder': self.lifecycle_encoder,
-                'resource_encoder': self.resource_encoder
-            }, encoders_path)
-            joblib.dump({
-                'sequence_length': self.sequence_length,
-                'fallback_mean': self.fallback_mean,
-                'fallback_std': self.fallback_std,
-                'y_mean': self.y_mean,
-                'y_std': self.y_std,
-                'method': 'probabilistic_ml'
-            }, metadata_path)
-            
-            print(f"Model saved to {filepath}_*.joblib and {filepath}_lstm_model.keras")
-            
-        elif self.method == "ml":
-            if self.ml_model is None:
-                raise ValueError("No model to save. Train model first.")
-            
-            model_path = f"{filepath}_model.joblib"
-            encoders_path = f"{filepath}_encoders.joblib"
-            scaler_path = f"{filepath}_scaler.joblib"
-            metadata_path = f"{filepath}_metadata.joblib"
-            
-            joblib.dump(self.ml_model, model_path)
-            joblib.dump(self.label_encoders, encoders_path)
-            joblib.dump(self.scaler, scaler_path)
-            joblib.dump({
-                'feature_names': self.feature_names,
-                'categorical_features': self.categorical_features,
-                'numerical_features': self.numerical_features,
-                'feature_defaults': self.feature_defaults,
-                'fallback_mean': self.fallback_mean,
-                'fallback_std': self.fallback_std,
-                'method': 'ml'
-            }, metadata_path)
-            
-            print(f"Model saved to {filepath}_*.joblib")
+        if save_path:
+            self.save(save_path)
 
+    def _train_lstm(self, X_train, X_val, y_train_norm, y_val_norm, y_train_raw, y_val_raw):
+        """Train LSTM model."""
+        if not TF_AVAILABLE:
+            raise ImportError("TensorFlow required for LSTM")
+        
+        gpu_available = setup_gpu()
+        batch_size = self.batch_size * 2 if gpu_available else self.batch_size
+        
+        print("\nBuilding LSTM model...")
+        self.model = self._build_lstm_model()
+        
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
+        self.model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+        self.model.summary()
+        
+        # Create datasets
+        train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train_norm))
+        train_ds = train_ds.shuffle(50000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        
+        val_ds = tf.data.Dataset.from_tensor_slices((X_val, y_val_norm))
+        val_ds = val_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        
+        callbacks = [
+            keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+            keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+        ]
+        
+        print("\nTraining...")
+        self.model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=self.epochs,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        # Evaluate
+        val_pred_norm = self.model.predict(X_val, verbose=0).flatten()
+        val_pred = np.exp(val_pred_norm * self.y_std + self.y_mean) - 1.0
+        
+        self._print_metrics(y_val_raw, val_pred)
+
+    def _train_rf(self, X_train, X_val, len_train, len_val, y_train, y_val):
+        """Train Random Forest model."""
+        print("\nTraining Random Forest...")
+        
+        # Flatten prefixes + add length as feature
+        X_train_flat = np.hstack([X_train, len_train.reshape(-1, 1)])
+        X_val_flat = np.hstack([X_val, len_val.reshape(-1, 1)])
+        
+        self.model = RandomForestRegressor(
+            n_estimators=200,
+            max_depth=20,
+            min_samples_split=10,
+            n_jobs=-1,
+            random_state=42,
+            verbose=1
+        )
+        
+        self.model.fit(X_train_flat, y_train)
+        val_pred = self.model.predict(X_val_flat)
+        
+        self._print_metrics(y_val, val_pred)
+
+    def _print_metrics(self, y_true, y_pred):
+        """Print evaluation metrics."""
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        r2 = r2_score(y_true, y_pred)
+        
+        rel_errors = np.abs(y_true - y_pred) / (y_true + 1e-6)
+        within_25 = np.mean(rel_errors <= 0.25) * 100
+        within_50 = np.mean(rel_errors <= 0.50) * 100
+        
+        print("\n" + "-" * 50)
+        print("Validation Results")
+        print("-" * 50)
+        print(f"MAE:        {mae/3600:.2f} hours ({mae:.0f}s)")
+        print(f"RMSE:       {rmse/3600:.2f} hours ({rmse:.0f}s)")
+        print(f"R²:         {r2:.4f}")
+        print(f"Within 25%: {within_25:.1f}%")
+        print(f"Within 50%: {within_50:.1f}%")
+        print("=" * 70)
+
+    def save(self, filepath: str):
+        """Save model and config."""
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        
+        if self.method == "lstm" and TF_AVAILABLE:
+            self.model.save(f"{filepath}_model.keras")
+        else:
+            joblib.dump(self.model, f"{filepath}_model.joblib")
+        
+        joblib.dump({
+            'method': self.method,
+            'activity_encoder': self.activity_encoder,
+            'num_activities': self.num_activities,
+            'max_prefix_length': self.max_prefix_length,
+            'y_mean': self.y_mean,
+            'y_std': self.y_std,
+            'fallback_mean': self.fallback_mean
+        }, f"{filepath}_config.joblib")
+        
+        print(f"Model saved to {filepath}")
