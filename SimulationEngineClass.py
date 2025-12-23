@@ -1,10 +1,11 @@
-from typing import List
+from typing import List, Optional
 import pandas as pd
 from enum import Enum
 import pm4py
 import os
 import uuid
 import random
+from datetime import timedelta
 from DataPreparationClass import DataPreparationClass
 from EventDataClass import LogEvent, Action, ConceptName, EventOrigin, LifecycleTransition
 from case_arrival_times_prediction.CaseArrivalTimePredictionClass import CaseArrivalTimePredictionClass
@@ -12,24 +13,31 @@ from case_attribute_prediction.CaseAttributePredictionClass import CaseAttribute
 from case_next_activity_prediction.CaseNextActivityPredictionClass import CaseNextActivityPredictionClass
 from event_arrival_prediction.EventArrivalPredictionClass import EventArrivalPredictionClass
 from event_attribute_prediction.EventAttributePredictionClass import EventAttributePredictionClass
+from processing_time_prediction.ProcessingTimePredictionClass import ProcessingTimePredictionClass
 
 
 class SimulationEngineClass:
 
     currentSequence: List[LogEvent]
     dataLogDf: pd.DataFrame = None
+    originalDataLogDf: pd.DataFrame = None  # Keep original data for processing time extraction
     dataIsPrepared: bool = False
     
     isCaseEnded = False
 
-    def __init__(self, dataLogDf: pd.DataFrame = None):
+    def __init__(self, dataLogDf: pd.DataFrame = None, processing_time_method: str = "ml"):
         self.dataLogDf = dataLogDf
+        self.originalDataLogDf = dataLogDf.copy() if dataLogDf is not None else None
 
         self.case_arrival_time_predictor = CaseArrivalTimePredictionClass()
         self.case_attribute_predictor = CaseAttributePredictionClass()
         self.next_activity_predictor = CaseNextActivityPredictionClass()
         self.event_arrival_predictor = EventArrivalPredictionClass()
         self.event_attribute_predictor = EventAttributePredictionClass()
+        
+        # Processing time predictor will be initialized after data is loaded
+        self.processing_time_predictor: Optional[ProcessingTimePredictionClass] = None
+        self.processing_time_method = processing_time_method
 
     def generate_case_id(self):
         return f"Application_{random.randint(10000000, 1999999999)}"
@@ -59,6 +67,16 @@ class SimulationEngineClass:
             prep = DataPreparationClass(self.dataLogDf)
             self.dataLogDf = prep.prepare_data()
             self.dataIsPrepared = True
+        
+        # Initialize processing time predictor if not already initialized
+        if self.processing_time_predictor is None:
+            print("Initializing processing time predictor (loading model from disk)...")
+            # Processing time model must be trained beforehand and saved to disk
+            # using `train_processing_time_model.py`. We load it here.
+            self.processing_time_predictor = ProcessingTimePredictionClass(
+                method=self.processing_time_method,
+                model_path="models/processing_time_model"
+            )
 
         #Simulation
         for i in range(numberSimulatedCases):
@@ -71,14 +89,14 @@ class SimulationEngineClass:
 
             # Draw-Case-Attributes
             case_loan_goal, case_application_type, requested_amount = self.case_attribute_predictor.predict()
+            
+            # Track previous event for processing time prediction
+            previous_event: Optional[LogEvent] = None
 
             while not self.isCaseEnded:
 
                 # Event_Id erstellen
                 generated_event_id = self.generate_event_id()
-
-                # PredictEventTimestamp
-                simulated_timestamp = self.event_arrival_predictor.predict()
 
                 # Predict Next Activity
                 predicted_next_activity, isCaseEnded = self.next_activity_predictor.predict()
@@ -90,10 +108,43 @@ class SimulationEngineClass:
                     monthly_cost, is_selected, credit_score, offered_amount
                 ) = self.event_attribute_predictor.predict()
 
+                # Predict Processing Time between previous and current event
+                if previous_event is not None and self.processing_time_predictor is not None:
+                    # Get previous event's activity and lifecycle
+                    # Handle both Enum and string types
+                    prev_activity = previous_event.concept_name.value if isinstance(previous_event.concept_name, Enum) else str(previous_event.concept_name)
+                    prev_lifecycle = previous_event.lifecycle.value if isinstance(previous_event.lifecycle, Enum) else str(previous_event.lifecycle)
+                    
+                    # Get current event's activity and lifecycle
+                    curr_activity = predicted_next_activity.value if isinstance(predicted_next_activity, Enum) else str(predicted_next_activity)
+                    curr_lifecycle = predicted_lifecycle.value if isinstance(predicted_lifecycle, Enum) else str(predicted_lifecycle)
+                    
+                    # Prepare context for ML model
+                    context = {
+                        'resource_1': previous_event.resource,
+                        'resource_2': predicted_resource,
+                        'case:RequestedAmount': requested_amount,
+                        'CreditScore': credit_score,
+                        'hour': simulated_timestamp.hour,
+                        'weekday': simulated_timestamp.weekday(),
+                        'month': simulated_timestamp.month,
+                    }
+                    
+                    # Predict processing time
+                    processing_time_seconds = self.processing_time_predictor.predict(
+                        prev_activity, prev_lifecycle,
+                        curr_activity, curr_lifecycle,
+                        context
+                    )
+                    
+                    # Add processing time to timestamp
+                    simulated_timestamp = simulated_timestamp + timedelta(seconds=processing_time_seconds)
+                else:
+                    # First event in case - use event arrival predictor
+                    simulated_timestamp = self.event_arrival_predictor.predict()
+
                 # Offer-ID erzeugen
                 generated_offer_id = self.generate_offer_id()
-
-                # Predict ActivityDuration ( Überhaupt noch relevant oder schon implizit in PredictEventTimestamp)
 
                 # Validieren der simulierten Event-Daten:
                 eventData = LogEvent(
@@ -124,6 +175,9 @@ class SimulationEngineClass:
 
                 # Schreiben ins SimLog:
                 self.write_event_into_sim_log(eventData)
+                
+                # Update previous event for next iteration
+                previous_event = eventData
 
                 #Damit endet
                 self.isCaseEnded = True
@@ -142,6 +196,7 @@ class SimulationEngineClass:
         if os.path.exists(SIMULATION_LOG_PATH):
             df = pd.read_csv(SIMULATION_LOG_PATH)
             self.dataLogDf = df 
+            self.originalDataLogDf = df.copy()  # Keep original for processing time extraction
             return df
 
         # Log neu einlesen
@@ -150,6 +205,7 @@ class SimulationEngineClass:
         df = pm4py.convert_to_dataframe(log)
 
         self.dataLogDf = df 
+        self.originalDataLogDf = df.copy()  # Keep original for processing time extraction
 
         print("✨ Speichere vorbereiteten Log für zukünftige Läufe...")
         df.to_csv(SIMULATION_LOG_PATH, index=False)
