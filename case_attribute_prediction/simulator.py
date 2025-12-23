@@ -1,28 +1,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import pickle
 from typing import Callable, Optional, Any, Dict
 import numpy as np
 import pandas as pd
 
-from .registry import build_default_registry, PredictorRegistry
+from .registry import (
+    build_default_registry,
+    PredictorRegistry,
+    registry_models_to_dict,
+    load_models_into_registry,
+)
 from .utils import resolve_col
 
 
-def _build_case_samplers(
+def _compute_case_sampler_artifact(
     df: pd.DataFrame,
-    seed: int = 42,
     case_col: str = "case:concept:name",
     loan_goal_col: str = "case:LoanGoal",
     app_type_col: str = "case:ApplicationType",
     requested_col: str = "case:RequestedAmount",
-) -> tuple[
-    Callable[[], str],
-    Callable[[str], str],
-    Callable[[str, str], float],
-]:
-    rng = np.random.default_rng(seed)
-
+) -> dict:
+    """
+    Berechnet alle benötigten Verteilungen für die Case-Sampler und gibt sie
+    als serialisierbares Artefakt zurück.
+    """
     for c in (loan_goal_col, app_type_col, requested_col):
         if c not in df.columns:
             raise KeyError(f"Fehlende Spalte im Input df: '{c}'")
@@ -58,6 +62,40 @@ def _build_case_samplers(
         for lg, sub in case_tbl.groupby(loan_goal_col)
     }
 
+    return {
+        "lg_vals": lg_vals,
+        "lg_probs": lg_probs,
+        "at_vals": at_vals,
+        "at_probs": at_probs,
+        "at_cond": at_cond,
+        "req_global": req_global,
+        "req_by_pair": req_by_pair,
+        "req_by_lg": req_by_lg,
+    }
+
+
+def _build_case_samplers_from_artifact(
+    artifact: dict,
+    seed: int = 42,
+) -> tuple[
+    Callable[[], str],
+    Callable[[str], str],
+    Callable[[str, str], float],
+]:
+    """
+    Baut die Case-Sampler-Funktionen aus einem zuvor berechneten Artefakt.
+    """
+    rng = np.random.default_rng(seed)
+
+    lg_vals = artifact["lg_vals"]
+    lg_probs = artifact["lg_probs"]
+    at_vals = artifact["at_vals"]
+    at_probs = artifact["at_probs"]
+    at_cond = artifact["at_cond"]
+    req_global = artifact["req_global"]
+    req_by_pair = artifact["req_by_pair"]
+    req_by_lg = artifact["req_by_lg"]
+
     def draw_lg() -> str:
         return str(rng.choice(lg_vals, p=lg_probs))
 
@@ -79,18 +117,41 @@ def _build_case_samplers(
     return draw_lg, draw_at, draw_requested_amount
 
 
-def _build_monthly_rate_sampler(
+def _build_case_samplers(
     df: pd.DataFrame,
     seed: int = 42,
     case_col: str = "case:concept:name",
+    loan_goal_col: str = "case:LoanGoal",
+    app_type_col: str = "case:ApplicationType",
+    requested_col: str = "case:RequestedAmount",
+) -> tuple[
+    Callable[[], str],
+    Callable[[str], str],
+    Callable[[str, str], float],
+]:
+    """
+    Convenience-Wrapper: berechnet das Artefakt aus dem df und baut daraus
+    die Sampler-Funktionen.
+    """
+    artifact = _compute_case_sampler_artifact(
+        df,
+        case_col=case_col,
+        loan_goal_col=loan_goal_col,
+        app_type_col=app_type_col,
+        requested_col=requested_col,
+    )
+    return _build_case_samplers_from_artifact(artifact, seed=seed)
+
+
+def _compute_monthly_rate_artifact(
+    df: pd.DataFrame,
+    case_col: str = "case:concept:name",
     monthly_col: str = "MonthlyCost",
     offered_col: str = "OfferedAmount",
-) -> Callable[[float], float]:
+) -> dict:
     """
-    Fallback, wenn kein MONTHLY_MODEL Artefakt vorhanden ist:
-    rate = MonthlyCost/OfferedAmount aus Originaldaten samplen.
+    Berechnet die Verteilung der Rate = MonthlyCost/OfferedAmount auf Case-Level.
     """
-    rng = np.random.default_rng(seed)
     mc = resolve_col(df, monthly_col)
     oa = resolve_col(df, offered_col)
 
@@ -105,11 +166,44 @@ def _build_monthly_rate_sampler(
     if rate.size == 0:
         rate = np.array([0.01], dtype=float)
 
+    return {"rate": rate}
+
+
+def _build_monthly_rate_sampler_from_artifact(
+    artifact: dict,
+    seed: int = 42,
+) -> Callable[[float], float]:
+    """
+    Baut den Monthly-Rate-Sampler aus einem zuvor berechneten Artefakt.
+    """
+    rng = np.random.default_rng(seed)
+    rate = np.asarray(artifact["rate"], dtype=float)
+
     def draw_monthly(offered_amount: float) -> float:
         r = float(rng.choice(rate))
         return float(max(r * float(offered_amount), 0.0))
 
     return draw_monthly
+
+
+def _build_monthly_rate_sampler(
+    df: pd.DataFrame,
+    seed: int = 42,
+    case_col: str = "case:concept:name",
+    monthly_col: str = "MonthlyCost",
+    offered_col: str = "OfferedAmount",
+) -> Callable[[float], float]:
+    """
+    Convenience-Wrapper: berechnet das Artefakt aus dem df und baut daraus
+    den Monthly-Rate-Sampler.
+    """
+    artifact = _compute_monthly_rate_artifact(
+        df,
+        case_col=case_col,
+        monthly_col=monthly_col,
+        offered_col=offered_col,
+    )
+    return _build_monthly_rate_sampler_from_artifact(artifact, seed=seed)
 
 
 @dataclass
@@ -142,24 +236,30 @@ class AttributeSimulationEngine:
 
     def __init__(
         self,
-        df: pd.DataFrame,
+        df: pd.DataFrame | None,
         seed: int = 42,
         monthly_artifact: dict | None = None,
         offer_create_activity: str = "O_Create Offer",
+        model_store_path: str | Path | None = None,
+        retrain_models: bool = False,
     ):
+        """
+        df kann None sein, wenn ausschließlich aus gespeicherten Artefakten
+        (Modelle + Verteilungen) simuliert werden soll.
+        """
         self.df = df
         self.seed = int(seed)
         self.offer_create_activity = str(offer_create_activity)
 
+        # Pfad für Modellartefakte (Pickle); default neben dieser Datei
+        self.model_store_path = Path(model_store_path) if model_store_path is not None else Path(__file__).with_name("attribute_models.pkl")
+        # Pfad für Verteilungs-Artefakte (Case-Sampler + Monthly-Rate)
+        self.dist_store_path = Path(__file__).with_name("attribute_distributions.pkl")
+        self.retrain_models = bool(retrain_models)
+
         # Registry + Fit (einmal)
         self.registry: PredictorRegistry = build_default_registry(seed=self.seed)
-        self.registry.credit_score.fit(df)
-        self.registry.offered_amount.fit(df)
-        self.registry.first_withdrawal_amount.fit(df)
-        self.registry.number_of_terms.fit(df)
-        self.registry.selected.fit(df)
-        self.registry.accepted.fit(df)
-        self.registry.monthly_cost.fit(df)
+        self._init_models(df)
 
         # MonthlyCost: Artefakt oder fallback rate sampler
         self.monthly_artifact = monthly_artifact
@@ -167,15 +267,91 @@ class AttributeSimulationEngine:
 
         if monthly_artifact is not None:
             self.registry.monthly_cost.set_artifact(monthly_artifact)
-        else:
+        # Fallback-Rate-Sampler oder Laden aus Artefakt
+        # sowie Case-Sampler:
+        if df is not None:
+            # Sampler direkt aus df bauen und Artefakt persistieren
             self.monthly_rate_sampler = _build_monthly_rate_sampler(df, seed=self.seed)
+            self.draw_lg, self.draw_at, self.draw_requested_amount = _build_case_samplers(df, seed=self.seed)
 
-        # Case-Sampler (einmal)
-        self.draw_lg, self.draw_at, self.draw_requested_amount = _build_case_samplers(df, seed=self.seed)
+            dist_artifact = {
+                "case": _compute_case_sampler_artifact(df),
+                "monthly_rate": _compute_monthly_rate_artifact(df),
+            }
+            try:
+                with self.dist_store_path.open("wb") as f:
+                    pickle.dump(dist_artifact, f)
+            except Exception:
+                # Persistence-Fehler sollen die Simulation nicht verhindern
+                pass
+        else:
+            # df ist None: wir erwarten vortrainierte Verteilungs-Artefakte
+            if not self.dist_store_path.exists():
+                raise ValueError(
+                    f"Kein df übergeben und Verteilungs-Artefakt '{self.dist_store_path}' nicht gefunden. "
+                    f"Bitte zuerst einmal mit retrain_models=True und df trainieren."
+                )
+            with self.dist_store_path.open("rb") as f:
+                dist_artifact = pickle.load(f)
+
+            case_art = dist_artifact.get("case")
+            monthly_art = dist_artifact.get("monthly_rate")
+            if case_art is None or monthly_art is None:
+                raise ValueError(
+                    f"Verteilungs-Artefakt '{self.dist_store_path}' ist unvollständig oder korrupt."
+                )
+
+            self.draw_lg, self.draw_at, self.draw_requested_amount = _build_case_samplers_from_artifact(
+                case_art,
+                seed=self.seed,
+            )
+
+            if monthly_artifact is None:
+                self.monthly_rate_sampler = _build_monthly_rate_sampler_from_artifact(
+                    monthly_art,
+                    seed=self.seed,
+                )
 
         # interner Zustand
         self._case_counter = 0
         self._active_case: CaseState | None = None
+
+    def _init_models(self, df: pd.DataFrame | None):
+        """
+        Modelle entweder laden oder neu fitten + persistieren.
+        """
+        models_loaded = False
+        if not self.retrain_models and self.model_store_path.exists():
+            try:
+                with self.model_store_path.open("rb") as f:
+                    models = pickle.load(f)
+                load_models_into_registry(self.registry, models)
+                models_loaded = True
+            except Exception:
+                # Fallback auf Neu-Training, wenn Laden fehlschlägt
+                models_loaded = False
+
+        if not models_loaded:
+            # Fit einmalig – benötigt ein df
+            if df is None:
+                raise ValueError(
+                    "Kein df übergeben, aber Modelle müssen neu trainiert werden. "
+                    "Bitte ein Trainings-DataFrame übergeben oder retrain_models=False setzen."
+                )
+            self.registry.credit_score.fit(df)
+            self.registry.offered_amount.fit(df)
+            self.registry.first_withdrawal_amount.fit(df)
+            self.registry.number_of_terms.fit(df)
+            self.registry.selected.fit(df)
+            self.registry.accepted.fit(df)
+            self.registry.monthly_cost.fit(df)
+            # persistieren
+            try:
+                with self.model_store_path.open("wb") as f:
+                    pickle.dump(registry_models_to_dict(self.registry), f)
+            except Exception:
+                # Persistence failures sollen Simulation nicht stoppen
+                pass
 
     def start_new_case(self, case_id: str | None = None) -> CaseState:
         """
@@ -200,6 +376,14 @@ class AttributeSimulationEngine:
     def _ensure_case(self):
         if self._active_case is None:
             self.start_new_case()
+
+    def end_current_case(self) -> None:
+        """
+        Beendet den aktuell aktiven Case.
+        Beim nächsten draw_case_attributes()/start_new_case()
+        wird automatisch ein neuer Case begonnen.
+        """
+        self._active_case = None
 
     def _draw_offer_dependent_attributes_once(self):
         """
@@ -352,25 +536,15 @@ class AttributeSimulationEngine:
         return results
 
 
-    def draw_case_and_event_attributes(
+    def draw_case_attributes(
         self,
-        next_activity: str,
         *,
         case_id: str | None = None,
         include_case_prefix_cols: bool = True,
-        extra_event_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
-        Hauptmethode:
-        - stellt sicher, dass ein Case aktiv ist
-        - zieht Offer-abhängige Attribute nur, wenn next_activity == offer_create_activity
-        - liefert ein Dict für einen Event-Row
-
-        Parameter:
-          - next_activity: Aktivität aus Ihrem Next-Activity-Modell/Regeln
-          - case_id: optional (falls Sie extern CaseIDs vergeben)
-          - include_case_prefix_cols: ob case:-Spalten so heißen sollen wie im Eventlog
-          - extra_event_fields: z.B. Action/EventOrigin/EventID/lifecycle:transition etc.
+        Liefert nur die Case-bezogenen Attribute (ohne Event-spezifische Felder).
+        Diese Werte bleiben für alle Events eines Cases konstant.
         """
         if self._active_case is None:
             self.start_new_case(case_id=case_id)
@@ -381,14 +555,8 @@ class AttributeSimulationEngine:
         assert self._active_case is not None
         cs = self._active_case
 
-        # Nur bei Offer-Creation wird das Bündel gezogen (wie Notebook-Intent)
-        if str(next_activity) == self.offer_create_activity:
-            self._draw_offer_dependent_attributes_once()
-
-        # Event-Dict bauen
         out: dict[str, Any] = {
             "case:concept:name": cs.case_id,
-            "concept:name": str(next_activity),
         }
 
         if include_case_prefix_cols:
@@ -404,8 +572,29 @@ class AttributeSimulationEngine:
                 "RequestedAmount": cs.requested_amount,
             })
 
-        # Attribute (wenn noch nicht gezogen, bleiben NaN/None)
-        out.update({
+        return out
+
+    def draw_event_attributes(
+        self,
+        next_activity: str,
+        *,
+        extra_event_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Liefert nur die Event-bezogenen Attribute:
+        - setzt bei O_Create Offer (offer_create_activity) die Offer-abhängigen Attribute,
+        - für andere Aktivitäten bleiben diese Attribute NaN/None (entspricht \"kein Offer-Event\").
+        """
+        self._ensure_case()
+        assert self._active_case is not None
+        cs = self._active_case
+
+        # Nur bei Offer-Creation wird das Bündel gezogen
+        if str(next_activity) == self.offer_create_activity:
+            self._draw_offer_dependent_attributes_once()
+
+        out: dict[str, Any] = {
+            "concept:name": str(next_activity),
             "CreditScore": cs.credit_score,
             "OfferedAmount": cs.offered_amount,
             "FirstWithdrawalAmount": cs.first_withdrawal_amount,
@@ -413,11 +602,38 @@ class AttributeSimulationEngine:
             "MonthlyCost": cs.monthly_cost,
             "Selected": cs.selected,
             "Accepted": cs.accepted,
-        })
+        }
 
         if extra_event_fields:
             out.update(dict(extra_event_fields))
 
+        return out
+
+    def draw_case_and_event_attributes(
+        self,
+        next_activity: str,
+        *,
+        case_id: str | None = None,
+        include_case_prefix_cols: bool = True,
+        extra_event_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Convenience-Wrapper für Legacy-Code:
+        kombiniert draw_case_attributes() und draw_event_attributes().
+
+        Wird perspektivisch durch die getrennten Methoden ersetzt.
+        """
+        case_attrs = self.draw_case_attributes(
+            case_id=case_id,
+            include_case_prefix_cols=include_case_prefix_cols,
+        )
+        event_attrs = self.draw_event_attributes(
+            next_activity,
+            extra_event_fields=extra_event_fields,
+        )
+        out: dict[str, Any] = {}
+        out.update(case_attrs)
+        out.update(event_attrs)
         return out
 
     def finalize_case_row(self) -> dict[str, Any]:
