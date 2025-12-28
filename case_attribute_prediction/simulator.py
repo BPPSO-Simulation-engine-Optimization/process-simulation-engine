@@ -444,6 +444,71 @@ class AttributeSimulationEngine:
         cs.selected = bool(self.registry.selected.predict(cs.loan_goal, cs.application_type, cs.credit_score))
         cs.accepted = bool(self.registry.accepted.predict(cs.monthly_cost, cs.credit_score))
 
+    def populate_offer_attributes(self, case_state: CaseState) -> None:
+        """
+        Populiert Offer-abhängige Attribute direkt auf dem übergebenen CaseState.
+        
+        Diese Methode ist für die DES-Engine gedacht, die viele Cases parallel
+        verarbeitet. Im Gegensatz zu _draw_offer_dependent_attributes_once()
+        verwendet sie NICHT den internen _active_case Pointer, sondern operiert
+        direkt auf dem übergebenen CaseState-Objekt.
+        
+        Args:
+            case_state: Das CaseState-Objekt, auf dem die Attribute gesetzt werden.
+        """
+        cs = case_state
+
+        # Bereits gezogen -> überspringen
+        if np.isfinite(cs.offered_amount):
+            return
+
+        # Deterministischer Seed aus case_id für Reproduzierbarkeit
+        case_seed = self.seed + hash(cs.case_id) % 100000
+
+        cs.credit_score = float(self.registry.credit_score.predict(cs.loan_goal, cs.application_type))
+
+        cs.offered_amount = float(
+            self.registry.offered_amount.predict(
+                cs.loan_goal, cs.application_type, cs.requested_amount,
+                mode="sample", n_draws=1, seed=case_seed
+            )
+        )
+
+        cs.first_withdrawal_amount = float(
+            self.registry.first_withdrawal_amount.predict(
+                cs.loan_goal, cs.application_type, cs.credit_score,
+                requested_amount=cs.requested_amount,
+                offered_amount=cs.offered_amount,
+                mode="sample",
+                seed=case_seed,
+            )
+        )
+
+        cs.number_of_terms = int(
+            self.registry.number_of_terms.predict(
+                offered_amount=cs.offered_amount,
+                credit_score=cs.credit_score,
+                loan_goal=cs.loan_goal,
+                application_type=cs.application_type,
+            )
+        )
+
+        if self.monthly_artifact is not None:
+            cs.monthly_cost = float(
+                self.registry.monthly_cost.predict(
+                    offered_amount=cs.offered_amount,
+                    number_of_terms=int(cs.number_of_terms),
+                    credit_score=cs.credit_score,
+                    application_type=cs.application_type,
+                )
+            )
+        else:
+            assert self.monthly_rate_sampler is not None
+            cs.monthly_cost = float(self.monthly_rate_sampler(cs.offered_amount))
+
+        cs.selected = bool(self.registry.selected.predict(cs.loan_goal, cs.application_type, cs.credit_score))
+        cs.accepted = bool(self.registry.accepted.predict(cs.monthly_cost, cs.credit_score))
+
     def validate(
         self,
         sim_df: pd.DataFrame,
