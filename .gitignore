@@ -10,6 +10,7 @@ DataSet/*
 Docs/*
 .venv
 .DS_Store
+.env
 .claude
 simulated_log.xes
 benchmark_results.xlsx
