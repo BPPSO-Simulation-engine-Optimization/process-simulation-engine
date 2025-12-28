@@ -4,22 +4,33 @@ Case Manager - Tracks active case state during simulation.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 
 @dataclass
 class CaseState:
     """
     State of an active case during simulation.
-    
+
     Tracks case attributes and activity history.
     """
     case_id: str
     case_type: str  # LoanGoal: "Home improvement", "Car", etc.
     application_type: str  # "New credit", "Limit raise"
     requested_amount: float
-    # hier auch noch die offer lvl attributes? wie gehen wir damit um, dass es pro case pot. mehrere offers gibt?
-    
+
+    # Offer-level attributes (populated when O_Create Offer occurs)
+    credit_score: Optional[float] = None
+    offered_amount: Optional[float] = None
+    first_withdrawal_amount: Optional[float] = None
+    number_of_terms: Optional[int] = None
+    monthly_cost: Optional[float] = None
+    selected: Optional[bool] = None
+    accepted: Optional[bool] = None
+
+    # Reference to attribute engine's case state for lazy evaluation
+    _attr_engine_case: Any = field(default=None, repr=False)
+
     # Runtime state
     activity_history: List[str] = field(default_factory=list)
     current_activity: Optional[str] = None
@@ -35,11 +46,27 @@ class CaseState:
     
     def get_payload(self) -> Dict:
         """Get case attributes for event payload."""
-        return {
+        payload = {
             'case:LoanGoal': self.case_type,
             'case:ApplicationType': self.application_type,
             'case:RequestedAmount': self.requested_amount,
         }
+        # Add offer-level attributes if they've been generated
+        if self.credit_score is not None:
+            payload['CreditScore'] = self.credit_score
+        if self.offered_amount is not None:
+            payload['OfferedAmount'] = self.offered_amount
+        if self.first_withdrawal_amount is not None:
+            payload['FirstWithdrawalAmount'] = self.first_withdrawal_amount
+        if self.number_of_terms is not None:
+            payload['NumberOfTerms'] = self.number_of_terms
+        if self.monthly_cost is not None:
+            payload['MonthlyCost'] = self.monthly_cost
+        if self.selected is not None:
+            payload['Selected'] = self.selected
+        if self.accepted is not None:
+            payload['Accepted'] = self.accepted
+        return payload
 
 
 class CaseManager:
