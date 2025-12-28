@@ -14,3 +14,6 @@ Docs/*
 .claude
 simulated_log.xes
 benchmark_results.xlsx
+models/*.joblib
+models/*.keras
+__pycache__/
