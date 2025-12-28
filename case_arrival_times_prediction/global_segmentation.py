@@ -38,7 +38,10 @@ class SegmentFeatureExtractor:
             p25_ia = 0.0
             p75_ia = 0.0
         else:
-            arr = np.sort(np.array(arrivals, dtype="datetime64[ns]"))
+            timestamps = pd.to_datetime(arrivals)
+            if timestamps.tz is not None:
+                timestamps = timestamps.tz_localize(None)
+            arr = np.sort(np.array(timestamps, dtype="datetime64[ns]"))
             diffs = np.diff(arr).astype("timedelta64[s]").astype(float) / 3600.0  # hours
             std_ia = np.std(diffs)
             p25_ia, p75_ia = np.percentile(diffs, [25, 75])

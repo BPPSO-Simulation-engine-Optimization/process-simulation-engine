@@ -81,7 +81,10 @@ def interarrival_statistics_from_timestamps(timestamps: List[pd.Timestamp], unit
     Berechnet Interarrival-Statistiken aus einer flachen Timestamp-Liste.
     unit: "seconds" (default) oder "hours".
     """
-    ts = sorted(pd.to_datetime(timestamps))
+    ts_series = pd.to_datetime(timestamps)
+    if ts_series.tz is not None:
+        ts_series = ts_series.tz_localize(None)
+    ts = sorted(ts_series)
     if len(ts) < 2:
         return InterarrivalStats(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 

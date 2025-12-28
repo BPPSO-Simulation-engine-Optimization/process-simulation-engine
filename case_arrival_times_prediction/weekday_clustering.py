@@ -23,7 +23,10 @@ def compute_statistics_for_days(days: List[DayArrivals]) -> np.ndarray | None:
         p25_ia = 0.0
         p75_ia = 0.0
     else:
-        arr = np.sort(np.array(timestamps, dtype="datetime64[ns]"))
+        ts_series = pd.to_datetime(timestamps)
+        if ts_series.tz is not None:
+            ts_series = ts_series.tz_localize(None)
+        arr = np.sort(np.array(ts_series, dtype="datetime64[ns]"))
         diffs = np.diff(arr).astype("timedelta64[s]").astype(float) / 3600.0
         std_ia = np.std(diffs)
         p25_ia, p75_ia = np.percentile(diffs, [25, 75])

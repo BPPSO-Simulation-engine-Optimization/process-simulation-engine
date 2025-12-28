@@ -55,7 +55,10 @@ def interarrival_stats_intraday_only(D_sim: DailySequence, unit: str = "seconds"
     for day in D_sim:
         if len(day) < 2:
             continue
-        arr = np.array(sorted(pd.to_datetime(day)), dtype="datetime64[ns]")
+        timestamps = pd.to_datetime(day)
+        if timestamps.tz is not None:
+            timestamps = timestamps.tz_localize(None)
+        arr = np.array(sorted(timestamps), dtype="datetime64[ns]")
         d = np.diff(arr).astype("timedelta64[ns]").astype(float) / 1e9  # Sekunden (float)
         d = d[d > 0]
         diffs.extend(d.tolist())

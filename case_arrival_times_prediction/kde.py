@@ -65,7 +65,10 @@ class InterarrivalKDETrainer:
                         if len(ts_day) < 2:
                             continue
 
-                        arr_day = np.array(ts_day, dtype="datetime64[ns]")
+                        ts_series = pd.to_datetime(ts_day)
+                        if ts_series.tz is not None:
+                            ts_series = ts_series.tz_localize(None)
+                        arr_day = np.array(ts_series, dtype="datetime64[ns]")
                         diffs_day = np.diff(arr_day).astype("timedelta64[s]").astype(float)
                         diffs_day = diffs_day[diffs_day > 0]
 
