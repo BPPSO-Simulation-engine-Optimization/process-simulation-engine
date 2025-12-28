@@ -83,7 +83,7 @@ class ProcessingTimePredictionClass:
         
         for col in boolean_cols:
             if col in df.columns:
-                df[col] = df[col].fillna(0).astype(int)
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
                 if col not in numerical_cols:
                     numerical_cols.append(col)
         
@@ -173,9 +173,10 @@ class ProcessingTimePredictionClass:
                 raise FileNotFoundError(f"ML model files not found at {filepath}")
             
             self.ml_model = joblib.load(model_path)
+            self.ml_model.verbose = 0  # Suppress parallel processing output
             self.label_encoders = joblib.load(encoders_path)
             self.scaler = joblib.load(scaler_path)
-            
+
             self.feature_names = metadata['feature_names']
             self.categorical_features = metadata['categorical_features']
             self.numerical_features = metadata['numerical_features']

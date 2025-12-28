@@ -44,7 +44,7 @@ def train_and_save(bpmn_path, log_path, output_path):
 
 if __name__ == "__main__":
     bpmn_path = "../process_model/LoanApplicationProcess.bpmn"
-    log_path = "../Dataset/BPI Challenge 2017.xes"
+    log_path = "../eventlog/eventlog.xes.gz"
     output_path = "../models/branch_predictor.joblib"
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)))

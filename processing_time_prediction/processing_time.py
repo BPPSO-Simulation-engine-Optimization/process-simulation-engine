@@ -1,9 +1,9 @@
 import pandas as pd
 import pm4py
-from ProcessingTimeTrainer import ProcessingTimeTrainer
-from ProcessingTimePredictionClass import ProcessingTimePredictionClass
+from processing_time_prediction.ProcessingTimeTrainer import ProcessingTimeTrainer
+from processing_time_prediction.ProcessingTimePredictionClass import ProcessingTimePredictionClass
 
-log = pm4py.read_xes("Dataset/BPI Challenge 2017.xes")
+log = pm4py.read_xes("eventlog/eventlog.xes.gz")
 df = pm4py.convert_to_dataframe(log)
 
 print("Training model...")
