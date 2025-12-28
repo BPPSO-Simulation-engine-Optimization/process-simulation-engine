@@ -1,28 +1,31 @@
+"""
+Test the branch predictor - demonstrates loading a pre-trained model.
+"""
 import os
+import random
+import joblib
+from pathlib import Path
+
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from bpmn_parser import BPMNParser
 from log_analyzer import LogAnalyzer
-import random
 
 
-class TestPredictor:
+class BranchPredictor:
     def __init__(self):
         self.probabilities = {}
         self.gateway_branches = {}
         self.gateway_connections = {}
 
-    def fit(self, bpmn_path, log_path):
-        parser = BPMNParser(bpmn_path)
-        self.gateway_connections = parser.get_gateway_connections()
-        self.gateway_branches = {
-            gw_id: conn['branches']
-            for gw_id, conn in self.gateway_connections.items()
-        }
-        analyzer = LogAnalyzer(log_path)
-        counts = analyzer.count_transitions(self.gateway_connections)
-        self.probabilities = analyzer.calculate_probabilities(counts)
-        return self
+    @classmethod
+    def load(cls, path):
+        data = joblib.load(path)
+        predictor = cls()
+        predictor.probabilities = data['probabilities']
+        predictor.gateway_branches = data['gateway_branches']
+        predictor.gateway_connections = data['gateway_connections']
+        return predictor
 
     def predict(self, gateway_id, preceding_activity):
         key = (gateway_id, preceding_activity)
@@ -38,14 +41,18 @@ class TestPredictor:
 
 
 def main():
-    bpmn_path = "../process_model/LoanApplicationProcess.bpmn"
+    model_path = Path("../models/branch_predictor.joblib")
     log_path = "../Dataset/BPI Challenge 2017.xes"
 
-    print("Training predictor...")
-    predictor = TestPredictor()
-    predictor.fit(bpmn_path, log_path)
+    if not model_path.exists():
+        print(f"Model not found at {model_path}")
+        print("Run train.py first to train and save the model.")
+        return
+
+    print("Loading pre-trained model...")
+    predictor = BranchPredictor.load(model_path)
     
-    print(f"Learned {len(predictor.probabilities)} decision points")
+    print(f"Loaded {len(predictor.probabilities)} decision points")
     print(f"Found {len(predictor.gateway_branches)} gateways")
 
     print("\nLoading log for testing...")
@@ -101,4 +108,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

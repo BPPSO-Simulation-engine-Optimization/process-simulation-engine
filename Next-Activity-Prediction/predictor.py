@@ -1,4 +1,6 @@
 import random
+import joblib
+from pathlib import Path
 from .bpmn_parser import BPMNParser
 from .log_analyzer import LogAnalyzer
 
@@ -22,6 +24,25 @@ class BranchPredictor:
         self.probabilities = analyzer.calculate_probabilities(counts)
         return self
 
+    def save(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            'probabilities': self.probabilities,
+            'gateway_branches': self.gateway_branches,
+            'gateway_connections': self.gateway_connections
+        }
+        joblib.dump(data, path)
+
+    @classmethod
+    def load(cls, path):
+        data = joblib.load(path)
+        predictor = cls()
+        predictor.probabilities = data['probabilities']
+        predictor.gateway_branches = data['gateway_branches']
+        predictor.gateway_connections = data['gateway_connections']
+        return predictor
+
     def predict(self, gateway_id, preceding_activity):
         key = (gateway_id, preceding_activity)
         probs = self.probabilities.get(key)
@@ -39,4 +60,3 @@ class BranchPredictor:
     def get_probabilities(self, gateway_id, preceding_activity):
         key = (gateway_id, preceding_activity)
         return self.probabilities.get(key, {})
-

@@ -1,3 +1,6 @@
 Dataset/*
 Docs/*
 .venv
+models/*.joblib
+models/*.keras
+__pycache__/
