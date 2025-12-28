@@ -14,16 +14,16 @@ class ResourceAvailabilityModel:
     Basic model for resource availabilities based on interval patterns.
     
     Simulates resource availability using:
-    - 2-week (14-day) cyclic pattern
+    - 1-week (7-day) cyclic pattern
     - Configurable working hours (default: 8:00-17:00)
-    - Configurable working days in the 2-week cycle
+    - Configurable working days in the week (Mon-Sun = 0-6)
     - Dutch public holidays awareness
     """
 
     def __init__(
         self,
         event_log_df: pd.DataFrame,
-        interval_days: int = 14,
+        interval_days: int = 7,
         workday_start_hour: int = 8,
         workday_end_hour: int = 17,
         working_cycle_days: Optional[Set[int]] = None,
@@ -33,20 +33,20 @@ class ResourceAvailabilityModel:
         
         Args:
             event_log_df: Event log as DataFrame with 'org:resource' and 'time:timestamp'
-            interval_days: Length of the work cycle (default: 14 days)
+            interval_days: Length of the work cycle (default: 7 days = 1 week)
             workday_start_hour: Start of working hours (default: 8)
             workday_end_hour: End of working hours (default: 17)
             working_cycle_days: Set of working days in the cycle (0-indexed)
-                               Default: Mon-Fri both weeks (0-4, 7-11 in 14-day cycle)
+                               Default: Mon-Fri (0-4 in 7-day cycle, where 0=Monday, 6=Sunday)
         """
         self.event_log_df = event_log_df.copy()
         self.interval_days = interval_days
         self.workday_start_hour = workday_start_hour
         self.workday_end_hour = workday_end_hour
 
-        # Default: Mon-Fri in both weeks of 2-week cycle
+        # Default: Mon-Fri in weekly cycle (0=Monday, 4=Friday)
         if working_cycle_days is None:
-            working_cycle_days = {0, 1, 2, 3, 4, 7, 8, 9, 10, 11}
+            working_cycle_days = {0, 1, 2, 3, 4}
         self.working_cycle_days = working_cycle_days
 
         # Ensure timestamps are datetime

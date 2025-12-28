@@ -11,3 +11,5 @@ Docs/*
 .venv
 .DS_Store
 .claude
+simulated_log.xes
+benchmark_results.xlsx
