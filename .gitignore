@@ -9,6 +9,7 @@ data/
 DataSet/*
 Docs/*
 .venv
+venv/
 .DS_Store
 .env
 .claude
