@@ -5,14 +5,35 @@ The main simulation loop that orchestrates:
 1. Event Queue (time-ordered processing)
 2. Predictors (next activity, processing time, case arrivals)
 3. Resource Allocator (who performs the activity)
-4. Event Logging (for CSV/XES export)
+4. Resource Pool (dynamic busy tracking + waiting queues)
+5. Event Logging (for CSV/XES export)
+
+Resource Allocation Model:
+- When an activity needs a resource, we check:
+  1. Eligibility (permission model - who CAN do this activity)
+  2. Availability (working hours - who is ON DUTY at this time)
+  3. Busy state (dynamic - who is NOT currently working on another activity)
+
+- If no resource is available:
+  - Work is added to a per-activity waiting queue (FIFO)
+  - NO fallback to User_1 or other default resource
+
+- When an activity completes:
+  - The resource is released
+  - The waiting queue is checked for work this resource can handle
+  - Waiting work is dispatched to the freed resource
+
+This creates realistic resource contention and waiting times.
 """
 
 import uuid
 import random
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Protocol
+from typing import List, Dict, Optional, Protocol, Set
+from collections import defaultdict
+import heapq
 
 import pandas as pd
 
@@ -22,6 +43,123 @@ from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WaitingWork:
+    """Represents work waiting for a resource."""
+    case_id: str
+    activity: str
+    arrival_time: datetime  # When the work arrived (for FIFO ordering)
+    case_state: CaseState
+
+    def __lt__(self, other):
+        """For heap ordering - earlier arrival time = higher priority."""
+        return self.arrival_time < other.arrival_time
+
+
+class ResourcePool:
+    """
+    Tracks resource busy state during simulation.
+
+    Manages:
+    - Which resources are currently busy
+    - When resources will become free
+    - Queue of work waiting for resources
+    """
+
+    def __init__(self, availability_model=None):
+        """
+        Initialize the resource pool.
+
+        Args:
+            availability_model: The availability model for checking working hours.
+        """
+        # resource_id -> (busy_until, case_id, activity)
+        self._busy_resources: Dict[str, tuple] = {}
+
+        # activity -> list of WaitingWork (heap ordered by arrival time)
+        self._waiting_queues: Dict[str, List[WaitingWork]] = defaultdict(list)
+
+        # Reference to availability model for working hours checks
+        self._availability = availability_model
+
+        # Stats
+        self.stats = {
+            'total_waits': 0,
+            'max_queue_length': 0,
+            'total_wait_time_seconds': 0,
+        }
+
+    def is_busy(self, resource_id: str, current_time: datetime) -> bool:
+        """Check if a resource is currently busy."""
+        if resource_id not in self._busy_resources:
+            return False
+        busy_until, _, _ = self._busy_resources[resource_id]
+        if current_time >= busy_until:
+            # Resource has finished, clean up
+            del self._busy_resources[resource_id]
+            return False
+        return True
+
+    def mark_busy(self, resource_id: str, until: datetime,
+                  case_id: str, activity: str) -> None:
+        """Mark a resource as busy until a given time."""
+        self._busy_resources[resource_id] = (until, case_id, activity)
+
+    def release(self, resource_id: str) -> None:
+        """Release a resource (mark as free)."""
+        if resource_id in self._busy_resources:
+            del self._busy_resources[resource_id]
+
+    def get_busy_until(self, resource_id: str) -> Optional[datetime]:
+        """Get the time when a resource will become free."""
+        if resource_id in self._busy_resources:
+            return self._busy_resources[resource_id][0]
+        return None
+
+    def add_to_waiting_queue(self, work: WaitingWork) -> None:
+        """Add work to the waiting queue for its activity."""
+        heapq.heappush(self._waiting_queues[work.activity], work)
+        self.stats['total_waits'] += 1
+        queue_len = len(self._waiting_queues[work.activity])
+        if queue_len > self.stats['max_queue_length']:
+            self.stats['max_queue_length'] = queue_len
+
+    def get_waiting_work(self, activity: str) -> Optional[WaitingWork]:
+        """Get the next waiting work for an activity (FIFO)."""
+        if activity in self._waiting_queues and self._waiting_queues[activity]:
+            return heapq.heappop(self._waiting_queues[activity])
+        return None
+
+    def has_waiting_work(self, activity: str = None) -> bool:
+        """Check if there's waiting work (optionally for a specific activity)."""
+        if activity:
+            return bool(self._waiting_queues.get(activity))
+        return any(q for q in self._waiting_queues.values())
+
+    def get_all_waiting_activities(self) -> Set[str]:
+        """Get all activities that have waiting work."""
+        return {act for act, q in self._waiting_queues.items() if q}
+
+    def peek_waiting_work(self, activity: str) -> Optional[WaitingWork]:
+        """Peek at the next waiting work without removing it."""
+        if activity in self._waiting_queues and self._waiting_queues[activity]:
+            return self._waiting_queues[activity][0]
+        return None
+
+    def get_available_resources(self, resources: List[str],
+                                 current_time: datetime) -> List[str]:
+        """Filter resources to only those not currently busy."""
+        return [r for r in resources if not self.is_busy(r, current_time)]
+
+    def get_total_waiting_count(self) -> int:
+        """Get total number of cases waiting across all activities."""
+        return sum(len(q) for q in self._waiting_queues.values())
+
+    def get_waiting_summary(self) -> Dict[str, int]:
+        """Get summary of waiting work per activity."""
+        return {act: len(q) for act, q in self._waiting_queues.items() if q}
 
 
 # Protocol definitions for pluggable predictors
@@ -165,16 +303,24 @@ class DESEngine:
                 "Use AttributeSimulationEngine from case_attribute_prediction.simulator"
             )
         self._case_attribute = case_attribute_predictor
-        
+
+        # Resource pool for dynamic busy tracking and waiting queue
+        self.resource_pool = ResourcePool(
+            availability_model=resource_allocator.availability if resource_allocator else None
+        )
+
         # Output: collected events for export
         self.completed_events: List[Dict] = []
-        
+
         # Statistics
         self.stats = {
             'cases_started': 0,
             'cases_completed': 0,
             'events_processed': 0,
-            'allocation_failures': 0,
+            'no_eligible_failures': 0,  # Permission model gaps (actual problem)
+            'outside_hours_count': 0,   # Expected - resources not working at this time
+            'waiting_events': 0,  # Cases that had to wait for resources
+            'wait_time_total_seconds': 0,  # Total time spent waiting
         }
     
     def _create_next_activity_predictor(self):
@@ -206,31 +352,63 @@ class DESEngine:
             List of event dictionaries for export.
         """
         logger.info(f"Starting simulation: {num_cases} cases")
-        
+
         # Reset state
         self.completed_events.clear()
         self.queue.clear()
         self.case_manager.clear()
-        
+        self.resource_pool = ResourcePool(
+            availability_model=self.allocator.availability if self.allocator else None
+        )
+        self.stats = {
+            'cases_started': 0,
+            'cases_completed': 0,
+            'events_processed': 0,
+            'no_eligible_failures': 0,
+            'outside_hours_count': 0,
+            'waiting_events': 0,
+            'wait_time_total_seconds': 0,
+        }
+
         # Schedule initial case arrivals
         self._schedule_case_arrivals(num_cases)
         
         # Main simulation loop
         while not self.queue.is_empty():
             event = self.queue.pop()
-            
+
             if max_time and event.timestamp > max_time:
                 logger.info(f"Reached max_time: {max_time}")
                 break
-            
+
             self.clock.advance_to(event.timestamp)
             self._handle_event(event)
-        
+
+        # Drain phase: process remaining waiting work by advancing time
+        if self.resource_pool.has_waiting_work():
+            logger.info("Starting drain phase for waiting work...")
+            self._drain_waiting_queues(max_time=max_time)
+
+        # Check for stuck cases
+        pending_count = self.resource_pool.get_total_waiting_count()
+        if pending_count > 0:
+            pending_summary = self.resource_pool.get_waiting_summary()
+            logger.warning(
+                f"Simulation ended with {pending_count} cases still waiting for resources! "
+                f"Breakdown: {pending_summary}"
+            )
+            self.stats['stuck_cases'] = pending_count
+            self.stats['stuck_cases_by_activity'] = pending_summary
+
         logger.info(
             f"Simulation complete: {self.stats['cases_completed']} cases, "
-            f"{len(self.completed_events)} events"
+            f"{len(self.completed_events)} events, "
+            f"{self.stats['waiting_events']} waits, "
+            f"{self.stats['outside_hours_count']} outside hours, "
+            f"{self.stats['no_eligible_failures']} no eligible"
+            + (f", {pending_count} stuck" if pending_count > 0 else "")
         )
-        
+
         return self.completed_events
     
     def _schedule_case_arrivals(self, num_cases: int) -> None:
@@ -283,13 +461,13 @@ class DESEngine:
     def _handle_event(self, event: SimulationEvent) -> None:
         """Route event to appropriate handler."""
         self.stats['events_processed'] += 1
-        
+
         handlers = {
             EventType.CASE_ARRIVAL: self._on_case_arrival,
             EventType.ACTIVITY_COMPLETE: self._on_activity_complete,
             EventType.CASE_END: self._on_case_end,
         }
-        
+
         handler = handlers.get(event.event_type)
         if handler:
             handler(event)
@@ -329,11 +507,17 @@ class DESEngine:
         self._schedule_activity(event.case_id, activity, event.timestamp, case)
     
     def _on_activity_complete(self, event: SimulationEvent) -> None:
-        """Handle activity completion: log event, predict next activity."""
+        """Handle activity completion: log event, release resource, process waiting queue."""
         case = self.case_manager.get_case(event.case_id)
         if not case:
             logger.warning(f"Case not found: {event.case_id}")
             return
+
+        # Release the resource that completed this activity
+        if event.resource:
+            self.resource_pool.release(event.resource)
+            # Try to dispatch waiting work now that this resource is free
+            self._process_waiting_queue(event.resource, event.timestamp)
 
         # Generate offer-dependent attributes when O_Create Offer completes
         if event.activity == "O_Create Offer" and case._attr_engine_case is not None:
@@ -365,35 +549,148 @@ class DESEngine:
             self._schedule_case_end(event.case_id, event.timestamp)
         else:
             self._schedule_activity(event.case_id, next_activity, event.timestamp, case)
+
+    def _process_waiting_queue(self, freed_resource: str, current_time: datetime) -> None:
+        """
+        Process waiting queue when a resource becomes free.
+
+        Tries to dispatch waiting work to the freed resource if it's eligible.
+        """
+        # Check which activities have waiting work
+        waiting_activities = self.resource_pool.get_all_waiting_activities()
+        if not waiting_activities:
+            return
+
+        # Check which activities this resource is eligible for
+        for activity in waiting_activities:
+            # Check if freed resource is eligible for this activity
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    activity, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(activity)
+
+            if freed_resource not in eligible:
+                continue
+
+            # Check if resource is available (working hours)
+            if not self.allocator.availability.is_available(freed_resource, current_time):
+                continue
+
+            # Found matching work - dispatch it
+            waiting_work = self.resource_pool.get_waiting_work(activity)
+            if waiting_work:
+                # Calculate wait time for stats
+                wait_seconds = (current_time - waiting_work.arrival_time).total_seconds()
+                self.stats['wait_time_total_seconds'] += wait_seconds
+
+                logger.debug(
+                    f"Dispatching waiting {activity} for case {waiting_work.case_id} "
+                    f"to {freed_resource} (waited {wait_seconds:.0f}s)"
+                )
+
+                # Schedule the activity with the freed resource
+                self._schedule_activity_with_resource(
+                    waiting_work.case_id,
+                    waiting_work.activity,
+                    current_time,
+                    waiting_work.case_state,
+                    freed_resource,
+                )
+                # Resource is now busy again, stop looking
+                return
     
     def _on_case_end(self, event: SimulationEvent) -> None:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1
         self.case_manager.remove_case(event.case_id)
     
-    def _schedule_activity(self, case_id: str, activity: str, 
+    def _schedule_activity(self, case_id: str, activity: str,
                            current_time: datetime, case: CaseState) -> None:
-        """Allocate resource and schedule activity completion."""
-        # Allocate resource
-        resource = self.allocator.allocate(
-            activity=activity,
-            timestamp=current_time,
-            case_type=case.case_type,
-        )
-        
+        """Allocate resource and schedule activity completion, or queue if unavailable."""
+        # Try to allocate a resource (with dynamic busy checking)
+        resource, failure_reason = self._try_allocate_resource_with_reason(activity, current_time, case)
+
         if resource is None:
-            self.stats['allocation_failures'] += 1
-            # Fallback: use generic resource
-            resource = "User_1"
-            logger.debug(f"Allocation failed for {activity}, using fallback")
-        
-        # Predict processing time
-        # ProcessingTimePredictionClass uses (prev_activity, prev_lifecycle, curr_activity, curr_lifecycle)
-        # TODO: Currently all lifecycles are hardcoded to "complete" (MVP decision).
-        #       Extend to support start/schedule lifecycles for more accurate timing.
+            # No resource available - add to waiting queue
+            self.stats['waiting_events'] += 1
+            waiting_work = WaitingWork(
+                case_id=case_id,
+                activity=activity,
+                arrival_time=current_time,
+                case_state=case,
+            )
+            self.resource_pool.add_to_waiting_queue(waiting_work)
+
+            # Log the reason for waiting
+            if failure_reason == 'no_eligible':
+                logger.warning(
+                    f"No eligible resources for activity '{activity}' - case {case_id} may be stuck. "
+                    f"Check permission model configuration."
+                )
+            else:
+                logger.debug(
+                    f"No resource for {activity} at {current_time} ({failure_reason}), "
+                    f"queued case {case_id}"
+                )
+            return
+
+        # Resource allocated - schedule the activity
+        self._schedule_activity_with_resource(
+            case_id, activity, current_time, case, resource
+        )
+
+    def _try_allocate_resource_with_reason(self, activity: str, timestamp: datetime,
+                                            case: CaseState) -> tuple:
+        """
+        Try to allocate a resource, returning (resource, failure_reason).
+
+        failure_reason is one of: None (success), 'no_eligible', 'outside_hours', 'all_busy'
+        """
+        # Get eligible resources from permission model
+        try:
+            eligible_resources = self.allocator.permissions.get_eligible_resources(
+                activity, timestamp=timestamp, case_type=case.case_type
+            )
+        except TypeError:
+            eligible_resources = self.allocator.permissions.get_eligible_resources(activity)
+
+        if not eligible_resources:
+            self.stats['no_eligible_failures'] += 1
+            return None, 'no_eligible'
+
+        # Filter by availability model (working hours, holidays, etc.)
+        available_by_hours = [
+            res for res in eligible_resources
+            if self.allocator.availability.is_available(res, timestamp)
+        ]
+
+        if not available_by_hours:
+            # No one working at this time (expected behavior)
+            self.stats['outside_hours_count'] += 1
+            return None, 'outside_hours'
+
+        # Filter by dynamic busy state
+        truly_available = self.resource_pool.get_available_resources(
+            available_by_hours, timestamp
+        )
+
+        if not truly_available:
+            # Everyone qualified is busy
+            return None, 'all_busy'
+
+        # Select randomly from truly available resources
+        import random
+        return random.choice(truly_available), None
+
+    def _schedule_activity_with_resource(self, case_id: str, activity: str,
+                                          current_time: datetime, case: CaseState,
+                                          resource: str) -> None:
+        """Schedule activity completion with an allocated resource."""
         prev_activity = case.activity_history[-1] if case.activity_history else "START"
 
-        # Build context from simulation state (P0-1 fix: pass context to processing time predictor)
+        # Build context for processing time prediction
         context = {
             # Temporal features (from simulation clock, not wall clock)
             'hour': current_time.hour,
@@ -411,7 +708,7 @@ class DESEngine:
 
             # Resource info (current allocation)
             'resource_1': case.current_resource or 'unknown',
-            'resource_2': resource,  # The resource being allocated for this activity
+            'resource_2': resource,
 
             # Offer-level attributes (available after O_Create Offer)
             'Accepted': case.accepted,
@@ -427,7 +724,10 @@ class DESEngine:
         )
         processing_time = timedelta(seconds=processing_seconds)
         completion_time = current_time + processing_time
-        
+
+        # Mark resource as busy until completion
+        self.resource_pool.mark_busy(resource, completion_time, case_id, activity)
+
         # Schedule completion event
         event = SimulationEvent(
             timestamp=completion_time,
@@ -447,6 +747,147 @@ class DESEngine:
             case_id=case_id,
         )
         self.queue.schedule(event)
+
+    def _get_next_business_hour(self, current_time: datetime) -> datetime:
+        """
+        Find the next business hour from the given time.
+
+        Uses the availability model's working hours configuration.
+        Handles weekends (can advance up to 72h from Friday evening to Monday morning).
+
+        Returns:
+            Next datetime when business hours start.
+        """
+        # Get working hours from availability model (defaults: 8-17)
+        avail = self.allocator.availability
+        start_hour = getattr(avail, 'workday_start_hour', 8)
+        end_hour = getattr(avail, 'workday_end_hour', 17)
+
+        # Check if we're already within business hours on a weekday
+        weekday = current_time.weekday()
+        hour = current_time.hour
+
+        # Working days (Mon-Fri = 0-4)
+        if weekday < 5 and start_hour <= hour < end_hour:
+            # Already in business hours
+            return current_time
+
+        # Need to find next business hour
+        next_time = current_time
+
+        # If after end_hour or not a working day, move to next day's start
+        if weekday >= 5 or hour >= end_hour:
+            # Move to next day at start_hour
+            next_time = (current_time + timedelta(days=1)).replace(
+                hour=start_hour, minute=0, second=0, microsecond=0
+            )
+        elif hour < start_hour:
+            # Before start_hour on a weekday - just advance to start_hour
+            next_time = current_time.replace(
+                hour=start_hour, minute=0, second=0, microsecond=0
+            )
+
+        # Skip weekends
+        while next_time.weekday() >= 5:
+            next_time += timedelta(days=1)
+
+        return next_time
+
+    def _drain_waiting_queues(self, max_time: datetime = None) -> None:
+        """
+        Drain phase: process remaining waiting work by advancing time.
+
+        Iteratively advances simulation time to next business hour and
+        attempts to dispatch waiting work. Continues until queues are
+        empty or no progress is made (truly stuck cases).
+
+        Args:
+            max_time: Optional maximum time to advance to.
+        """
+        max_iterations = 100  # Safety limit (100 * potential 72h = weeks of simulation time)
+        iterations_without_progress = 0
+        max_no_progress = 3  # Stop if 3 time advances produce no dispatches
+
+        initial_waiting = self.resource_pool.get_total_waiting_count()
+        logger.info(f"Drain phase starting with {initial_waiting} waiting cases")
+
+        while self.resource_pool.has_waiting_work() and iterations_without_progress < max_no_progress:
+            current_time = self.clock.now
+            dispatched_this_round = 0
+
+            # Get all waiting activities
+            waiting_activities = self.resource_pool.get_all_waiting_activities()
+
+            # Try to dispatch each waiting activity
+            for activity in list(waiting_activities):
+                while self.resource_pool.has_waiting_work(activity):
+                    # Try to allocate a resource
+                    waiting_work = self.resource_pool.peek_waiting_work(activity)
+                    if not waiting_work:
+                        break
+
+                    resource, failure_reason = self._try_allocate_resource_with_reason(
+                        activity, current_time, waiting_work.case_state
+                    )
+
+                    if resource:
+                        # Got a resource - dispatch the work
+                        work = self.resource_pool.get_waiting_work(activity)
+                        wait_seconds = (current_time - work.arrival_time).total_seconds()
+                        self.stats['wait_time_total_seconds'] += wait_seconds
+
+                        logger.debug(
+                            f"[Drain] Dispatching {activity} for case {work.case_id} "
+                            f"to {resource} (waited {wait_seconds:.0f}s)"
+                        )
+
+                        self._schedule_activity_with_resource(
+                            work.case_id, work.activity, current_time,
+                            work.case_state, resource
+                        )
+                        dispatched_this_round += 1
+                    else:
+                        # No resource available for this activity right now
+                        break
+
+            # Process any completion events that are now schedulable
+            while not self.queue.is_empty():
+                event = self.queue.pop()
+                if max_time and event.timestamp > max_time:
+                    logger.info(f"Drain phase reached max_time: {max_time}")
+                    return
+                self.clock.advance_to(event.timestamp)
+                self._handle_event(event)
+
+            if dispatched_this_round > 0:
+                iterations_without_progress = 0
+                logger.debug(f"[Drain] Dispatched {dispatched_this_round} cases this round")
+            else:
+                # No progress - advance time to next business hour
+                current_time = self.clock.now
+                next_business_hour = self._get_next_business_hour(
+                    current_time + timedelta(minutes=1)  # Advance at least 1 minute
+                )
+
+                if max_time and next_business_hour > max_time:
+                    logger.info(f"Drain phase would exceed max_time, stopping")
+                    return
+
+                time_jump = next_business_hour - current_time
+                logger.info(
+                    f"[Drain] No resources available, advancing {time_jump} to {next_business_hour}"
+                )
+                self.clock.advance_to(next_business_hour)
+                iterations_without_progress += 1
+
+            max_iterations -= 1
+            if max_iterations <= 0:
+                logger.warning("Drain phase hit iteration limit, stopping")
+                break
+
+        final_waiting = self.resource_pool.get_total_waiting_count()
+        drained = initial_waiting - final_waiting
+        logger.info(f"Drain phase complete: {drained} cases dispatched, {final_waiting} remaining")
 
 
 # Stub predictors for testing/fallback

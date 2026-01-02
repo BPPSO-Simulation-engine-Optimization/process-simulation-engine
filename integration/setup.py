@@ -9,6 +9,7 @@ import random
 import logging
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Any
+import os
 import pandas as pd
 
 from .config import SimulationConfig
@@ -91,8 +92,14 @@ def _setup_arrivals(
             )
 
             # Determine whether to retrain or load cached model
-            model_path = "case_arrival_model.pkl"
-            retrain_model = df is not None
+            model_path = "models/case_arrival_model.pkl"
+            
+            # Use cached model if it exists, otherwise retrain if data is available
+            if os.path.exists(model_path):
+                logger.info(f"Found existing case arrival model at {model_path}, using cached version.")
+                retrain_model = False
+            else:
+                retrain_model = df is not None
 
             # The run() API generates by DAYS, not by case count.
             # BPIC17 event log statistics (analyzed from eventlog.xes.gz):
@@ -113,6 +120,7 @@ def _setup_arrivals(
                     model_path=model_path,
                     n_days_to_simulate=estimated_days,
                     config=arr_config,
+                    start_date=start_date,
                 )
 
                 # Convert to datetime objects

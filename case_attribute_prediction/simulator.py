@@ -13,7 +13,8 @@ from .registry import (
     registry_models_to_dict,
     load_models_into_registry,
 )
-from .utils import resolve_col
+from .utils import resolve_col, to_case_level
+from .metrics import ks_statistic_1d, wasserstein_approx_1d
 
 
 def _compute_case_sampler_artifact(
@@ -509,6 +510,140 @@ class AttributeSimulationEngine:
         cs.selected = bool(self.registry.selected.predict(cs.loan_goal, cs.application_type, cs.credit_score))
         cs.accepted = bool(self.registry.accepted.predict(cs.monthly_cost, cs.credit_score))
 
+    def _validate_requested_amount(
+        self,
+        df: pd.DataFrame,
+        sim_df: pd.DataFrame,
+        requested_col: str = "case:RequestedAmount",
+        per_group: bool = True,
+        print_results: bool = True,
+    ):
+        """
+        Validiert simulierte RequestedAmount gegen Original-Daten.
+        Gruppiert nach LoanGoal und ApplicationType.
+        """
+        o_col = resolve_col(df, requested_col)
+        s_col = resolve_col(sim_df, requested_col)
+
+        orig = to_case_level(df, ["case:LoanGoal", "case:ApplicationType", "case:concept:name", o_col]).copy()
+        sim = sim_df[["case:LoanGoal", "case:ApplicationType", s_col]].copy()
+
+        orig[o_col] = pd.to_numeric(orig[o_col], errors="coerce")
+        sim[s_col] = pd.to_numeric(sim[s_col], errors="coerce")
+        orig = orig.dropna(subset=[o_col])
+        sim = sim.dropna(subset=[s_col])
+        orig = orig[orig[o_col] > 0]
+        sim = sim[sim[s_col] > 0]
+
+        def summary(x):
+            x = np.asarray(x, dtype=float)
+            if len(x) == 0:
+                return {
+                    "n": 0,
+                    "mean": np.nan,
+                    "std": np.nan,
+                    "min": np.nan,
+                    "max": np.nan,
+                    "p5": np.nan,
+                    "p10": np.nan,
+                    "p25": np.nan,
+                    "p50": np.nan,
+                    "p75": np.nan,
+                    "p90": np.nan,
+                    "p95": np.nan,
+                }
+            return {
+                "n": int(len(x)),
+                "mean": float(np.mean(x)),
+                "std": float(np.std(x)),
+                "min": float(np.min(x)),
+                "max": float(np.max(x)),
+                "p5": float(np.quantile(x, 0.05)),
+                "p10": float(np.quantile(x, 0.10)),
+                "p25": float(np.quantile(x, 0.25)),
+                "p50": float(np.quantile(x, 0.50)),
+                "p75": float(np.quantile(x, 0.75)),
+                "p90": float(np.quantile(x, 0.90)),
+                "p95": float(np.quantile(x, 0.95)),
+            }
+
+        x_all = orig[o_col].to_numpy()
+        y_all = sim[s_col].to_numpy()
+
+        overall = {
+            **{f"orig_{k}": v for k, v in summary(x_all).items()},
+            **{f"sim_{k}": v for k, v in summary(y_all).items()},
+        }
+
+        if len(x_all) > 0 and len(y_all) > 0:
+            overall["ks"] = ks_statistic_1d(x_all, y_all)
+            overall["wasserstein"] = wasserstein_approx_1d(x_all, y_all)
+            overall["mean_diff"] = float(np.mean(y_all) - np.mean(x_all))
+            overall["mean_diff_pct"] = float((np.mean(y_all) - np.mean(x_all)) / np.mean(x_all) * 100) if np.mean(x_all) > 0 else np.nan
+            overall["median_diff"] = float(np.median(y_all) - np.median(x_all))
+        else:
+            overall["ks"] = np.nan
+            overall["wasserstein"] = np.nan
+            overall["mean_diff"] = np.nan
+            overall["mean_diff_pct"] = np.nan
+            overall["median_diff"] = np.nan
+
+        overall_df = pd.DataFrame([overall])
+
+        if not per_group:
+            return overall_df, None
+
+        rows = []
+        og = orig.groupby(["case:LoanGoal", "case:ApplicationType"])
+        sg = sim.groupby(["case:LoanGoal", "case:ApplicationType"])
+        keys = set(og.groups.keys()) | set(sg.groups.keys())
+
+        for k in keys:
+            o_vals = og.get_group(k)[o_col].to_numpy() if k in og.groups else np.array([])
+            s_vals = sg.get_group(k)[s_col].to_numpy() if k in sg.groups else np.array([])
+
+            if len(o_vals) == 0 or len(s_vals) == 0:
+                continue
+
+            row = {
+                "case:LoanGoal": k[0],
+                "case:ApplicationType": k[1],
+                **{f"orig_{k}": v for k, v in summary(o_vals).items()},
+                **{f"sim_{k}": v for k, v in summary(s_vals).items()},
+            }
+
+            if len(o_vals) > 0 and len(s_vals) > 0:
+                row["ks"] = ks_statistic_1d(o_vals, s_vals)
+                row["wasserstein"] = wasserstein_approx_1d(o_vals, s_vals)
+                row["mean_diff"] = float(np.mean(s_vals) - np.mean(o_vals))
+                row["mean_diff_pct"] = float((np.mean(s_vals) - np.mean(o_vals)) / np.mean(o_vals) * 100) if np.mean(o_vals) > 0 else np.nan
+            else:
+                row["ks"] = np.nan
+                row["wasserstein"] = np.nan
+                row["mean_diff"] = np.nan
+                row["mean_diff_pct"] = np.nan
+
+            rows.append(row)
+
+        per_group_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        
+        if print_results:
+            print("\n=== VALIDATION: Requested Amount ===")
+            print("\n--- Overall Statistics ---")
+            print(overall_df)
+            
+            if per_group_df is not None and len(per_group_df) > 0:
+                print("\n--- Per Group Statistics (LoanGoal, ApplicationType) ---")
+                cols_to_show = ["case:LoanGoal", "case:ApplicationType", "orig_n", "sim_n", 
+                                "orig_mean", "sim_mean", "orig_p50", "sim_p50", 
+                                "mean_diff", "mean_diff_pct", "ks", "wasserstein"]
+                available_cols = [c for c in cols_to_show if c in per_group_df.columns]
+                print(per_group_df[available_cols].head(20))
+                if len(per_group_df) > 20:
+                    print(f"... ({len(per_group_df) - 20} weitere Gruppen)")
+        
+        return overall_df, per_group_df
+
     def validate(
         self,
         sim_df: pd.DataFrame,
@@ -516,6 +651,7 @@ class AttributeSimulationEngine:
         monthly_cost: bool = False,
         credit_score: bool = False,
         offered_amount: bool = False,
+        requested_amount: bool = False,
         number_of_terms_dist = False,
         number_of_terms_mae = False,
         first_withdrawal: bool = False,
@@ -529,12 +665,17 @@ class AttributeSimulationEngine:
         results: dict[str, pd.DataFrame] = {}
 
         if number_of_terms_dist:
-            results["number_of_terms_dist"] = self.registry.number_of_terms.validate(
+            overall, per_group = self.registry.number_of_terms.validate(
                 self.df,
                 sim_df,
                 original_col="NumberOfTerms",
                 simulated_col="NumberOfTerms",
+                per_group=True,
+                print_results=True,
             )
+            results["number_of_terms_dist"] = overall
+            if per_group is not None and len(per_group) > 0:
+                results["number_of_terms_dist_per_group"] = per_group
 
         if number_of_terms_mae:
             overall, by_month, baseline, _ = (
@@ -546,18 +687,28 @@ class AttributeSimulationEngine:
             results["number_of_terms_mae_overall"] = pd.DataFrame([overall])
             results["number_of_terms_mae_by_month"] = by_month
             results["number_of_terms_mae_baseline"] = pd.DataFrame([baseline])
+            
+            print("\n=== VALIDATION: Number of Terms (MAE) ===")
+            print("\n--- MAE Overall ---")
+            print(results["number_of_terms_mae_overall"])
+            print("\n--- MAE Baseline ---")
+            print(results["number_of_terms_mae_baseline"])
 
 
         if credit_score:
-            overall, per_group = self.registry.credit_score.validate(
+            overall, per_group, bin_dist = self.registry.credit_score.validate(
                 self.df,
                 sim_df,
                 original_cs_col="CreditScore",
                 simulated_cs_col="CreditScore",
+                per_group=True,
+                print_results=True,
             )
             results["credit_score_overall"] = overall
             if per_group is not None:
                 results["credit_score_per_group"] = per_group
+            if bin_dist is not None and len(bin_dist) > 0:
+                results["credit_score_bin_distribution"] = bin_dist
 
         if offered_amount:
             results["offered_amount"] = self.registry.offered_amount.validate(
@@ -566,6 +717,7 @@ class AttributeSimulationEngine:
                 original_col="OfferedAmount",
                 simulated_col="OfferedAmount",
                 score_col="CreditScore",
+                print_results=True,
             )
 
         if first_withdrawal:
@@ -573,7 +725,7 @@ class AttributeSimulationEngine:
                 self.df,
                 sim_df,
                 col="FirstWithdrawalAmount",
-                score_col="CreditScore",
+                print_results=True,
             )
 
         if selected:
@@ -581,6 +733,7 @@ class AttributeSimulationEngine:
                 self.df,
                 sim_df,
                 col="Selected",
+                print_results=True,
             )
 
         if accepted:
@@ -588,6 +741,7 @@ class AttributeSimulationEngine:
                 self.df,
                 sim_df,
                 col="Accepted",
+                print_results=True,
             )
 
         if monthly_cost:
@@ -596,7 +750,20 @@ class AttributeSimulationEngine:
                 sim_df,
                 original_col="MonthlyCost",
                 simulated_col="MonthlyCost",
+                print_results=True,
             )
+
+        if requested_amount:
+            overall, per_group = self._validate_requested_amount(
+                self.df,
+                sim_df,
+                requested_col="case:RequestedAmount",
+                per_group=True,
+                print_results=True,
+            )
+            results["requested_amount_overall"] = overall
+            if per_group is not None and len(per_group) > 0:
+                results["requested_amount_per_group"] = per_group
 
         return results
 

@@ -88,6 +88,7 @@ class OfferedAmountPredictor(AttributePredictorBase):
         score_labels=("<600", "600-649", "650-699", "700-749", "750-999"),
         quantiles=(0.10, 0.50, 0.90),
         include_overall: bool = True,
+        print_results: bool = True,
     ) -> pd.DataFrame:
         # 1) Resolve
         o_amt = resolve_col(df, original_col)
@@ -170,10 +171,18 @@ class OfferedAmountPredictor(AttributePredictorBase):
                 **_stats_pair(o, s),
             })
 
-                # -------------------------------------------------
+        # -------------------------------------------------
         # 6) Weighted KS (sim_n * ks)
         # -------------------------------------------------
         df_out = pd.DataFrame(rows)
+        
+        if print_results:
+            print("\n=== VALIDATION: Offered Amount ===")
+            print(df_out.head(30))
+            if len(df_out) > 30:
+                print(f"... ({len(df_out) - 30} weitere Zeilen)")
+        
+        return df_out
 
         # nur echte Gruppen (kein OVERALL, keine NaNs)
         mask = (

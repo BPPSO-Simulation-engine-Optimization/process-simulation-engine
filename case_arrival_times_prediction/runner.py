@@ -87,9 +87,10 @@ def interarrival_stats_intraday_only(D_sim: DailySequence, unit: str = "seconds"
 def run(
     df: Optional[pd.DataFrame],
     retrain_model: bool,
-    model_path: str = "case_arrival_model.pkl",
+    model_path: str = "models/case_arrival_model.pkl",
     n_days_to_simulate: Optional[int] = None,
     config: Optional[SimulationConfig] = None,
+    start_date: Optional[pd.Timestamp] = None,
 ) -> List[pd.Timestamp]:
     """
     Trainiert oder lädt ein Modell und simuliert Case-Timestamps.
@@ -127,10 +128,12 @@ def run(
     if retrain_model:
         if df is None:
             raise ValueError("DataFrame df must be provided when retrain_model=True")
+        print(f"Training new CaseInterarrivalPipeline model...")
         pipe = CaseInterarrivalPipeline(cfg)
         pipe.fit(df)
 
         # Modell speichern
+        print(f"Saving model to {model_path}...")
         with open(model_path, "wb") as f:
             pickle.dump(pipe, f)
     else:
@@ -150,9 +153,9 @@ def run(
 
     # Wenn n_days_to_simulate gesetzt ist, wird diese Anzahl an Tagen simuliert.
     # Die tatsächliche Anzahl der Timestamps ergibt sich dann aus dem Modell.
-    case_timestamps = pipe.simulate_case_timestamps(N_hat=n_days_to_simulate)
+    case_timestamps = pipe.simulate_case_timestamps(N_hat=n_days_to_simulate, start_date=start_date)
 
-    D_sim = pipe.simulate_days(N_hat=n_days_to_simulate)
+    D_sim = pipe.simulate_days(N_hat=n_days_to_simulate, start_date=start_date)
     stats = interarrival_stats_intraday_only(D_sim, unit="seconds")
     print("simulierte Interarrival-Statistiken (intraday only):")
     for k in ["mean","std","q05","q25","q50","q75","q95"]:

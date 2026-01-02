@@ -42,6 +42,7 @@ class AcceptedPredictor(AttributePredictorBase):
         sim_df: pd.DataFrame,
         col: str = "Accepted",
         group_cols=("case:LoanGoal", "case:ApplicationType"),
+        print_results: bool = True,
     ) -> pd.DataFrame:
         col_o = resolve_col(df, col)
         col_s = resolve_col(sim_df, col)
@@ -75,7 +76,15 @@ class AcceptedPredictor(AttributePredictorBase):
                 "abs_diff": float(abs(o.mean() - s.mean())),
             })
 
-        return pd.DataFrame(rows).sort_values("orig_n", ascending=False).reset_index(drop=True)
+        result_df = pd.DataFrame(rows).sort_values("orig_n", ascending=False).reset_index(drop=True)
+        
+        if print_results:
+            print("\n=== VALIDATION: Accepted ===")
+            print(result_df.head(30))
+            if len(result_df) > 30:
+                print(f"... ({len(result_df) - 30} weitere Zeilen)")
+        
+        return result_df
 
-    def validate(self, df: pd.DataFrame, sim_df: pd.DataFrame, col: str = "Accepted") -> pd.DataFrame:
-        return self.validate_binary(df=df, sim_df=sim_df, col=col)
+    def validate(self, df: pd.DataFrame, sim_df: pd.DataFrame, col: str = "Accepted", print_results: bool = True) -> pd.DataFrame:
+        return self.validate_binary(df=df, sim_df=sim_df, col=col, print_results=print_results)

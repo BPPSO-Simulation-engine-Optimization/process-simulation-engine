@@ -142,7 +142,7 @@ class MonthlyCostPredictor(AttributePredictorBase):
         y_hat = float(np.dot(x, model["coef"]) + model["intercept"] - model["bias"])
         return float(max(y_hat, 0.0))
 
-    def validate(self, df: pd.DataFrame, sim_df: pd.DataFrame, original_col="MonthlyCost", simulated_col="MonthlyCost"):
+    def validate(self, df: pd.DataFrame, sim_df: pd.DataFrame, original_col="MonthlyCost", simulated_col="MonthlyCost", print_results: bool = True):
         o_col = resolve_col(df, original_col)
         s_col = resolve_col(sim_df, simulated_col)
 
@@ -158,4 +158,10 @@ class MonthlyCostPredictor(AttributePredictorBase):
             "orig_mean": float(np.mean(x)) if len(x) else np.nan,
             "sim_mean": float(np.mean(y)) if len(y) else np.nan,
         }
-        return pd.DataFrame([overall])
+        result_df = pd.DataFrame([overall])
+        
+        if print_results:
+            print("\n=== VALIDATION: Monthly Cost ===")
+            print(result_df)
+        
+        return result_df

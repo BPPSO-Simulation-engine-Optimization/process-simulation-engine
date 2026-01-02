@@ -6,6 +6,8 @@ This script runs a full simulation using:
 - Processing times: basic (stub) or advanced (ProcessingTimePredictionClass)
 - Case attributes: basic (stub) or advanced (AttributeSimulationEngine)
 
++ It saves the respective subset of the GT EL in case num-cases is specified
+
 Usage:
     python -m integration.test_integration --mode basic
     python -m integration.test_integration --mode advanced --num-cases 31000
@@ -57,6 +59,44 @@ def create_resource_allocator(log_path: str):
         raise Exception(f"Could not load ResourceAllocator: {e}")
 
 
+def save_ground_truth_subset(df: pd.DataFrame, num_cases: int, output_dir: str):
+    """
+    Save a subset of the original event log with the first N cases (by arrival time).
+
+    Args:
+        df: Original event log DataFrame
+        num_cases: Number of cases to keep
+        output_dir: Output directory for the reduced log
+    """
+    # Get case arrival times (first event per case)
+    case_arrivals = df.groupby('case:concept:name')['time:timestamp'].min().sort_values()
+
+    # Select first N cases by arrival time
+    selected_cases = case_arrivals.head(num_cases).index.tolist()
+
+    # Filter the event log
+    reduced_df = df[df['case:concept:name'].isin(selected_cases)].copy()
+
+    print(f"\nGround truth subset: {len(selected_cases)} cases, {len(reduced_df)} events")
+
+    # Save to output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    csv_path = os.path.join(output_dir, "ground_truth_log.csv")
+    reduced_df.to_csv(csv_path, index=False)
+    print(f"Exported ground truth CSV to: {csv_path}")
+
+    try:
+        import pm4py
+        xes_path = os.path.join(output_dir, "ground_truth_log.xes")
+        pm4py.write_xes(reduced_df, xes_path)
+        print(f"Exported ground truth XES to: {xes_path}")
+    except Exception as e:
+        print(f"Could not export ground truth XES: {e}")
+
+    return reduced_df
+
+
 def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str):
     """Run the simulation with given configuration."""
     print("\n" + "=" * 60)
@@ -86,12 +126,22 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 
     # Create engine
     print("\nInitializing DESEngine...")
+    
+    # Adjust start_time to be the earliest of simulation start date or first arrival
+    # This prevents "Cannot go back in time" errors if the arrival generator
+    # produces timestamps earlier in the day than the log's start time (due to normalization).
+    engine_start_time = start_date
+    if arrivals and len(arrivals) > 0:
+         if arrivals[0] < start_date:
+             engine_start_time = arrivals[0]
+             print(f"Adjusting simulation start time to first arrival: {engine_start_time}")
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
-        start_time=start_date,
+        start_time=engine_start_time,
     )
 
     # Run simulation
@@ -104,7 +154,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Cases started: {engine.stats['cases_started']}")
     print(f"  Cases completed: {engine.stats['cases_completed']}")
     print(f"  Events generated: {len(events)}")
-    print(f"  Allocation failures: {engine.stats['allocation_failures']}")
+    print(f"  Outside hours: {engine.stats['outside_hours_count']}")
+    print(f"  No eligible: {engine.stats['no_eligible_failures']}")
     print("=" * 60)
 
     # Export results
@@ -217,6 +268,10 @@ def main():
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)
+
+    # Save ground truth subset for comparison
+    print(f"\nSaving ground truth subset ({num_cases} cases) for comparison...")
+    save_ground_truth_subset(df, num_cases, args.output_dir)
 
     # Run simulation
     events = run_simulation(config, df, allocator, args.output_dir)
