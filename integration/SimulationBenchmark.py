@@ -717,16 +717,11 @@ class SimulationBenchmark:
 if __name__ == "__main__":
     # Option 1: Direkt .xes Dateien laden
     benchmark = SimulationBenchmark(
-        'eventlog/eventlog.xes.gz',  # Original BPIC 2017 Log
-        'simulation/output/simulated_log.xes'  # TODO: Replace with path to simulated log
+        'integration/output/ground_truth_log.xes',  # Original BPIC 2017 Log (possible subset)
+        'integration/output/simulated_log.xes'  # Simulated Log
     )
-    
-    # Option 2: Mit DataFrames (wie vorher)
-    # original_df = pd.DataFrame()  # Load BPIC 2017 as DataFrame
-    # simulated_df = pd.DataFrame()  # Load simulated log as DataFrame
-    # benchmark = SimulationBenchmark(original_df, simulated_df)
     
     # Analyse durchführen
     results = benchmark.compute_all_metrics()
     benchmark.print_summary()
-    benchmark.export_results('simulation/output/benchmark_results.xlsx')
+    benchmark.export_results('integration/output/benchmark_results.xlsx')

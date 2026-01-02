@@ -295,29 +295,37 @@ The test suite (`test_resource_availabilities_new.py`) covers:
 - ✅ Current activity detection
 - ✅ Workload calculation
 
-## 🤝 Integration with Simulation
+## 🤝 Integration with DESEngine
+
+The **DESEngine** integrates resource availability through the `ResourceAllocator` and a **waiting queue mechanism**:
 
 ```python
-# In your simulation loop
-def assign_activity(activity, current_time):
-    # Get candidate resources
-    candidates = get_resources_for_activity(activity)
-    
-    # Filter by availability
-    available = [r for r in candidates 
-                 if model.is_available(r, current_time)]
-    
-    if not available:
-        # Schedule for next available time
-        next_times = [(r, model.get_next_available_time(r, current_time))
-                      for r in candidates]
-        resource, next_time = min(next_times, key=lambda x: x[1])
-        return schedule_activity(activity, resource, next_time)
-    
-    # Select from available (e.g., least loaded)
-    resource = select_optimal(available)
-    return schedule_activity(activity, resource, current_time)
+# DESEngine resource allocation flow:
+# 1. Check eligibility (permission model)
+# 2. Filter by availability (this model)
+# 3. Filter by dynamic busy state (ResourcePool)
+# 4. Either allocate or queue
+
+# When no resource is available:
+# - Work is added to per-activity waiting queue
+# - When ANY activity completes, the freed resource checks the queue
+# - Waiting work is dispatched FIFO to eligible freed resources
 ```
+
+### Key Integration Points
+
+1. **`is_available(resource_id, timestamp)`** - Called by ResourceAllocator to filter eligible resources by working hours
+
+2. **Dynamic busy tracking** - The DESEngine's `ResourcePool` tracks which resources are currently working (separate from this model's static patterns)
+
+3. **User_1 special handling** - User_1 returns `True` for `is_available()` at all times (24/7 system resource)
+
+### No Retry Scheduling
+
+The DESEngine does NOT use `get_next_available_time()` to schedule retries. Instead:
+- Work waits in queue until a resource completes an activity
+- The freed resource checks if it can handle any waiting work
+- This creates realistic resource contention and waiting times
 
 ## 🎯 Summary
 

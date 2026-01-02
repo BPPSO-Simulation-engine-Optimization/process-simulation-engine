@@ -48,3 +48,50 @@ resource = allocator.allocate(
     *   Resource-specific working days (e.g., Mon-Thu vs Mon-Fri).
     *   (Optional) Probabilistic availability if configured.
 3.  **Selection**: Randomly selects one of the available, eligible resources.
+
+## Integration with DESEngine
+
+The `ResourceAllocator.allocate()` method returns `None` when no eligible resource is available. The **DESEngine** handles this through a **waiting queue mechanism**:
+
+### Resource Pool & Waiting Queue
+
+The DESEngine maintains a `ResourcePool` that tracks:
+- **Dynamic busy state**: Which resources are currently working on activities
+- **Per-activity waiting queues**: Work that couldn't be allocated (FIFO ordering)
+
+### Allocation Flow in DESEngine
+
+```
+1. Activity needs resource
+   ↓
+2. Check eligibility (permission model)
+   ↓
+3. Filter by availability (working hours)
+   ↓
+4. Filter by busy state (not working on another activity)
+   ↓
+5a. Resource found → Schedule activity, mark resource busy
+5b. No resource → Add to waiting queue
+```
+
+### When Resources Become Free
+
+When an activity completes:
+1. Resource is released (marked as free)
+2. Waiting queue is checked for activities this resource can perform
+3. If matching work found, it's dispatched to the freed resource (FIFO)
+
+### Failure Reasons
+
+The allocation can fail for three reasons:
+- `'no_eligible'`: No resources qualified for this activity (permission model issue)
+- `'outside_hours'`: Qualified resources exist but none are working at this timestamp
+- `'all_busy'`: Qualified resources exist and are working, but all are busy with other activities
+
+### User_1 (System Resource)
+
+User_1 is a special 24/7 automated system resource that:
+- Is always available (no working hour restrictions)
+- Is eligible for system activities: `A_Create Application`, `A_Submitted`, `A_Concept`, `A_Cancelled`, `O_Cancelled`, `W_Complete application`, `W_Validate application`, `W_Call after offers`, `W_Call incomplete files`, `W_Handle leads`, `W_Assess potential fraud`
+
+This ensures the simulation chain keeps moving even outside business hours for these activities.
