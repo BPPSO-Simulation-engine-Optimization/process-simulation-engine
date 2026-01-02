@@ -8,29 +8,39 @@ from case_attribute_prediction.simulator import AttributeSimulationEngine
 # Wenn False: ausschließlich aus gespeicherten Artefakten simulieren (kein XES-Load).
 RETRAIN_MODELS = False
 
-# Eventlog wird nur geladen für das Training der Modelle.
-if RETRAIN_MODELS:
-    if len(sys.argv) > 1:
-        EVENT_LOG_PATH = sys.argv[1]
-    else:
-        EVENT_LOG_PATH = "eventlog.xes.gz"
+# Eventlog wird geladen für Validierung (immer) und Training (nur wenn RETRAIN_MODELS=True).
+# Wir brauchen das df auch für die Validierung, auch wenn wir nicht neu trainieren.
+if len(sys.argv) > 1:
+    EVENT_LOG_PATH = sys.argv[1]
+else:
+    EVENT_LOG_PATH = "eventlog/eventlog.xes.gz"
 
+try:
     event_log = xes_importer.apply(EVENT_LOG_PATH)
     df = log_converter.apply(event_log, variant=log_converter.Variants.TO_DATA_FRAME)
-else:
+    print(f"Eventlog geladen: {len(df)} Events, {df['case:concept:name'].nunique()} Cases")
+except Exception as e:
+    print(f"Warnung: Eventlog konnte nicht geladen werden: {e}")
+    print("Validierung wird übersprungen. Nur Simulation wird durchgeführt.")
     df = None
 
 engine = AttributeSimulationEngine(df=df, seed=42, retrain_models=RETRAIN_MODELS)
 
+# Sicherstellen, dass engine.df gesetzt ist für Validierung
+# (wichtig wenn df später geladen wurde oder RETRAIN_MODELS=False war)
+if df is not None:
+    engine.df = df
+
 case_rows = []
 
-n_cases = 100
+n_cases = 30000
 for _ in range(n_cases):
     # Case-bezogene Attribute (bleiben für alle Events dieses Cases konstant)
     case_attributes = engine.draw_case_attributes()
 
     # Hardgecoded Startaktivität für den Case
-    next_activity = "O_Withdrawal"
+    # WICHTIG: Offer-Attribute werden nur bei "O_Create Offer" generiert
+    next_activity = "O_Create Offer"
 
     # Zieht so lange event_attributes, bis die Next-Activity "END" ist
     while True:
@@ -53,34 +63,17 @@ for _ in range(n_cases):
 
 sim_df = pd.DataFrame(case_rows)
 
-# Validierung nur, wenn ein Trainings-df vorhanden ist (RETRAIN_MODELS=True).
-# In reiner Simulationsphase wird ausschließlich vorhergesagt.
-if RETRAIN_MODELS:
-    # monthly_cost: bool = False,
-    # credit_score: bool = False,
-    # offered_amount: bool = False,
-    # number_of_terms_dist = False,
-    # number_of_terms_mae = False,
-    # first_withdrawal: bool = False,
-    # selected: bool = False,
-    # accepted: bool = False,
-    print("\n=== VALIDATION: MONTHLY_COST ===")
+# Validierung wird ausgeführt, wenn ein Trainings-df vorhanden ist.
+# Auch ohne RETRAIN_MODELS=True können wir validieren, solange df geladen wurde.
+if df is not None:
     val = engine.validate(
         sim_df,
-        offered_amount=True
-    )
-    print(val["offered_amount"])
-
-    print("\n=== VALIDATION: Number of Terms ===")
-    val = engine.validate(
-        sim_df,
-        number_of_terms_dist=True,
-        number_of_terms_mae=True,
+        first_withdrawal=True,
     )
 
-    print(val["number_of_terms_dist"])
-    print(val["number_of_terms_mae_overall"])
-    print(val["number_of_terms_mae_baseline"])
+    print(df.columns)
+else:
+    print("\n(Warnung: Kein Eventlog geladen, Validierung übersprungen)")
 
 cols = [
     "case:RequestedAmount",
@@ -114,17 +107,86 @@ avg_overpayment_pct = d["overpayment_pct"].mean()
 
 print(f"Durchschnittliche Mehrzahlung: {avg_overpayment_pct:.2f} %")
 
-# Loan goal gut, aplpication type gut, rquested amount gut (Annahme), Offered amount gut,
+# Loan goal gut, aplpication type gut, rquested amount gut, Offered amount gut, CreditScore in Abh. zu case:LoanGoal und ApplicationType gut. gut
 ## TODO:
-# rquested amount validieren und creditScore validieren
-# testen, ob Fälle gibt mit requested amount < offeredamount
 # CreditScore korrigieren
 # Datapreparation korrigiere
 # Verbessern von No of terms und monthlycosts. 51% mehr overpay statt 18% im original df
-# FirstWithdrawal amount fixen!!
 
 print(sim_df.head()["concept:name"])
 print(sim_df["case:concept:name"].unique())
+
+print(sim_df["case:RequestedAmount"].unique())
+
+# Test: Prüfe ob FirstWithdrawalAmount <= OfferedAmount
+print("\n=== TEST: FirstWithdrawalAmount vs OfferedAmount ===")
+sim_df_test = sim_df[
+    sim_df["FirstWithdrawalAmount"].notna() & 
+    sim_df["OfferedAmount"].notna() &
+    (sim_df["FirstWithdrawalAmount"] >= 0) &
+    (sim_df["OfferedAmount"] > 0)
+].copy()
+
+if len(sim_df_test) > 0:
+    # Vergleich FirstWithdrawalAmount vs OfferedAmount
+    sim_df_test["fwa_lt_offered"] = sim_df_test["FirstWithdrawalAmount"] < sim_df_test["OfferedAmount"]
+    sim_df_test["fwa_eq_offered"] = sim_df_test["FirstWithdrawalAmount"] == sim_df_test["OfferedAmount"]
+    sim_df_test["fwa_gt_offered"] = sim_df_test["FirstWithdrawalAmount"] > sim_df_test["OfferedAmount"]
+    sim_df_test["fwa_le_offered"] = sim_df_test["FirstWithdrawalAmount"] <= sim_df_test["OfferedAmount"]
+    
+    total = len(sim_df_test)
+    lt_count = sim_df_test["fwa_lt_offered"].sum()
+    eq_count = sim_df_test["fwa_eq_offered"].sum()
+    gt_count = sim_df_test["fwa_gt_offered"].sum()
+    le_count = sim_df_test["fwa_le_offered"].sum()
+    
+    print(f"Gesamt Fälle mit gültigen Werten: {total}")
+    print(f"FirstWithdrawalAmount < OfferedAmount: {lt_count} ({lt_count/total*100:.2f}%)")
+    print(f"FirstWithdrawalAmount == OfferedAmount: {eq_count} ({eq_count/total*100:.2f}%)")
+    print(f"FirstWithdrawalAmount <= OfferedAmount: {le_count} ({le_count/total*100:.2f}%)")
+    print(f"FirstWithdrawalAmount > OfferedAmount: {gt_count} ({gt_count/total*100:.2f}%) ⚠️")
+    
+    if gt_count > 0:
+        print(f"\n❌ FEHLER: {gt_count} Fälle haben FirstWithdrawalAmount > OfferedAmount (UNGÜLTIG!)")
+        print("\nBeispiele (FirstWithdrawalAmount > OfferedAmount):")
+        problematic = sim_df_test[sim_df_test["fwa_gt_offered"]][
+            ["case:LoanGoal", "case:ApplicationType", "FirstWithdrawalAmount", "OfferedAmount"]
+        ].head(10)
+        print(problematic)
+        
+        # Berechne Differenz für problematische Fälle
+        problematic["difference"] = problematic["FirstWithdrawalAmount"] - problematic["OfferedAmount"]
+        problematic["pct_over"] = (problematic["difference"] / problematic["OfferedAmount"]) * 100
+        print("\nÜberschreitung:")
+        print(problematic[["FirstWithdrawalAmount", "OfferedAmount", "difference", "pct_over"]])
+    else:
+        print("\n✅ Alle Fälle sind gültig (FirstWithdrawalAmount <= OfferedAmount)")
+    
+    # Statistik: Durchschnittliches Verhältnis (Prozent)
+    sim_df_test["pct_of_offered"] = (sim_df_test["FirstWithdrawalAmount"] / sim_df_test["OfferedAmount"]) * 100
+    print(f"\nStatistik (FirstWithdrawalAmount als % von OfferedAmount):")
+    print(f"  Durchschnitt: {sim_df_test['pct_of_offered'].mean():.2f}%")
+    print(f"  Median: {sim_df_test['pct_of_offered'].median():.2f}%")
+    print(f"  Min: {sim_df_test['pct_of_offered'].min():.2f}%")
+    print(f"  Max: {sim_df_test['pct_of_offered'].max():.2f}%")
+    
+    # Verteilung in Kategorien
+    def categorize_pct(pct):
+        if pct <= 5:
+            return "0-5%"
+        elif pct < 95:
+            return "5-95%"
+        else:
+            return "95-100%"
+    
+    sim_df_test["pct_category"] = sim_df_test["pct_of_offered"].apply(categorize_pct)
+    cat_counts = sim_df_test["pct_category"].value_counts(normalize=True) * 100
+    print(f"\nVerteilung der Abhebungsprozent:")
+    for cat in ["0-5%", "5-95%", "95-100%"]:
+        count = cat_counts.get(cat, 0)
+        print(f"  {cat}: {count:.2f}%")
+else:
+    print("⚠️  Keine gültigen Daten für Vergleich vorhanden")
 
 
 

@@ -81,6 +81,7 @@ class SelectedPredictor(AttributePredictorBase):
         group_cols=("case:LoanGoal", "case:ApplicationType"),
         score_bins=(0, 500, 600, 700, 800, 900, 1000),
         col: str = "Selected",
+        print_results: bool = True,
     ) -> pd.DataFrame:
         col_o = resolve_col(df, col)
         col_s = resolve_col(sim_df, col)
@@ -115,12 +116,20 @@ class SelectedPredictor(AttributePredictorBase):
                 "sim_n": int(len(s)),
             })
 
-        return (
+        result_df = (
             pd.DataFrame(rows)
             .sort_values(["case:LoanGoal", "case:ApplicationType", "CreditScore_bin"])
             .reset_index(drop=True)
         )
+        
+        if print_results:
+            print("\n=== VALIDATION: Selected ===")
+            print(result_df.head(30))
+            if len(result_df) > 30:
+                print(f"... ({len(result_df) - 30} weitere Zeilen)")
+        
+        return result_df
 
-    def validate(self, df: pd.DataFrame, sim_df: pd.DataFrame, col: str = "Selected") -> pd.DataFrame:
+    def validate(self, df: pd.DataFrame, sim_df: pd.DataFrame, col: str = "Selected", print_results: bool = True) -> pd.DataFrame:
         # identisch zur Notebook-Logik validate_binary_by_score
-        return self.validate_binary_by_score(df=df, sim_df=sim_df, col=col)
+        return self.validate_binary_by_score(df=df, sim_df=sim_df, col=col, print_results=print_results)
