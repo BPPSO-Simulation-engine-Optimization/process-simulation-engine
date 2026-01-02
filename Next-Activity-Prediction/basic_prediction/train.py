@@ -7,8 +7,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bpmn_parser import BPMNParser
-from log_analyzer import LogAnalyzer
+from .bpmn_parser import BPMNParser
+from .log_analyzer import LogAnalyzer
 import joblib
 from pathlib import Path
 
@@ -43,9 +43,9 @@ def train_and_save(bpmn_path, log_path, output_path):
 
 
 if __name__ == "__main__":
-    bpmn_path = "../process_model/LoanApplicationProcess.bpmn"
-    log_path = "../Dataset/BPI Challenge 2017.xes"
-    output_path = "../models/branch_predictor.joblib"
+    bpmn_path = "../../process_model/LoanApplicationProcess.bpmn"
+    log_path = "../../Dataset/BPI Challenge 2017.xes"
+    output_path = "../../models/branch_predictor.joblib"
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     train_and_save(bpmn_path, log_path, output_path)

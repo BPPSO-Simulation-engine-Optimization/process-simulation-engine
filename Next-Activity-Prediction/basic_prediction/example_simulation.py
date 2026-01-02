@@ -1,4 +1,3 @@
-
 import random
 import joblib
 from pathlib import Path
@@ -65,7 +64,7 @@ def simulate_case(predictor):
 
 
 def main():
-    model_path = Path(__file__).parent.parent / "models" / "branch_predictor.joblib"
+    model_path = Path(__file__).parent.parent.parent / "models" / "branch_predictor.joblib"
     
     if not model_path.exists():
         print(f"Model not found at {model_path}")
@@ -90,3 +89,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

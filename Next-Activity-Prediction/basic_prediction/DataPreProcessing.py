@@ -1,7 +1,7 @@
 import pm4py
 import pandas as pd
 
-LOG_FILE = r"Dataset\BPI Challenge 2017.xes"
+LOG_FILE = r"../../Dataset/BPI Challenge 2017.xes"
 
 def prefix_generation():
     """
@@ -26,10 +26,10 @@ def prefix_generation():
         "next_activity": labels
     })
 
-    df.to_csv(r'Dataset\Prefix_Label_Data.csv', index=False)
-
+    df.to_csv(r'../../Dataset/Prefix_Label_Data.csv', index=False)
 
 
 
 if __name__ == "__main__":
     prefix_generation()
+
