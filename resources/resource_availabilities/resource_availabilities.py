@@ -67,7 +67,10 @@ class ResourceAvailabilityModel:
 
         self.resources = sorted(self.event_log_df["org:resource"].dropna().unique())
         
-
+        # Ensure User_1 (automatic 24/7 resource) is always in the resources list
+        if 'User_1' not in self.resources:
+            self.resources.append('User_1')
+            self.resources = sorted(self.resources)
 
     def _cycle_day_index(self, current_time: datetime) -> int:
         """Calculate the day index within the cycle (0 to interval_days-1)."""
@@ -235,6 +238,23 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         df['date'] = df['time:timestamp'].dt.date
         
         for resource in self.resources:
+            # Special handling for System User (User_1)
+            if resource == "User_1":
+                self.resource_patterns[resource] = {
+                    'working_start': 0,
+                    'working_end': 24,
+                    'working_days': {0, 1, 2, 3, 4, 5, 6},  # Mon-Sun
+                    'peak_hours': set(range(24)),
+                    'hour_probabilities': {h: 1.0 for h in range(24)},
+                    'dow_probabilities': {d: 1.0 for d in range(7)},
+                    'first_activity': None,  # Always available, no time restrictions
+                    'last_activity': None,   # Always available, no time restrictions
+                    'total_activities': 999999, # Artificially high
+                    'activity_intensity': 999.0,
+                    'active_days': 365,
+                }
+                continue
+
             resource_df = df[df['org:resource'] == resource]
             
             if len(resource_df) < self.min_activity_threshold:
@@ -484,6 +504,10 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         Returns:
             True if resource is available (not busy and within working hours)
         """
+        # CRITICAL: User_1 is a 24/7 automatic system resource - always available
+        if resource_id == 'User_1':
+            return True
+        
         if resource_id not in self.resources:
             return False
         
@@ -671,6 +695,21 @@ class AdvancedResourceAvailabilityModel(ResourceAvailabilityModel):
         print(f"          - {len(instance.resource_patterns)} resource patterns")
         print(f"          - {len(instance.resource_clusters)} clustered resources")
         print(f"          - {sum(len(p) for p in instance.resource_busy_periods.values())} busy periods")
+        
+        # Add User_1 as always available (24/7 automatic resource)
+        if 'User_1' not in instance.resources:
+            instance.resources.append('User_1')
+            instance.resources = sorted(instance.resources)
+            # Create 24/7 pattern for User_1
+            instance.resource_patterns['User_1'] = {
+                'working_days': set(range(7)),  # All days
+                'working_start': 0,  # 00:00
+                'working_end': 24,  # 24:00
+                'peak_hours': set(range(24)),
+                'hour_probabilities': {h: 1.0 for h in range(24)},
+                'first_activity': None,
+                'last_activity': None
+            }
         
         return instance
     

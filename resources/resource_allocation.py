@@ -1,7 +1,7 @@
 import pandas as pd
 import pm4py
-from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from datetime import datetime
+from typing import Optional, List
 import random
 import logging
 import os
@@ -176,25 +176,18 @@ class ResourceAllocator:
             
         return df
 
-    def allocate(self, activity: str, timestamp: datetime, case_type: str = None) -> Tuple[Optional[str], datetime]:
+    def allocate(self, activity: str, timestamp: datetime, case_type: str = None) -> Optional[str]:
         """
         Allocates a suitable resource for the given activity at the given timestamp.
 
         1. Finds all resources eligible for the activity (considering context).
         2. Filters them by availability at the timestamp.
-        3. If no resource is available, waits until the next available time.
-        4. Returns the selected resource and the actual start time.
+        3. Returns a randomly selected available resource, or None if none are found.
         
         Args:
             activity: Name of the activity.
-            timestamp: Desired time when the activity should be performed.
+            timestamp: Time when the activity is to be performed.
             case_type: Optional Case Type (e.g., "Home improvement", "Car").
-            
-        Returns:
-            Tuple of (resource_id, actual_start_time):
-            - If resources are available at timestamp: (resource, timestamp)
-            - If no resources available: (resource, next_available_time)
-            - If no eligible resources exist: (None, timestamp)
         """
         # 1. Eligibility (context-aware)
         try:
@@ -207,59 +200,22 @@ class ResourceAllocator:
 
         if not eligible_resources:
             # logger.debug(f"No eligible resources found for activity '{activity}'.")
-            return (None, timestamp)
+            return None
 
-        # 2. Availability at requested time
+        # 2. Availability
+        # Optimization: Filter list first
         available_resources = [
             res for res in eligible_resources 
             if self.availability.is_available(res, timestamp)
         ]
 
-        if available_resources:
-            # Resources available now - select one randomly
-            selected_resource = random.choice(available_resources)
-            return (selected_resource, timestamp)
-        
-        # 3. No resources available - find next available time
-        # Check each eligible resource for their next available time
-        next_available_times = []
-        
-        for resource in eligible_resources:
-            next_time = self._find_next_available_time(resource, timestamp)
-            if next_time:
-                next_available_times.append((resource, next_time))
-        
-        if not next_available_times:
-            # No resource will ever be available (shouldn't happen normally)
-            logger.warning(f"No resource found that will become available for activity '{activity}'")
-            return (None, timestamp)
-        
-        # Select the resource that becomes available earliest
-        next_available_times.sort(key=lambda x: x[1])
-        selected_resource, actual_start_time = next_available_times[0]
-        
-        # logger.info(f"Activity '{activity}' delayed: resource '{selected_resource}' available at {actual_start_time} instead of {timestamp}")
-        return (selected_resource, actual_start_time)
-    
-    def _find_next_available_time(self, resource_id: str, start_time: datetime, max_days: int = 30) -> Optional[datetime]:
-        """
-        Find the next time a resource becomes available after start_time.
-        
-        Args:
-            resource_id: The resource to check
-            start_time: Start searching from this time
-            max_days: Maximum number of days to search ahead (default: 30)
-            
-        Returns:
-            Next available datetime, or None if not found within max_days
-        """
-        check_time = start_time
-        end_time = start_time + timedelta(days=max_days)
-        
-        # Check hour by hour
-        while check_time < end_time:
-            if self.availability.is_available(resource_id, check_time):
-                return check_time
-            check_time += timedelta(hours=1)
-        
-        return None
+        if not available_resources:
+            # Fallback: Use User_1 as 24/7 system resource when no other resource is available
+            if 'User_1' in eligible_resources and self.availability.is_available('User_1', timestamp):
+                return 'User_1'
+            # logger.debug(f"No available resources found for activity '{activity}' at {timestamp}.")
+            return None
+
+        # 3. Selection (Random for now, TODO improve in optimization?)
+        selected_resource = random.choice(available_resources)
+        return selected_resource
