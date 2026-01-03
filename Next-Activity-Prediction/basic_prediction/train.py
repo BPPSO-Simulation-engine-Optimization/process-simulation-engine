@@ -50,3 +50,8 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     train_and_save(bpmn_path, log_path, output_path)
 
+
+
+
+
+

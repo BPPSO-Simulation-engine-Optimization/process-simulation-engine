@@ -61,3 +61,8 @@ class BranchPredictor:
         key = (gateway_id, preceding_activity)
         return self.probabilities.get(key, {})
 
+
+
+
+
+
