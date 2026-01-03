@@ -18,3 +18,11 @@ benchmark_results.xlsx
 models/*.joblib
 models/*.keras
 __pycache__/
+Dataset/*
+Docs/*
+.venv
+models/*.joblib
+models/*.keras
+__pycache__/
+Next-Activity-Prediction/advanced/models_lstm_new/*
+Next-Activity-Prediction/advanced/data/*

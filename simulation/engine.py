@@ -325,17 +325,33 @@ class DESEngine:
     
     def _create_next_activity_predictor(self):
         """
-        Auto-load BranchNextActivityPredictor if trained model exists, else use stub.
+        Auto-load next activity predictor based on available models.
         
-        The model is trained via: python Next-Activity-Prediction/train.py
+        Priority:
+        1. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
+        2. BranchPredictor model (models/branch_predictor.joblib)
+        3. Stub predictor (fallback)
         """
         from pathlib import Path
+        
+        # Try LSTM models first
+        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
+        if lstm_models_dir.exists() and any(lstm_models_dir.iterdir()):
+            try:
+                logger.info("Loading LSTMNextActivityPredictor...")
+                return LSTMNextActivityPredictor(str(lstm_models_dir))
+            except Exception as e:
+                logger.warning(f"Could not load LSTM predictor: {e}")
+        
+        # Fallback to BranchPredictor
         model_path = Path(BranchNextActivityPredictor.DEFAULT_MODEL_PATH)
         if model_path.exists():
             try:
                 return BranchNextActivityPredictor(str(model_path))
             except Exception as e:
                 logger.warning(f"Failed to load next activity model: {e}")
+        
+        # Last resort: stub
         logger.info("Using stub next activity predictor "
                    "(train model with: python Next-Activity-Prediction/train.py)")
         return _StubNextActivityPredictor()
@@ -918,6 +934,118 @@ class _StubCaseArrivalPredictor:
         # Random 1-30 minutes between cases
         minutes = random.randint(1, 30)
         return timedelta(minutes=minutes)
+
+
+class LSTMNextActivityPredictor:
+    """
+    Advanced next activity predictor using LSTM models per decision point.
+    
+    Wraps the existing decision_function_advanced() from Next-Activity-Prediction/advanced.
+    """
+    
+    END_ACTIVITIES = {"A_Cancelled", "A_Complete"}
+    START_ACTIVITY = "A_Create Application"
+    
+    def __init__(
+        self,
+        models_dir: str = "Next-Activity-Prediction/advanced/models_lstm_new",
+        max_history: int = 15,
+        seed: int = 42,
+    ):
+        """Load LSTM models, process graph, and decision point map."""
+        import sys
+        from pathlib import Path
+        
+        # Add advanced module to path
+        advanced_path = Path(__file__).parent.parent / "Next-Activity-Prediction" / "advanced"
+        if str(advanced_path) not in sys.path:
+            sys.path.insert(0, str(advanced_path))
+        
+        from api import load_models
+        from simulation import load_simulation_assets, decision_function_advanced
+        
+        self.models = load_models(models_dir)
+        self.process_graph, self.decision_point_map = load_simulation_assets()
+        self.decision_function = decision_function_advanced
+        self.max_history = max_history
+        self.rng = random.Random(seed)
+        
+        # Build activity -> DP mapping
+        self._activity_to_dp = {}
+        for dp, info in self.decision_point_map.items():
+            if "incoming" in info:
+                for act in info["incoming"]:
+                    self._activity_to_dp[act] = dp
+        
+        logger.info(
+            f"Loaded LSTMNextActivityPredictor: {len(self.models)} models, "
+            f"{len(self.process_graph)} nodes, {len(self._activity_to_dp)} activity-to-DP mappings"
+        )
+    
+    def predict(self, case_state: CaseState) -> tuple[str, bool]:
+        """Predict next activity using LSTM models at decision points."""
+        if not case_state.activity_history:
+            return self.START_ACTIVITY, False
+        
+        current = case_state.activity_history[-1]
+        
+        if current in self.END_ACTIVITIES:
+            return current, True
+        
+        next_options = self.process_graph.get(current, [])
+        
+        if not next_options:
+            logger.debug(f"No outgoing edges for {current}, ending case")
+            return current, True
+        
+        if len(next_options) == 1:
+            next_act = next_options[0]
+            return next_act, next_act in self.END_ACTIVITIES
+        
+        # Multiple options - use LSTM at decision point
+        decision_point = self._activity_to_dp.get(current)
+        
+        if not decision_point:
+            # No DP mapping - random choice
+            logger.debug(f"No DP for {current}, random choice from {next_options}")
+            next_act = self.rng.choice(next_options)
+            return next_act, next_act in self.END_ACTIVITIES
+        
+        # Convert CaseState to history format
+        history = self._case_state_to_history(case_state)
+        
+        try:
+            next_act, prob = self.decision_function(
+                current_dp=decision_point,
+                history=history,
+                options=next_options,
+                models=self.models,
+                decision_point_map=self.decision_point_map,
+                process_graph=self.process_graph,
+                max_history=self.max_history,
+            )
+            logger.debug(f"LSTM predicted {next_act} at {decision_point} (p={prob:.3f})")
+            return next_act, next_act in self.END_ACTIVITIES
+        except Exception as e:
+            logger.warning(f"LSTM prediction failed at {decision_point}: {e}, using random")
+            next_act = self.rng.choice(next_options)
+            return next_act, next_act in self.END_ACTIVITIES
+    
+    def _case_state_to_history(self, case_state: CaseState) -> List[Dict]:
+        """Convert CaseState to history format for decision_function_advanced."""
+        from datetime import timedelta
+        
+        base_time = case_state.start_time or datetime.now()
+        history = []
+        
+        for i, activity in enumerate(case_state.activity_history):
+            history.append({
+                'task': activity,
+                'resource': case_state.current_resource or 'User_1',
+                'timestamp': base_time + timedelta(seconds=i),
+            })
+        
+        return history
 
 
 class BranchNextActivityPredictor:

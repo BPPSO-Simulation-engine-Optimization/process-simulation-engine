@@ -21,6 +21,9 @@ class SimulationConfig:
     processing_time_method: Literal["distribution", "ml", "probabilistic_ml"] = "ml"
     processing_time_model_path: Optional[str] = "models/processing_time_model"
 
+    # Next activity prediction
+    next_activity_mode: Literal["basic", "advanced"] = "basic"
+
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
     # (see case_arrival_times_prediction/runner.py run() defaults)
@@ -64,6 +67,7 @@ class SimulationConfig:
         return cls(
             processing_time_mode="advanced",
             processing_time_model_path=processing_time_model_path,
+            next_activity_mode="advanced",
             case_arrival_mode="advanced",
             case_attribute_mode="advanced",
             event_log_path=event_log_path,

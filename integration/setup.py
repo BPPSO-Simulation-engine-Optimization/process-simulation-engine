@@ -21,7 +21,7 @@ def setup_simulation(
     config: SimulationConfig,
     df: Optional[pd.DataFrame] = None,
     start_date: Optional[datetime] = None,
-) -> Tuple[List[datetime], Any, Any, Any]:
+) -> Tuple[List[datetime], Any, Any, Any, Any]:
     """
     Set up all simulation components based on configuration.
 
@@ -33,7 +33,7 @@ def setup_simulation(
             Defaults to now() if not provided.
 
     Returns:
-        Tuple of (arrival_timestamps, processing_time_predictor, case_attribute_predictor)
+        Tuple of (arrival_timestamps, next_activity_predictor, processing_time_predictor, case_attribute_predictor)
 
     Raises:
         ValueError: If advanced mode requires df but df is None.
@@ -55,13 +55,16 @@ def setup_simulation(
     # 1. Case arrival timestamps
     arrival_timestamps = _setup_arrivals(config, df, start_date)
 
-    # 2. Processing time predictor
+    # 2. Next activity predictor
+    next_activity_pred = _setup_next_activity(config)
+
+    # 3. Processing time predictor
     processing_time_pred = _setup_processing_time(config)
 
-    # 3. Case attribute predictor
+    # 4. Case attribute predictor
     case_attr_pred = _setup_case_attributes(config, df)
 
-    return arrival_timestamps, processing_time_pred, case_attr_pred
+    return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
 def _setup_arrivals(
@@ -251,3 +254,46 @@ def _setup_case_attributes(
     mode_desc = "retrained from event log" if retrain else "from cached artifacts"
     logger.info(f"Loaded AttributeSimulationEngine ({mode_desc})")
     return predictor
+
+
+def _setup_next_activity(config: SimulationConfig) -> Any:
+    """
+    Set up next activity predictor based on config.
+    
+    Returns LSTMNextActivityPredictor if in advanced mode and models exist,
+    otherwise returns None (engine will auto-load).
+    """
+    from pathlib import Path
+    
+    if config.next_activity_mode == "advanced":
+        logger.info("Setting up advanced next activity predictor (LSTM)...")
+        
+        # Import LSTMNextActivityPredictor from simulation.engine module
+        from simulation.engine import LSTMNextActivityPredictor
+        
+        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
+        if not lstm_models_dir.exists():
+            logger.warning(f"LSTM models directory not found: {lstm_models_dir}")
+            logger.info("Falling back to auto-load (will try BranchPredictor or Stub)")
+            return None
+        
+        try:
+            predictor = LSTMNextActivityPredictor(
+                models_dir=str(lstm_models_dir),
+                max_history=15,
+                seed=config.random_seed,
+            )
+            logger.info(f"✓ LSTM ADVANCED MODEL LOADED: {len(predictor.models)} models")
+            logger.info(f"✓ Process graph: {len(predictor.process_graph)} nodes")
+            logger.info(f"✓ Decision points: {len(predictor.decision_point_map)} DPs")
+            return predictor
+        except Exception as e:
+            import traceback
+            logger.error(f"!!! LSTM predictor load FAILED: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            logger.info("Falling back to auto-load")
+            return None
+    
+    # Basic mode - return None to trigger auto-load in engine
+    logger.info("Using engine auto-load for next activity prediction")
+    return None

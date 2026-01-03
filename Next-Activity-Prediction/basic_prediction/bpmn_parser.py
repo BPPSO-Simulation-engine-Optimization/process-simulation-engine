@@ -86,3 +86,7 @@ class BPMNParser:
                 'branches': self._trace_succeeding(gw_data['outgoing'], set())
             }
         return connections
+
+
+
+

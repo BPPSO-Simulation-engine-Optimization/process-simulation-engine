@@ -8,8 +8,8 @@ from pathlib import Path
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from bpmn_parser import BPMNParser
-from log_analyzer import LogAnalyzer
+from .bpmn_parser import BPMNParser
+from .log_analyzer import LogAnalyzer
 
 
 class BranchPredictor:
@@ -41,8 +41,8 @@ class BranchPredictor:
 
 
 def main():
-    model_path = Path("../models/branch_predictor.joblib")
-    log_path = "../Dataset/BPI Challenge 2017.xes"
+    model_path = Path("../../models/branch_predictor.joblib")
+    log_path = "../../Dataset/BPI Challenge 2017.xes"
 
     if not model_path.exists():
         print(f"Model not found at {model_path}")
@@ -108,3 +108,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+

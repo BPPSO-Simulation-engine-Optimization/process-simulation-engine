@@ -117,7 +117,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 
     # Setup predictors
     print("\nSetting up predictors...")
-    arrivals, proc_pred, attr_pred = setup_simulation(
+    arrivals, next_act_pred, proc_pred, attr_pred = setup_simulation(
         config,
         df=df if config.case_arrival_mode == "advanced" or config.case_attribute_mode == "advanced" else None,
         start_date=start_date,
@@ -139,6 +139,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
+        next_activity_predictor=next_act_pred,
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
