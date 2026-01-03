@@ -182,6 +182,9 @@ class ProcessingTimePredictionClass:
             self.numerical_features = metadata['numerical_features']
             self.feature_defaults = metadata['feature_defaults']
             
+            # Pre-compute feature plan for fast prediction
+            self._optimize_prediction_pipeline()
+            
             print(f"ML model loaded from {filepath}_*.joblib")
             
         elif self.method == "probabilistic_ml":
@@ -212,6 +215,99 @@ class ProcessingTimePredictionClass:
             self.y_std = metadata.get('y_std', 1.0)
             
             print(f"Probabilistic ML model loaded from {filepath}_*.joblib and {model_path}")
+
+    def _optimize_prediction_pipeline(self):
+        """Build optimized feature extraction plan for ML predictions."""
+        self.feature_plan = []
+        
+        # Map numerical features to scaler indices
+        num_feat_to_idx = {name: i for i, name in enumerate(self.numerical_features)}
+        
+        # Pre-process label encoders into fast lookup dicts
+        self.fast_encoders = {}
+        for col, le in self.label_encoders.items():
+            mapping = {cls: int(idx) for cls, idx in zip(le.classes_, le.transform(le.classes_))}
+            self.fast_encoders[col] = mapping
+
+        # Pre-fetch scaler params
+        if self.scaler is not None and hasattr(self.scaler, 'scale_') and hasattr(self.scaler, 'min_'):
+            scaler_scales = self.scaler.scale_
+            scaler_mins = self.scaler.min_
+        else:
+            scaler_scales = None
+            scaler_mins = None
+
+        for fname in self.feature_names:
+            plan_item = {'name': fname}
+            
+            # Determine processing type
+            # Note: feature_defaults should be used for missing values
+            default_val = self.feature_defaults.get(fname, 0.0)
+            
+            if fname in self.fast_encoders:
+                plan_item['type'] = 'categorical'
+                plan_item['mapping'] = self.fast_encoders[fname]
+                plan_item['default'] = default_val
+                
+                # Check if default needs mapping (usually "unknown")
+                if default_val in plan_item['mapping']:
+                    plan_item['default_int'] = plan_item['mapping'][default_val]
+                else:
+                    plan_item['default_int'] = 0
+            
+            elif fname in num_feat_to_idx:
+                plan_item['type'] = 'numerical'
+                idx = num_feat_to_idx[fname]
+                plan_item['default'] = default_val
+                
+                if scaler_scales is not None:
+                    plan_item['scale'] = scaler_scales[idx]
+                    plan_item['min'] = scaler_mins[idx]
+                else:
+                    plan_item['scale'] = 1.0
+                    plan_item['min'] = 0.0
+            
+            else:
+                plan_item['type'] = 'passthrough'
+                plan_item['default'] = default_val
+                
+            self.feature_plan.append(plan_item)
+
+    def _prepare_single_vector(self, feature_dict: Dict) -> np.ndarray:
+        """Optimized feature preparation for single prediction."""
+        # Use a list for faster construction than pre-allocating zeros sometimes? 
+        # Actually pre-allocating is better in numpy usually.
+        vec = np.zeros((1, len(self.feature_plan)), dtype=np.float32)
+        
+        for i, plan in enumerate(self.feature_plan):
+            fname = plan['name']
+            
+            val = feature_dict.get(fname, plan['default'])
+            if val is None:
+                val = plan['default']
+
+            if plan['type'] == 'numerical':
+                try:
+                    val_float = float(val)
+                except (ValueError, TypeError):
+                    val_float = float(plan['default'])
+                
+                vec[0, i] = val_float * plan['scale'] + plan['min']
+                
+            elif plan['type'] == 'categorical':
+                val_str = str(val)
+                if val_str in plan['mapping']:
+                    vec[0, i] = plan['mapping'][val_str]
+                else:
+                    vec[0, i] = plan.get('default_int', 0.0) # Fallback for unknown category
+                    
+            else:
+                try:
+                    vec[0, i] = float(val)
+                except (ValueError, TypeError):
+                     vec[0, i] = 0.0
+
+        return vec
 
     def predict(
         self,
@@ -303,17 +399,25 @@ class ProcessingTimePredictionClass:
                     prev_activity, prev_lifecycle, curr_activity, curr_lifecycle, context
                 )
                 
-                df_features = pd.DataFrame([feature_dict])
-                df_prepared = self._prepare_features(df_features)
-                
-                missing_features = set(self.feature_names) - set(df_prepared.columns)
-                if missing_features:
-                    for feat in missing_features:
-                        df_prepared[feat] = self.feature_defaults.get(feat, 0.0)
-                
-                df_prepared = df_prepared[self.feature_names]
-                
-                prediction = self.ml_model.predict(df_prepared)[0]
+                # Optimized path: avoid DataFrame overhead
+                if hasattr(self, 'feature_plan'):
+                    X = self._prepare_single_vector(feature_dict)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message="X does not have valid feature names")
+                        prediction = self.ml_model.predict(X)[0]
+                else:
+                    # Legacy fallback
+                    df_features = pd.DataFrame([feature_dict])
+                    df_prepared = self._prepare_features(df_features)
+                    
+                    missing_features = set(self.feature_names) - set(df_prepared.columns)
+                    if missing_features:
+                        for feat in missing_features:
+                            df_prepared[feat] = self.feature_defaults.get(feat, 0.0)
+                    
+                    df_prepared = df_prepared[self.feature_names]
+                    prediction = self.ml_model.predict(df_prepared)[0]
+
                 prediction = max(0.0, float(prediction))
                 
                 return prediction
