@@ -11,6 +11,13 @@ from .models import SequenceEncoder, ContextEncoder, LSTMPredictor
 from .evaluation import ModelEvaluator, FeatureImportanceAnalyzer
 from .parsers import BPMNParser
 from .storage import ModelPersistence
+from .api import load_models, predict_next_activity
+from .simulation import (
+    load_simulation_assets,
+    decision_function_advanced,
+    simulate_cases_advanced,
+    events_to_dataframe,
+)
 
 # Backward-compatible function aliases
 from .preprocessing.decision_points import extract_bpmn_decision_point_map
@@ -41,6 +48,12 @@ __all__ = [
     "BPMNParser",
     "AdvancedBPMNParser",
     "ModelPersistence",
+    "load_models",
+    "predict_next_activity",
+    "load_simulation_assets",
+    "decision_function_advanced",
+    "simulate_cases_advanced",
+    "events_to_dataframe",
     # Legacy functions - preprocessing
     "extract_bpmn_decision_point_map",
     "generate_enriched_training_sets_simple",

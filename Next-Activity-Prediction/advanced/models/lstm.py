@@ -1,9 +1,11 @@
 import tensorflow as tf
+import keras
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.layers import Input, Embedding, LSTM, Dense, Concatenate, Lambda
 from tensorflow.keras.models import Model
 
 
+@keras.saving.register_keras_serializable(package="CustomLayers")
 def _expand_and_cast(x):
     return tf.cast(tf.expand_dims(x, axis=-1), tf.float32)
 

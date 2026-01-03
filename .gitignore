@@ -4,3 +4,5 @@ Docs/*
 models/*.joblib
 models/*.keras
 __pycache__/
+Next-Activity-Prediction/advanced/models_lstm_new/*
+Next-Activity-Prediction/advanced/data/*

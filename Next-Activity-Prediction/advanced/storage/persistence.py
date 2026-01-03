@@ -1,9 +1,11 @@
 import os
 import joblib
+import keras
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
 
+@keras.saving.register_keras_serializable(package="CustomLayers")
 def _expand_and_cast(x):
     return tf.cast(tf.expand_dims(x, axis=-1), tf.float32)
 
@@ -38,7 +40,7 @@ class ModelPersistence:
     def load(cls, directory):
         model = load_model(
             os.path.join(directory, cls.MODEL_FILE),
-            custom_objects={"expand_and_cast": _expand_and_cast},
+            custom_objects={"_expand_and_cast": _expand_and_cast},
             safe_mode=False,
         )
 
