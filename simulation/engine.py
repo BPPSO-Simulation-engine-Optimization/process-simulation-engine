@@ -49,7 +49,10 @@ logger = logging.getLogger(__name__)
 class WaitingWork:
     """Represents work waiting for a resource."""
     case_id: str
+    # Original activity label used for logging/simulation semantics
     activity: str
+    # Normalized label used for permission/availability checks and queue routing
+    allocation_activity: str
     arrival_time: datetime  # When the work arrived (for FIFO ordering)
     case_state: CaseState
 
@@ -78,7 +81,7 @@ class ResourcePool:
         # resource_id -> (busy_until, case_id, activity)
         self._busy_resources: Dict[str, tuple] = {}
 
-        # activity -> list of WaitingWork (heap ordered by arrival time)
+        # allocation_activity -> list of WaitingWork (heap ordered by arrival time)
         self._waiting_queues: Dict[str, List[WaitingWork]] = defaultdict(list)
 
         # Reference to availability model for working hours checks
@@ -120,9 +123,9 @@ class ResourcePool:
 
     def add_to_waiting_queue(self, work: WaitingWork) -> None:
         """Add work to the waiting queue for its activity."""
-        heapq.heappush(self._waiting_queues[work.activity], work)
+        heapq.heappush(self._waiting_queues[work.allocation_activity], work)
         self.stats['total_waits'] += 1
-        queue_len = len(self._waiting_queues[work.activity])
+        queue_len = len(self._waiting_queues[work.allocation_activity])
         if queue_len > self.stats['max_queue_length']:
             self.stats['max_queue_length'] = queue_len
 
@@ -262,6 +265,7 @@ class DESEngine:
         case_arrival_predictor: CaseArrivalPredictor = None,
         case_attribute_predictor: CaseAttributePredictor = None,
         start_time: datetime = None,
+        max_activities_per_case: int = 500,
     ):
         """
         Initialize the DES Engine.
@@ -303,6 +307,9 @@ class DESEngine:
                 "Use AttributeSimulationEngine from case_attribute_prediction.simulator"
             )
         self._case_attribute = case_attribute_predictor
+
+        # Safety: prevent infinite loops in process graph simulation
+        self._max_activities_per_case = max_activities_per_case
 
         # Resource pool for dynamic busy tracking and waiting queue
         self.resource_pool = ResourcePool(
@@ -553,6 +560,18 @@ class DESEngine:
         # Record activity in case history
         case.add_activity(event.activity, event.resource)
 
+        # Safety guard: if a case keeps looping, stop it instead of hanging the run
+        if self._max_activities_per_case and len(case.activity_history) >= self._max_activities_per_case:
+            logger.warning(
+                f"Case {event.case_id} hit max_activities_per_case={self._max_activities_per_case}; "
+                f"ending to avoid infinite loop (last={case.activity_history[-1]})."
+            )
+            log_record = event.to_log_record()
+            log_record.update(case.get_payload())
+            self.completed_events.append(log_record)
+            self._schedule_case_end(event.case_id, event.timestamp)
+            return
+
         # Log the event for export
         log_record = event.to_log_record()
         log_record.update(case.get_payload())
@@ -578,14 +597,14 @@ class DESEngine:
             return
 
         # Check which activities this resource is eligible for
-        for activity in waiting_activities:
+        for allocation_activity in waiting_activities:
             # Check if freed resource is eligible for this activity
             try:
                 eligible = self.allocator.permissions.get_eligible_resources(
-                    activity, timestamp=current_time
+                    allocation_activity, timestamp=current_time
                 )
             except TypeError:
-                eligible = self.allocator.permissions.get_eligible_resources(activity)
+                eligible = self.allocator.permissions.get_eligible_resources(allocation_activity)
 
             if freed_resource not in eligible:
                 continue
@@ -595,14 +614,14 @@ class DESEngine:
                 continue
 
             # Found matching work - dispatch it
-            waiting_work = self.resource_pool.get_waiting_work(activity)
+            waiting_work = self.resource_pool.get_waiting_work(allocation_activity)
             if waiting_work:
                 # Calculate wait time for stats
                 wait_seconds = (current_time - waiting_work.arrival_time).total_seconds()
                 self.stats['wait_time_total_seconds'] += wait_seconds
 
                 logger.debug(
-                    f"Dispatching waiting {activity} for case {waiting_work.case_id} "
+                    f"Dispatching waiting {waiting_work.activity} for case {waiting_work.case_id} "
                     f"to {freed_resource} (waited {wait_seconds:.0f}s)"
                 )
 
@@ -625,8 +644,16 @@ class DESEngine:
     def _schedule_activity(self, case_id: str, activity: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
+        # Some activities are control-flow artifacts (e.g., decision points) and must not
+        # require an organizational resource.
+        if not self._activity_requires_resource(activity):
+            self._schedule_activity_without_resource(case_id, activity, current_time, case)
+            return
+
+        allocation_activity = self._normalize_activity_for_resources(activity)
+
         # Try to allocate a resource (with dynamic busy checking)
-        resource, failure_reason = self._try_allocate_resource_with_reason(activity, current_time, case)
+        resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
 
         if resource is None:
             # No resource available - add to waiting queue
@@ -634,6 +661,7 @@ class DESEngine:
             waiting_work = WaitingWork(
                 case_id=case_id,
                 activity=activity,
+                allocation_activity=allocation_activity,
                 arrival_time=current_time,
                 case_state=case,
             )
@@ -656,6 +684,77 @@ class DESEngine:
         self._schedule_activity_with_resource(
             case_id, activity, current_time, case, resource
         )
+
+    def _activity_requires_resource(self, activity: Optional[str]) -> bool:
+        """Return True if this activity needs an org resource assignment."""
+        if not activity:
+            return True
+        # Decision points / process gateways are not executed by a human resource.
+        return not (activity.startswith('DP ') or activity.startswith('PG '))
+
+    def _normalize_activity_for_resources(self, activity: str) -> str:
+        """Normalize activity labels to match the resource permission model."""
+        # Do not normalize control-flow artifacts (already treated as resource-free)
+        if not activity or activity.startswith('DP ') or activity.startswith('PG '):
+            return activity
+
+        # Many parts of this project generate duplicate labels to avoid loops
+        # (e.g., "W_Complete application 1", "A_Cancelled 2").
+        # The permission model is typically trained on the base label.
+        parts = activity.rsplit(' ', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            base = parts[0].strip()
+            return base or activity
+        return activity
+
+    def _schedule_activity_without_resource(
+        self,
+        case_id: str,
+        activity: str,
+        current_time: datetime,
+        case: CaseState,
+    ) -> None:
+        """Schedule an activity completion without allocating any resource."""
+        prev_activity = case.activity_history[-1] if case.activity_history else "START"
+
+        # Many learned processing-time models won't know DP/PG labels.
+        # For control-flow artifacts, treat duration as instantaneous.
+        processing_seconds = 0.0
+        try:
+            processing_seconds = float(self._processing_time.predict(
+                prev_activity=prev_activity,
+                prev_lifecycle="complete",
+                curr_activity=activity,
+                curr_lifecycle="complete",
+                context={
+                    'hour': current_time.hour,
+                    'weekday': current_time.weekday(),
+                    'month': current_time.month,
+                    'day_of_year': current_time.timetuple().tm_yday,
+                    'case:LoanGoal': case.case_type,
+                    'case:ApplicationType': case.application_type,
+                    'event_position_in_case': len(case.activity_history) + 1,
+                    'case_duration_so_far': (current_time - case.start_time).total_seconds() if case.start_time else 0.0,
+                    'resource_1': case.current_resource or 'unknown',
+                    'resource_2': 'none',
+                    'Accepted': case.accepted,
+                    'Selected': case.selected,
+                },
+            ))
+        except Exception:
+            processing_seconds = 0.0
+
+        completion_time = current_time + timedelta(seconds=processing_seconds)
+
+        event = SimulationEvent(
+            timestamp=completion_time,
+            event_type=EventType.ACTIVITY_COMPLETE,
+            case_id=case_id,
+            activity=activity,
+            resource=None,
+            payload=case.get_payload(),
+        )
+        self.queue.schedule(event)
 
     def _try_allocate_resource_with_reason(self, activity: str, timestamp: datetime,
                                             case: CaseState) -> tuple:
@@ -954,15 +1053,22 @@ class LSTMNextActivityPredictor:
     ):
         """Load LSTM models, process graph, and decision point map."""
         import sys
+        import importlib
         from pathlib import Path
         
-        # Add advanced module to path
-        advanced_path = Path(__file__).parent.parent / "Next-Activity-Prediction" / "advanced"
-        if str(advanced_path) not in sys.path:
-            sys.path.insert(0, str(advanced_path))
-        
-        from api import load_models
-        from simulation import load_simulation_assets, decision_function_advanced
+        # Add Next-Activity-Prediction parent to sys.path.
+        # IMPORTANT: avoid importing a top-level module named "simulation" here, because
+        # this project already has a package named "simulation".
+        na_root = Path(__file__).parent.parent / "Next-Activity-Prediction"
+        if str(na_root) not in sys.path:
+            sys.path.insert(0, str(na_root))
+
+        advanced_api = importlib.import_module("advanced.api")
+        advanced_sim = importlib.import_module("advanced.simulation")
+
+        load_models = advanced_api.load_models
+        load_simulation_assets = advanced_sim.load_simulation_assets
+        decision_function_advanced = advanced_sim.decision_function_advanced
         
         self.models = load_models(models_dir)
         self.process_graph, self.decision_point_map = load_simulation_assets()
@@ -1010,6 +1116,19 @@ class LSTMNextActivityPredictor:
             logger.debug(f"No DP for {current}, random choice from {next_options}")
             next_act = self.rng.choice(next_options)
             return next_act, next_act in self.END_ACTIVITIES
+
+        # Use outgoing activities from decision point map (matches advanced/simulation.py)
+        dp_info = self.decision_point_map.get(decision_point, {})
+        decision_options_raw = dp_info.get('outgoing', next_options)
+
+        # Filter out DPs/PGs; engine will still handle them, but feeding real activities
+        # to the LSTM decision improves stability and avoids DP->DP loops.
+        decision_options = [
+            act for act in decision_options_raw
+            if not (act.startswith('DP ') or act.startswith('PG '))
+        ]
+        if not decision_options:
+            decision_options = list(decision_options_raw)
         
         # Convert CaseState to history format
         history = self._case_state_to_history(case_state)
@@ -1018,7 +1137,7 @@ class LSTMNextActivityPredictor:
             next_act, prob = self.decision_function(
                 current_dp=decision_point,
                 history=history,
-                options=next_options,
+                options=decision_options,
                 models=self.models,
                 decision_point_map=self.decision_point_map,
                 process_graph=self.process_graph,
