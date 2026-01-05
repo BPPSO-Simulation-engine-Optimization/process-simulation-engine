@@ -335,13 +335,23 @@ class DESEngine:
         Auto-load next activity predictor based on available models.
         
         Priority:
-        1. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
-        2. BranchPredictor model (models/branch_predictor.joblib)
-        3. Stub predictor (fallback)
+        1. Unified model (models/unified_next_activity/) - best for avoiding loops
+        2. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
+        3. BranchPredictor model (models/branch_predictor.joblib)
+        4. Stub predictor (fallback)
         """
         from pathlib import Path
         
-        # Try LSTM models first
+        # Try Unified model first (best for avoiding loops)
+        unified_model_dir = Path(UnifiedNextActivityPredictor.DEFAULT_MODEL_PATH)
+        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
+            try:
+                logger.info("Loading UnifiedNextActivityPredictor...")
+                return UnifiedNextActivityPredictor(str(unified_model_dir))
+            except Exception as e:
+                logger.warning(f"Could not load Unified predictor: {e}")
+        
+        # Try LSTM models
         lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
         if lstm_models_dir.exists() and any(lstm_models_dir.iterdir()):
             try:
@@ -1165,6 +1175,61 @@ class LSTMNextActivityPredictor:
             })
         
         return history
+
+
+class UnifiedNextActivityPredictor:
+    """
+    Unified next activity predictor using dual-output LSTM model.
+    
+    Predicts both activity AND lifecycle to avoid simulation loops.
+    Uses repetition penalty on seen (activity, lifecycle) pairs.
+    """
+    
+    END_ACTIVITIES = {"A_Cancelled", "A_Complete", "End"}
+    START_ACTIVITY = "A_Create Application"
+    DEFAULT_MODEL_PATH = "models/unified_next_activity"
+    
+    def __init__(self, model_path: str = None, max_history: int = 15, seed: int = 42):
+        """Initialize the unified predictor."""
+        self.rng = random.Random(seed)
+        self.max_history = max_history
+        model_path = model_path or self.DEFAULT_MODEL_PATH
+        
+        # Import and load the unified predictor
+        from pathlib import Path
+        import sys
+        import importlib
+        
+        # Add Next-Activity-Prediction to path (so we can import advanced.unified)
+        project_root = Path(__file__).parent.parent
+        na_root = project_root / "Next-Activity-Prediction"
+        if str(na_root) not in sys.path:
+            sys.path.insert(0, str(na_root))
+        
+        # Import the unified predictor module
+        # Import parent packages first to ensure package structure is recognized
+        # This ensures relative imports in predictor.py (like "from .persistence") work correctly
+        try:
+            # Import in order to establish package hierarchy
+            import advanced
+            import advanced.unified
+            # Now import the predictor module - relative imports should work
+            predictor_module = importlib.import_module("advanced.unified.predictor")
+            _Impl = predictor_module.UnifiedNextActivityPredictor
+        except ImportError as e:
+            logger.error(f"Failed to import unified predictor: {e}")
+            logger.error(f"Python path: {sys.path[:3]}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+        
+        self._impl = _Impl(model_path=model_path, max_history=max_history, seed=seed)
+        
+        logger.info(f"Loaded UnifiedNextActivityPredictor from {model_path}")
+    
+    def predict(self, case_state: CaseState) -> tuple[str, bool]:
+        """Predict next activity using unified model."""
+        return self._impl.predict(case_state)
 
 
 class BranchNextActivityPredictor:

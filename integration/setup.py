@@ -260,15 +260,33 @@ def _setup_next_activity(config: SimulationConfig) -> Any:
     """
     Set up next activity predictor based on config.
     
-    Returns LSTMNextActivityPredictor if in advanced mode and models exist,
-    otherwise returns None (engine will auto-load).
+    Returns predictor based on mode:
+    - "advanced": UnifiedNextActivityPredictor (preferred) or LSTMNextActivityPredictor
+    - "basic": None (engine will auto-load)
     """
     from pathlib import Path
     
     if config.next_activity_mode == "advanced":
-        logger.info("Setting up advanced next activity predictor (LSTM)...")
+        # Try Unified model first (best for avoiding loops)
+        unified_model_dir = Path("models/unified_next_activity")
+        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
+            logger.info("Setting up advanced next activity predictor (Unified)...")
+            try:
+                from simulation.engine import UnifiedNextActivityPredictor
+                predictor = UnifiedNextActivityPredictor(
+                    model_path=str(unified_model_dir),
+                    max_history=15,
+                    seed=config.random_seed,
+                )
+                logger.info("✓ UNIFIED ADVANCED MODEL LOADED")
+                return predictor
+            except Exception as e:
+                import traceback
+                logger.warning(f"Unified predictor load failed: {e}")
+                logger.debug(f"Traceback:\n{traceback.format_exc()}")
         
-        # Import LSTMNextActivityPredictor from simulation.engine module
+        # Fall back to LSTM models
+        logger.info("Setting up advanced next activity predictor (LSTM)...")
         from simulation.engine import LSTMNextActivityPredictor
         
         lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
