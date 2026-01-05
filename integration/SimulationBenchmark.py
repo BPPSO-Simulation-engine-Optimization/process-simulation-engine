@@ -18,6 +18,15 @@ except ImportError:
     PM4PY_AVAILABLE = False
     warnings.warn("pm4py not available. XES file loading will not work.")
 
+try:
+    from sklearn.metrics import classification_report, precision_recall_fscore_support, accuracy_score
+    from sklearn.preprocessing import LabelBinarizer
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    warnings.warn("sklearn not available. Next activity prediction metrics will not work.")
+
 warnings.filterwarnings('ignore')
 
 
@@ -118,7 +127,7 @@ class SimulationBenchmark:
             
             # Ensure timestamp is datetime
             if 'timestamp' in log.columns:
-                log['timestamp'] = pd.to_datetime(log['timestamp'])
+                log['timestamp'] = pd.to_datetime(log['timestamp'], format='mixed')
                 
     def compute_all_metrics(self) -> Dict:
         """
@@ -167,6 +176,10 @@ class SimulationBenchmark:
         # Activity durations (time to next event)
         print("  - Activity durations...")
         self.results['activity_durations'] = self._compare_activity_durations()
+        
+        # Next Activity Prediction metrics
+        print("  - Next Activity Prediction metrics...")
+        self.results['next_activity_metrics'] = self._compute_next_activity_metrics()
         
         # Resource statistics (if available)
         if 'resource' in self.original_log.columns and 'resource' in self.simulated_log.columns:
@@ -614,6 +627,159 @@ class SimulationBenchmark:
         pairs = list(zip(log['activity'], log['resource']))
         return Counter(pairs)
     
+    def _multiclass_roc_auc_score(self, y_test, y_pred, average='macro'):
+        """Calculate multiclass ROC AUC score using LabelBinarizer."""
+        lb = LabelBinarizer()
+        lb.fit(y_test)
+        y_test_bin = lb.transform(y_test)
+        y_pred_bin = lb.transform(y_pred)
+        return roc_auc_score(y_test_bin, y_pred_bin, average=average)
+    
+    def _multiclass_pr_auc_score(self, y_test, y_pred, average='macro'):
+        """Calculate multiclass PR AUC score using LabelBinarizer."""
+        lb = LabelBinarizer()
+        lb.fit(y_test)
+        y_test_bin = lb.transform(y_test)
+        y_pred_bin = lb.transform(y_pred)
+        return average_precision_score(y_test_bin, y_pred_bin, average=average)
+    
+    def _compute_next_activity_metrics(self) -> Dict:
+        """
+        Compute Next Activity Prediction metrics by comparing simulated vs original logs.
+        
+        Uses sklearn classification metrics similar to LSTM next activity prediction:
+        - Classification report (precision, recall, f1-score per class)
+        - Macro-averaged metrics
+        - Weighted metrics
+        - AUC and AUC-PR scores
+        
+        Returns:
+            Dictionary with classification report and all metrics
+        """
+        if not SKLEARN_AVAILABLE:
+            return {
+                'error': 'sklearn not available. Install with: pip install scikit-learn'
+            }
+        
+        try:
+            # Align next activity sequences between logs
+            y_true, y_pred = self._align_next_activity_sequences()
+            
+            if len(y_true) == 0 or len(y_pred) == 0:
+                return {
+                    'error': 'Could not align sequences between logs',
+                    'note': 'Original and simulated logs have different case structures'
+                }
+            
+            # Calculate macro-averaged metrics
+            precision, recall, fscore, support = precision_recall_fscore_support(
+                y_true, y_pred, average='macro', zero_division=0
+            )
+            
+            # Calculate weighted metrics
+            precision_weighted, recall_weighted, fscore_weighted, _ = precision_recall_fscore_support(
+                y_true, y_pred, average='weighted', zero_division=0
+            )
+            
+            # Calculate accuracy
+            accuracy = accuracy_score(y_true, y_pred)
+            
+            # Calculate AUC scores
+            try:
+                auc_score_macro = self._multiclass_roc_auc_score(y_true, y_pred, average='macro')
+                prauc_score_macro = self._multiclass_pr_auc_score(y_true, y_pred, average='macro')
+            except Exception as e:
+                auc_score_macro = f"Error: {str(e)}"
+                prauc_score_macro = f"Error: {str(e)}"
+            
+            # Generate classification report as string
+            class_report_str = classification_report(y_true, y_pred, digits=3, zero_division=0)
+            
+            # Generate classification report as dict for detailed analysis
+            class_report_dict = classification_report(y_true, y_pred, digits=3, 
+                                                     output_dict=True, zero_division=0)
+            
+            # Extract per-class metrics for DataFrame
+            per_class_metrics = []
+            for activity, metrics in class_report_dict.items():
+                if activity not in ['accuracy', 'macro avg', 'weighted avg']:
+                    if isinstance(metrics, dict):
+                        per_class_metrics.append({
+                            'Activity': activity,
+                            'Precision': metrics['precision'],
+                            'Recall': metrics['recall'],
+                            'F1-Score': metrics['f1-score'],
+                            'Support': int(metrics['support'])
+                        })
+            
+            per_class_df = pd.DataFrame(per_class_metrics).sort_values('Support', ascending=False)
+            
+            return {
+                'classification_report': class_report_str,
+                'overall_metrics': {
+                    'Accuracy': accuracy,
+                    'Precision (Macro)': precision,
+                    'Recall (Macro)': recall,
+                    'F1-Score (Macro)': fscore,
+                    'Precision (Weighted)': precision_weighted,
+                    'Recall (Weighted)': recall_weighted,
+                    'F1-Score (Weighted)': fscore_weighted,
+                    'AUC (Macro)': auc_score_macro,
+                    'AUC-PR (Macro)': prauc_score_macro,
+                    'Total Samples': len(y_true)
+                },
+                'per_class_metrics': per_class_df,
+                'confusion_summary': {
+                    'Total Predictions': len(y_pred),
+                    'Correct Predictions': int((y_true == y_pred).sum()),
+                    'Incorrect Predictions': int((y_true != y_pred).sum()),
+                    'Accuracy Rate': float((y_true == y_pred).sum() / len(y_true))
+                }
+            }
+        
+        except Exception as e:
+            return {
+                'error': f'Error computing next activity metrics: {str(e)}'
+            }
+    
+    def _align_next_activity_sequences(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Align next activity sequences between original and simulated logs.
+        
+        Creates aligned pairs of (actual_next_activity, predicted_next_activity)
+        by comparing traces from both logs position by position. Since case IDs differ,
+        we compare cases by their order (first case in original vs first case in simulated).
+        
+        Returns:
+            Tuple of (y_true, y_pred) as numpy arrays
+        """
+        y_true = []
+        y_pred = []
+        
+        # Get sorted list of cases from both logs
+        orig_cases = sorted(self.original_log['case_id'].unique())
+        sim_cases = sorted(self.simulated_log['case_id'].unique())
+        
+        # Compare up to the minimum number of cases
+        num_cases = min(len(orig_cases), len(sim_cases))
+        
+        for i in range(num_cases):
+            orig_case = self.original_log[self.original_log['case_id'] == orig_cases[i]].sort_values('timestamp')
+            sim_case = self.simulated_log[self.simulated_log['case_id'] == sim_cases[i]].sort_values('timestamp')
+            
+            orig_activities = orig_case['activity'].tolist()
+            sim_activities = sim_case['activity'].tolist()
+            
+            # Align by position (take minimum length to avoid index errors)
+            min_len = min(len(orig_activities), len(sim_activities))
+            
+            # For each position (except last), compare next activity
+            for j in range(min_len - 1):
+                y_true.append(orig_activities[j + 1])
+                y_pred.append(sim_activities[j + 1])
+        
+        return np.array(y_true), np.array(y_pred)
+    
     def print_summary(self):
         """Print all comparison results in a formatted way."""
         if not self.results:
@@ -669,6 +835,36 @@ class SimulationBenchmark:
         print("\n### ACTIVITY DURATIONS (Time to Next Event) ###")
         print(self.results['activity_durations'].to_string(index=False))
         
+        # Next Activity Prediction Metrics
+        if 'next_activity_metrics' in self.results:
+            print("\n### NEXT ACTIVITY PREDICTION METRICS ###")
+            nap_metrics = self.results['next_activity_metrics']
+            
+            if 'error' in nap_metrics:
+                print(f"Error: {nap_metrics['error']}")
+                if 'note' in nap_metrics:
+                    print(f"Note: {nap_metrics['note']}")
+            else:
+                # Overall metrics
+                print("\nOverall Metrics:")
+                for metric, value in nap_metrics['overall_metrics'].items():
+                    if isinstance(value, float):
+                        print(f"  {metric}: {value:.4f}")
+                    else:
+                        print(f"  {metric}: {value}")
+                
+                # Classification report
+                print("\nDetailed Classification Report:")
+                print(nap_metrics['classification_report'])
+                
+                # Confusion summary
+                print("\nPrediction Summary:")
+                for key, value in nap_metrics['confusion_summary'].items():
+                    if isinstance(value, float):
+                        print(f"  {key}: {value:.4f}")
+                    else:
+                        print(f"  {key}: {value}")
+        
         # Resources (if available)
         if 'resource_stats' in self.results:
             print("\n### RESOURCE STATISTICS ###")
@@ -706,6 +902,22 @@ class SimulationBenchmark:
             self.results['end_activities'].to_excel(writer, sheet_name='End Activities', index=False)
             self.results['activity_durations'].to_excel(writer, sheet_name='Activity Durations', index=False)
             
+            # Next Activity Prediction Metrics
+            if 'next_activity_metrics' in self.results:
+                nap = self.results['next_activity_metrics']
+                if 'error' not in nap:
+                    # Overall metrics
+                    overall_df = pd.DataFrame([nap['overall_metrics']])
+                    overall_df.to_excel(writer, sheet_name='NAP Overall', index=False)
+                    
+                    # Per-class metrics
+                    if 'per_class_metrics' in nap and not nap['per_class_metrics'].empty:
+                        nap['per_class_metrics'].to_excel(writer, sheet_name='NAP Per Class', index=False)
+                    
+                    # Confusion summary
+                    confusion_df = pd.DataFrame([nap['confusion_summary']])
+                    confusion_df.to_excel(writer, sheet_name='NAP Confusion', index=False)
+            
             if 'resource_stats' in self.results:
                 self.results['resource_stats'].to_excel(writer, sheet_name='Resource Stats', index=False)
                 self.results['activity_resource'].to_excel(writer, sheet_name='Activity-Resource', index=False)
@@ -717,8 +929,8 @@ class SimulationBenchmark:
 if __name__ == "__main__":
     # Option 1: Direkt .xes Dateien laden
     benchmark = SimulationBenchmark(
-        'integration/output/ground_truth_log.xes',  # Original BPIC 2017 Log (possible subset)
-        'integration/output/simulated_log.xes'  # Simulated Log
+        'integration/output/ground_truth_log_100.csv',  # Original BPIC 2017 Log (possible subset)
+        'simulated_log_100.csv'  # Simulated Log
     )
     
     # Analyse durchführen
