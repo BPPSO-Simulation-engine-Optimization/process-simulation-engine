@@ -261,13 +261,46 @@ def _setup_next_activity(config: SimulationConfig) -> Any:
     Set up next activity predictor based on config.
     
     Returns predictor based on mode:
-    - "advanced": UnifiedNextActivityPredictor (preferred) or LSTMNextActivityPredictor
+    - "advanced": BPIC17SimplifiedPredictor (preferred), UnifiedNextActivityPredictor, or LSTMNextActivityPredictor
     - "basic": None (engine will auto-load)
     """
     from pathlib import Path
+    import sys
+    import importlib
     
     if config.next_activity_mode == "advanced":
-        # Try Unified model first (best for avoiding loops)
+        # Try BPIC17 Simplified model first (optimized for start/complete lifecycle)
+        bpic17_model_dir = Path("models/bpic17_simplified")
+        if bpic17_model_dir.exists() and (bpic17_model_dir / "model.keras").exists():
+            logger.info("Setting up advanced next activity predictor (BPIC17 Simplified)...")
+            try:
+                # Add Next-Activity-Prediction to path
+                project_root = Path(__file__).parent.parent
+                na_root = project_root / "Next-Activity-Prediction"
+                if str(na_root) not in sys.path:
+                    sys.path.insert(0, str(na_root))
+                
+                # Try importing the predictor
+                try:
+                    from bpic17_simplified import BPIC17SimplifiedPredictor
+                except ImportError:
+                    # Try alternative import path
+                    predictor_module = importlib.import_module("bpic17_simplified.predictor")
+                    BPIC17SimplifiedPredictor = predictor_module.BPIC17SimplifiedPredictor
+                
+                predictor = BPIC17SimplifiedPredictor(
+                    model_path=str(bpic17_model_dir),
+                    max_history=15,
+                    seed=config.random_seed,
+                )
+                logger.info("✓ BPIC17 SIMPLIFIED MODEL LOADED")
+                return predictor
+            except Exception as e:
+                import traceback
+                logger.warning(f"BPIC17 Simplified predictor load failed: {e}")
+                logger.debug(f"Traceback:\n{traceback.format_exc()}")
+        
+        # Try Unified model (best for avoiding loops)
         unified_model_dir = Path("models/unified_next_activity")
         if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
             logger.info("Setting up advanced next activity predictor (Unified)...")

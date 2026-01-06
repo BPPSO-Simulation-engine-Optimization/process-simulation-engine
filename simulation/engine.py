@@ -335,14 +335,41 @@ class DESEngine:
         Auto-load next activity predictor based on available models.
         
         Priority:
-        1. Unified model (models/unified_next_activity/) - best for avoiding loops
-        2. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
-        3. BranchPredictor model (models/branch_predictor.joblib)
-        4. Stub predictor (fallback)
+        1. BPIC17 Simplified model (models/bpic17_simplified/) - optimized for start/complete lifecycle
+        2. Unified model (models/unified_next_activity/) - best for avoiding loops
+        3. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
+        4. BranchPredictor model (models/branch_predictor.joblib)
+        5. Stub predictor (fallback)
         """
         from pathlib import Path
         
-        # Try Unified model first (best for avoiding loops)
+        # Try BPIC17 Simplified model first (optimized for start/complete lifecycle)
+        bpic17_model_dir = Path("models/bpic17_simplified")
+        if bpic17_model_dir.exists() and (bpic17_model_dir / "model.keras").exists():
+            try:
+                logger.info("Loading BPIC17SimplifiedPredictor...")
+                import sys
+                import importlib
+                
+                # Add Next-Activity-Prediction to path
+                project_root = Path(__file__).parent.parent
+                na_root = project_root / "Next-Activity-Prediction"
+                if str(na_root) not in sys.path:
+                    sys.path.insert(0, str(na_root))
+                
+                # Try importing the predictor
+                try:
+                    from bpic17_simplified import BPIC17SimplifiedPredictor
+                except ImportError:
+                    # Try alternative import path
+                    predictor_module = importlib.import_module("bpic17_simplified.predictor")
+                    BPIC17SimplifiedPredictor = predictor_module.BPIC17SimplifiedPredictor
+                
+                return BPIC17SimplifiedPredictor(str(bpic17_model_dir))
+            except Exception as e:
+                logger.warning(f"Could not load BPIC17 Simplified predictor: {e}")
+        
+        # Try Unified model (best for avoiding loops)
         unified_model_dir = Path(UnifiedNextActivityPredictor.DEFAULT_MODEL_PATH)
         if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
             try:
@@ -370,7 +397,7 @@ class DESEngine:
         
         # Last resort: stub
         logger.info("Using stub next activity predictor "
-                   "(train model with: python Next-Activity-Prediction/train.py)")
+                   "(train model with: python Next-Activity-Prediction/bpic17_simplified/train.py)")
         return _StubNextActivityPredictor()
     
     def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
