@@ -95,7 +95,7 @@ class LifecycleFilter:
             - resource = resource from complete event (who finished it)
             - timestamp = complete_timestamp (when activity finished)
 
-        For activities with only complete (O_* activities):
+        For activities with only complete (O_*/A_* activities):
             - processing_time = 0 (instant/automatic)
             - resource = resource from complete event
             - timestamp = complete_timestamp
@@ -109,72 +109,63 @@ class LifecycleFilter:
         if filtered_df is None:
             filtered_df = self.filter_lifecycle()
 
-        # Sort by case, activity, timestamp
-        df = filtered_df.sort_values(
-            [self.CASE_COLUMN, self.ACTIVITY_COLUMN, self.TIMESTAMP_COLUMN]
-        ).reset_index(drop=True)
+        df = filtered_df.copy()
 
-        # Identify activities that have start events
+        # Identify activities that have start events (only W_* activities)
         activities_with_start = set(
             df[df[self.LIFECYCLE_COLUMN] == "start"][self.ACTIVITY_COLUMN].unique()
         )
 
-        collapsed_rows = []
+        # Split into complete events (our output base) and start events (for pairing)
+        completes = df[df[self.LIFECYCLE_COLUMN] == "complete"].copy()
+        starts = df[df[self.LIFECYCLE_COLUMN] == "start"].copy()
 
-        # Process each case
-        for case_id, case_group in df.groupby(self.CASE_COLUMN):
-            # Separate start and complete events
-            starts = case_group[case_group[self.LIFECYCLE_COLUMN] == "start"]
-            completes = case_group[case_group[self.LIFECYCLE_COLUMN] == "complete"]
+        # Initialize processing_time to 0 for all complete events
+        completes["processing_time"] = 0.0
 
-            # Index starts by activity for quick lookup
-            # Store as list of (timestamp, row_dict) tuples for proper comparison
-            start_events = {}
-            for _, row in starts.iterrows():
-                activity = row[self.ACTIVITY_COLUMN]
-                if activity not in start_events:
-                    start_events[activity] = []
-                # Store as tuple (timestamp, row_dict) for easier comparison
-                start_events[activity].append((row[self.TIMESTAMP_COLUMN], row.to_dict()))
+        # Only process activities that have start events (W_* activities)
+        if len(activities_with_start) > 0 and len(starts) > 0:
+            # Filter to only work activities for pairing
+            work_completes = completes[completes[self.ACTIVITY_COLUMN].isin(activities_with_start)].copy()
+            work_starts = starts[starts[self.ACTIVITY_COLUMN].isin(activities_with_start)].copy()
 
-            # Process each complete event
-            for _, complete_row in completes.iterrows():
-                activity = complete_row[self.ACTIVITY_COLUMN]
-                complete_ts = complete_row[self.TIMESTAMP_COLUMN]
+            if len(work_completes) > 0 and len(work_starts) > 0:
+                # Store original index for updating later
+                work_completes["_orig_idx"] = work_completes.index
 
-                # Check if this activity has start events
-                if activity in activities_with_start and activity in start_events:
-                    # Find matching start event (closest start before this complete)
-                    matching_idx = None
-                    matching_ts = None
-                    for idx, (start_ts, _) in enumerate(start_events[activity]):
-                        if start_ts <= complete_ts:
-                            if matching_ts is None or start_ts > matching_ts:
-                                matching_idx = idx
-                                matching_ts = start_ts
+                # Sort both by case, activity, timestamp for merge_asof
+                work_completes_sorted = work_completes.sort_values(
+                    [self.CASE_COLUMN, self.ACTIVITY_COLUMN, self.TIMESTAMP_COLUMN]
+                ).reset_index(drop=True)
 
-                    if matching_idx is not None:
-                        # Compute processing time
-                        processing_time = (complete_ts - matching_ts).total_seconds()
-                        # Remove used start event to handle multiple instances
-                        start_events[activity].pop(matching_idx)
-                        if not start_events[activity]:
-                            del start_events[activity]
-                    else:
-                        # No matching start found, treat as instant
-                        processing_time = 0.0
-                else:
-                    # Activity doesn't have start events (O_*/A_* activities), treat as instant
-                    processing_time = 0.0
+                work_starts_sorted = work_starts[[self.CASE_COLUMN, self.ACTIVITY_COLUMN, self.TIMESTAMP_COLUMN]].copy()
+                work_starts_sorted = work_starts_sorted.rename(columns={self.TIMESTAMP_COLUMN: "start_timestamp"})
+                work_starts_sorted = work_starts_sorted.sort_values(
+                    [self.CASE_COLUMN, self.ACTIVITY_COLUMN, "start_timestamp"]
+                ).reset_index(drop=True)
 
-                # Create collapsed row
-                row_dict = complete_row.to_dict()
-                row_dict["processing_time"] = processing_time
-                # Remove lifecycle column as it's no longer needed
-                row_dict.pop(self.LIFECYCLE_COLUMN, None)
-                collapsed_rows.append(row_dict)
+                # Use merge_asof to find the closest start event before each complete
+                # This is a vectorized backward search
+                paired = pd.merge_asof(
+                    work_completes_sorted.sort_values(self.TIMESTAMP_COLUMN),
+                    work_starts_sorted.sort_values("start_timestamp"),
+                    left_on=self.TIMESTAMP_COLUMN,
+                    right_on="start_timestamp",
+                    by=[self.CASE_COLUMN, self.ACTIVITY_COLUMN],
+                    direction="backward"
+                )
 
-        result = pd.DataFrame(collapsed_rows)
+                # Calculate processing time where we have a matching start
+                has_start = paired["start_timestamp"].notna()
+                paired.loc[has_start, "processing_time"] = (
+                    paired.loc[has_start, self.TIMESTAMP_COLUMN] - paired.loc[has_start, "start_timestamp"]
+                ).dt.total_seconds()
+
+                # Update the completes dataframe with computed processing times
+                completes.loc[paired["_orig_idx"].values, "processing_time"] = paired["processing_time"].values
+
+        # Remove lifecycle column
+        result = completes.drop(columns=[self.LIFECYCLE_COLUMN])
 
         # Sort by case and timestamp
         result = result.sort_values(
