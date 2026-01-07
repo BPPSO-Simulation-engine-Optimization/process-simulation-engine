@@ -3,9 +3,16 @@ import pandas as pd
 
 
 class TrainingDataGenerator:
-    """Generates enriched training datasets from event logs for decision points."""
+    """Generates enriched training datasets from event logs for decision points.
+
+    Supports two modes:
+    1. Pre-processed mode: If DataFrame has 'processing_time' column (from LifecycleFilter),
+       uses actual processing times instead of computing inter-event durations.
+    2. Legacy mode: Computes inter-event durations from consecutive timestamps.
+    """
 
     CASE_COLUMNS = ["case:LoanGoal", "case:ApplicationType", "case:RequestedAmount"]
+    PROCESSING_TIME_COLUMN = "processing_time"
 
     def __init__(self, df_log, decision_point_map, max_history=10, min_seq_count=20, min_class_count=10):
         self._log = df_log
@@ -13,6 +20,7 @@ class TrainingDataGenerator:
         self._max_history = max_history
         self._min_seq_count = min_seq_count
         self._min_class_count = min_class_count
+        self._has_processing_time = self.PROCESSING_TIME_COLUMN in df_log.columns
 
     def _build_transition_lookup(self):
         transitions = defaultdict(set)
@@ -29,7 +37,8 @@ class TrainingDataGenerator:
             .set_index("case:concept:name")
         )
 
-    def _compute_durations(self, timestamps, start_idx, end_idx):
+    def _compute_durations_legacy(self, timestamps, start_idx, end_idx):
+        """Compute inter-event durations (legacy mode)."""
         durations = []
         for j in range(start_idx + 1, end_idx + 1):
             delta = (timestamps[j] - timestamps[j - 1]).total_seconds()
@@ -38,10 +47,29 @@ class TrainingDataGenerator:
             durations.insert(0, 0.0)
         return durations
 
+    def _get_durations(self, processing_times, timestamps, start_idx, end_idx):
+        """
+        Get durations for a sequence.
+
+        If processing_time column exists, use actual processing times.
+        Otherwise, fall back to inter-event durations (legacy mode).
+        """
+        if self._has_processing_time and processing_times is not None:
+            # Use actual processing times from the collapsed events
+            return processing_times[start_idx : end_idx + 1]
+        else:
+            # Legacy: compute inter-event durations
+            return self._compute_durations_legacy(timestamps, start_idx, end_idx)
+
     def _process_case(self, case_id, group, transition_map, case_attrs):
         events = group["concept:name"].tolist()
         resources = group["org:resource"].tolist()
         timestamps = group["time:timestamp"].tolist()
+
+        # Get processing times if available
+        processing_times = None
+        if self._has_processing_time:
+            processing_times = group[self.PROCESSING_TIME_COLUMN].tolist()
 
         rows_by_dp = defaultdict(list)
 
@@ -56,7 +84,7 @@ class TrainingDataGenerator:
             seq = events[start : i + 1]
             seq_res = resources[start : i + 1]
             seq_ts = timestamps[start : i + 1]
-            seq_dur = self._compute_durations(timestamps, start, i)
+            seq_dur = self._get_durations(processing_times, timestamps, start, i)
 
             case_feats = case_attrs.loc[case_id].to_dict() if case_id in case_attrs.index else {}
 
