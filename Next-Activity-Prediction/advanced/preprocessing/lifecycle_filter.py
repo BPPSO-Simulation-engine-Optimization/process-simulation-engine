@@ -128,13 +128,14 @@ class LifecycleFilter:
             completes = case_group[case_group[self.LIFECYCLE_COLUMN] == "complete"]
 
             # Index starts by activity for quick lookup
-            # Group by activity to handle multiple instances of same activity
+            # Store as list of (timestamp, row_dict) tuples for proper comparison
             start_events = {}
             for _, row in starts.iterrows():
                 activity = row[self.ACTIVITY_COLUMN]
                 if activity not in start_events:
                     start_events[activity] = []
-                start_events[activity].append(row)
+                # Store as tuple (timestamp, row_dict) for easier comparison
+                start_events[activity].append((row[self.TIMESTAMP_COLUMN], row.to_dict()))
 
             # Process each complete event
             for _, complete_row in completes.iterrows():
@@ -144,25 +145,26 @@ class LifecycleFilter:
                 # Check if this activity has start events
                 if activity in activities_with_start and activity in start_events:
                     # Find matching start event (closest start before this complete)
-                    matching_start = None
-                    for start_row in start_events[activity]:
-                        start_ts = start_row[self.TIMESTAMP_COLUMN]
+                    matching_idx = None
+                    matching_ts = None
+                    for idx, (start_ts, _) in enumerate(start_events[activity]):
                         if start_ts <= complete_ts:
-                            if matching_start is None or start_ts > matching_start[self.TIMESTAMP_COLUMN]:
-                                matching_start = start_row
+                            if matching_ts is None or start_ts > matching_ts:
+                                matching_idx = idx
+                                matching_ts = start_ts
 
-                    if matching_start is not None:
+                    if matching_idx is not None:
                         # Compute processing time
-                        processing_time = (complete_ts - matching_start[self.TIMESTAMP_COLUMN]).total_seconds()
+                        processing_time = (complete_ts - matching_ts).total_seconds()
                         # Remove used start event to handle multiple instances
-                        start_events[activity].remove(matching_start)
+                        start_events[activity].pop(matching_idx)
                         if not start_events[activity]:
                             del start_events[activity]
                     else:
                         # No matching start found, treat as instant
                         processing_time = 0.0
                 else:
-                    # Activity doesn't have start events (O_* activities), treat as instant
+                    # Activity doesn't have start events (O_*/A_* activities), treat as instant
                     processing_time = 0.0
 
                 # Create collapsed row

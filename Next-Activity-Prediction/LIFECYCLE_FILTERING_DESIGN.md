@@ -127,43 +127,66 @@ The BPI Challenge 2017 process operates with a **work queue model**:
 
 ## Activity Classification
 
-### Analysis Results
+### Analysis Results (Validated)
 
 Activities in BPI Challenge 2017 fall into two categories based on lifecycle patterns:
 
-#### Activities WITH Start Events (Work Activities)
-These are "W_" and "A_" prefix activities that represent actual work:
+#### Activities WITH Start Events (Work Activities) - Only W_* prefix
+These are "W_" prefix activities that represent actual human work:
 - Have both `start` and `complete` lifecycle transitions
 - Processing time = `complete_timestamp - start_timestamp`
 - Consume resources during execution
-- Examples: `W_Complete application`, `A_Submitted`, `W_Call after offers`
 
-#### Activities WITHOUT Start Events (Instant/Automatic)
-These are "O_" prefix activities representing system events and status changes:
+| Activity | Start Count | Complete Count | Mean Duration |
+|----------|-------------|----------------|---------------|
+| W_Validate application | 39,444 | 15,848 | ~39 hours |
+| W_Call after offers | 31,485 | 342 | ~30 hours |
+| W_Complete application | 29,918 | 19,104 | ~9 hours |
+| W_Call incomplete files | 23,218 | 2,793 | ~117 hours |
+| W_Handle leads | 3,727 | 3,493 | ~22 minutes |
+| W_Assess potential fraud | 355 | 282 | ~84 hours |
 
-| Activity | Type | Description |
-|----------|------|-------------|
-| O_Create Offer | System/Automatic | System creates offer |
-| O_Created | System/Automatic | Offer creation logged |
-| O_Sent (mail and online) | Communication | Notification sent (instant) |
-| O_Sent (online only) | Communication | Notification sent (instant) |
-| O_Accepted | Status Update | Customer accepts (instant state change) |
-| O_Cancelled | Status Update | Offer cancelled (instant) |
-| O_Refused | Status Update | Offer refused (instant) |
-| O_Returned | Status Update | Offer returned (instant) |
+#### Activities WITHOUT Start Events (Instant/Automatic) - O_* and A_* prefixes
+
+**O_* Activities (Offer-related system events)**:
+| Activity | Count | Description |
+|----------|-------|-------------|
+| O_Create Offer | 42,995 | System creates offer |
+| O_Created | 42,995 | Offer creation logged |
+| O_Sent (mail and online) | 39,707 | Notification sent |
+| O_Sent (online only) | 2,026 | Notification sent |
+| O_Accepted | 17,228 | Customer accepts |
+| O_Cancelled | 20,898 | Offer cancelled |
+| O_Refused | 4,695 | Offer refused |
+| O_Returned | 23,305 | Offer returned |
+
+**A_* Activities (Application state changes)**:
+| Activity | Count | Description |
+|----------|-------|-------------|
+| A_Create Application | 31,509 | Application created |
+| A_Concept | 31,509 | Concept phase |
+| A_Accepted | 31,509 | Application accepted |
+| A_Complete | 31,362 | Application complete |
+| A_Validating | 38,816 | Validation state |
+| A_Incomplete | 23,055 | Marked incomplete |
+| A_Submitted | 20,423 | Submitted state |
+| A_Pending | 17,228 | Pending state |
+| A_Cancelled | 10,431 | Cancelled state |
+| A_Denied | 3,753 | Denied state |
 
 **Key characteristics**:
 - Only have `complete` transitions (no `start`)
-- Intrinsically instantaneous operations
+- Intrinsically instantaneous operations (state changes)
 - Execute atomically with no processing time
 - Should be treated as **0-duration** in simulation
 
-### Handling Strategy
+### Handling Strategy (Updated)
 
 | Activity Type | Has Start? | Duration Calculation | Resource Consumption |
 |---------------|------------|---------------------|---------------------|
-| W_* / A_* activities | Yes | `complete - start` | Yes (allocate → free) |
-| O_* activities | No | 0 (instant) | No (or minimal) |
+| W_* activities | Yes | `complete - start` | Yes (allocate → free) |
+| A_* activities | No | 0 (instant) | No (state change) |
+| O_* activities | No | 0 (instant) | No (system event) |
 
 ---
 
@@ -216,11 +239,14 @@ A (duration: complete - start) → O_Created (duration: 0) → B (duration: comp
 - [x] Handle O_* activities as instant (duration = 0)
 - [x] Update `TrainingDataGenerator` to use filtered events
 
-### Phase 2: Data Validation
-- [ ] Verify event pairing correctness (same case, same activity instance)
-- [ ] Validate O_* activities have no start events (confirm classification)
-- [ ] Compute duration statistics per activity type
-- [ ] Compare sequence lengths before/after filtering
+### Phase 2: Data Validation ✅ COMPLETE
+**Validation script**: `advanced/preprocessing/validate_lifecycle_filter.py`
+
+**Results**:
+- [x] Verify event pairing correctness - All processing times non-negative
+- [x] Validate activity classification - Only W_* have start events, O_* and A_* are instant
+- [x] Compute duration statistics - W_* activities: 22 min to 117 hours mean duration
+- [x] Compare sequence lengths - 60.5% reduction (1.2M → 475K events), all 31,509 cases preserved
 
 ### Phase 3: Model Retraining
 **File**: `advanced/notebooks/01_train.ipynb`
@@ -387,6 +413,11 @@ The processing time module already handles duration prediction. This lifecycle f
 | | | - Created `LifecycleFilter` class in `lifecycle_filter.py` |
 | | | - Updated `TrainingDataGenerator` for processing_time support |
 | | | - Modified training notebook to use lifecycle filtering |
+| 2026-01-07 | - | **Phase 2 Validation Complete** |
+| | | - Created validation script `validate_lifecycle_filter.py` |
+| | | - Fixed bug in event pairing logic |
+| | | - Corrected activity classification: only W_* have start events |
+| | | - Validated 60.5% event reduction, all cases preserved |
 
 ---
 
