@@ -335,38 +335,70 @@ class DESEngine:
         Auto-load next activity predictor based on available models.
         
         Priority:
-        1. LSTM next activity model (models/next_activity_lstm/)
-        2. ProcessSequencePrediction model (ProcessSequencePrediction-master/code/output_files/models/)
-        3. BranchPredictor model (models/branch_predictor.joblib)
-        4. Stub predictor (fallback)
+        1. LSTM next activity model (embedding-based: models/next_activity_lstm/)
+        2. LSTM next activity model (one-hot: models/next_activity_lstm_onehot/)
+        3. ProcessSequencePrediction model (ProcessSequencePrediction-master/code/output_files/models/)
+        4. BranchPredictor model (models/branch_predictor.joblib)
+        5. Stub predictor (fallback)
         """
         from pathlib import Path
         
-        # Try LSTM next activity model
-        # Check both project root and next_activity_prediction module locations
-        possible_paths = [
+        def _try_load_predictor(model_dir: Path, pred_type: str, module_name: str, class_name: str):
+            """Helper to try loading a predictor from a directory."""
+            model_file = model_dir / "model.keras"
+            checkpoint_file = model_dir / "checkpoints" / "best_model.keras"
+            
+            if not model_dir.exists() or (not model_file.exists() and not checkpoint_file.exists()):
+                return None
+            
+            try:
+                logger.info(f"Loading {class_name} from {model_dir}...")
+                module = __import__(module_name, fromlist=[class_name])
+                PredictorClass = getattr(module, class_name)
+                
+                if checkpoint_file.exists():
+                    logger.info(f"Using checkpoint: {checkpoint_file}")
+                    return PredictorClass(str(checkpoint_file))
+                elif model_file.exists():
+                    logger.info(f"Using model: {model_file}")
+                    return PredictorClass(str(model_dir))
+            except ImportError:
+                return None
+            except Exception as e:
+                logger.warning(f"Could not load {pred_type} predictor from {model_dir}: {e}")
+                return None
+        
+        # Try embedding-based LSTM model
+        possible_embedding_paths = [
             Path("models/next_activity_lstm"),
             Path("next_activity_prediction/models/next_activity_lstm"),
         ]
         
-        for lstm_model_dir in possible_paths:
-            model_file = lstm_model_dir / "model.keras"
-            checkpoint_file = lstm_model_dir / "checkpoints" / "best_model.keras"
-            
-            if lstm_model_dir.exists() and (model_file.exists() or checkpoint_file.exists()):
-                try:
-                    logger.info(f"Loading LSTMNextActivityPredictor from {lstm_model_dir}...")
-                    from next_activity_prediction import LSTMNextActivityPredictor
-                    # Use checkpoint if available, otherwise use model.keras
-                    if checkpoint_file.exists():
-                        logger.info(f"Using checkpoint: {checkpoint_file}")
-                        return LSTMNextActivityPredictor(str(checkpoint_file))
-                    elif model_file.exists():
-                        logger.info(f"Using model: {model_file}")
-                        return LSTMNextActivityPredictor(str(lstm_model_dir))
-                except Exception as e:
-                    logger.warning(f"Could not load LSTM predictor from {lstm_model_dir}: {e}")
-                    continue
+        for lstm_model_dir in possible_embedding_paths:
+            predictor = _try_load_predictor(
+                lstm_model_dir, 
+                "embedding",
+                "next_activity_prediction", 
+                "LSTMNextActivityPredictor"
+            )
+            if predictor:
+                return predictor
+        
+        # Try one-hot LSTM model
+        possible_onehot_paths = [
+            Path("models/next_activity_lstm_onehot"),
+            Path("next_activity_prediction_onehot/models/next_activity_lstm_onehot"),
+        ]
+        
+        for lstm_model_dir in possible_onehot_paths:
+            predictor = _try_load_predictor(
+                lstm_model_dir,
+                "onehot",
+                "next_activity_prediction_onehot",
+                "LSTMNextActivityPredictorOneHot"
+            )
+            if predictor:
+                return predictor
         
         # Try ProcessSequencePrediction model
         psp_model_dir = Path(ProcessSequencePredictor.DEFAULT_MODEL_PATH)

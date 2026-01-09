@@ -68,9 +68,63 @@ def setup_simulation(
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
+def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
+    """
+    Try to load a next activity predictor from the given path.
+    
+    Args:
+        model_path: Path to model directory
+        model_type: "embedding", "onehot", or "auto"
+        
+    Returns:
+        Predictor instance if successful, None otherwise
+    """
+    model_file = model_path / "model.keras"
+    checkpoint_file = model_path / "checkpoints" / "best_model.keras"
+    
+    if not model_path.exists() or (not model_file.exists() and not checkpoint_file.exists()):
+        return None
+    
+    # Determine which predictor to try based on model_type
+    # If "auto", try both in order
+    predictors_to_try = []
+    if model_type == "embedding":
+        predictors_to_try = [("embedding", "next_activity_prediction", "LSTMNextActivityPredictor")]
+    elif model_type == "onehot":
+        predictors_to_try = [("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot")]
+    else:  # auto
+        predictors_to_try = [
+            ("embedding", "next_activity_prediction", "LSTMNextActivityPredictor"),
+            ("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot"),
+        ]
+    
+    for pred_type, module_name, class_name in predictors_to_try:
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            PredictorClass = getattr(module, class_name)
+            
+            if checkpoint_file.exists():
+                predictor = PredictorClass(model_path=str(checkpoint_file))
+                logger.info(f"✓ {pred_type.capitalize()} model loaded from checkpoint: {checkpoint_file}")
+            else:
+                predictor = PredictorClass(model_path=str(model_path))
+                logger.info(f"✓ {pred_type.capitalize()} model loaded from: {model_path}")
+            
+            return predictor
+        except ImportError:
+            continue
+        except Exception as e:
+            logger.debug(f"Could not load {pred_type} predictor from {model_path}: {e}")
+            continue
+    
+    return None
+
+
 def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     """
     Set up next activity predictor based on config.
+    
+    Supports both embedding-based and one-hot encoded models.
     
     Args:
         config: Simulation configuration
@@ -80,37 +134,15 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     """
     from pathlib import Path
     
+    model_type = getattr(config, 'next_activity_model_type', 'auto')
+    
     if config.next_activity_mode == "advanced" and config.next_activity_model_path:
         model_path = Path(config.next_activity_model_path)
         
-        # Check if model directory or checkpoint exists
-        model_file = model_path / "model.keras"
-        checkpoint_file = model_path / "checkpoints" / "best_model.keras"
-        
-        if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
-            try:
-                logger.info("Setting up next activity predictor (LSTM)...")
-                from next_activity_prediction import LSTMNextActivityPredictor
-                
-                # Use checkpoint if available
-                if checkpoint_file.exists():
-                    predictor = LSTMNextActivityPredictor(
-                        model_path=str(checkpoint_file)
-                    )
-                    logger.info(f"✓ LSTM model loaded from checkpoint: {checkpoint_file}")
-                else:
-                    predictor = LSTMNextActivityPredictor(
-                        model_path=str(model_path)
-                    )
-                    logger.info(f"✓ LSTM model loaded from: {model_path}")
-                
-                return predictor
-            except Exception as e:
-                import traceback
-                logger.warning(f"Failed to load next activity predictor: {e}")
-                logger.debug(f"Traceback:\n{traceback.format_exc()}")
-                logger.info("Falling back to engine auto-load")
-                return None
+        predictor = _try_load_predictor(model_path, model_type)
+        if predictor:
+            logger.info("Setting up next activity predictor...")
+            return predictor
         else:
             logger.warning(f"Next activity model not found at {model_path}")
             logger.info("Falling back to engine auto-load")
@@ -120,32 +152,15 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     possible_paths = [
         Path("models/next_activity_lstm"),
         Path("next_activity_prediction/models/next_activity_lstm"),
+        Path("models/next_activity_lstm_onehot"),
+        Path("next_activity_prediction_onehot/models/next_activity_lstm_onehot"),
     ]
     
     for model_path in possible_paths:
-        model_file = model_path / "model.keras"
-        checkpoint_file = model_path / "checkpoints" / "best_model.keras"
-        
-        if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
-            try:
-                logger.info(f"Auto-loading next activity predictor from {model_path}...")
-                from next_activity_prediction import LSTMNextActivityPredictor
-                
-                if checkpoint_file.exists():
-                    predictor = LSTMNextActivityPredictor(
-                        model_path=str(checkpoint_file)
-                    )
-                    logger.info(f"✓ Auto-loaded LSTM model from checkpoint: {checkpoint_file}")
-                else:
-                    predictor = LSTMNextActivityPredictor(
-                        model_path=str(model_path)
-                    )
-                    logger.info(f"✓ Auto-loaded LSTM model from: {model_path}")
-                
-                return predictor
-            except Exception as e:
-                logger.warning(f"Could not auto-load LSTM predictor from {model_path}: {e}")
-                continue
+        predictor = _try_load_predictor(model_path, model_type)
+        if predictor:
+            logger.info(f"Auto-loading next activity predictor from {model_path}...")
+            return predictor
     
     # No model found - return None to trigger engine auto-load (which will try again)
     logger.info("No next activity model found, using engine auto-load fallback")
