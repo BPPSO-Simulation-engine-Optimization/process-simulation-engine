@@ -335,30 +335,49 @@ class DESEngine:
         Auto-load next activity predictor based on available models.
         
         Priority:
-        1. Unified model (models/unified_next_activity/) - best for avoiding loops
-        2. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
+        1. LSTM next activity model (models/next_activity_lstm/)
+        2. ProcessSequencePrediction model (ProcessSequencePrediction-master/code/output_files/models/)
         3. BranchPredictor model (models/branch_predictor.joblib)
         4. Stub predictor (fallback)
         """
         from pathlib import Path
         
-        # Try Unified model first (best for avoiding loops)
-        unified_model_dir = Path(UnifiedNextActivityPredictor.DEFAULT_MODEL_PATH)
-        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
-            try:
-                logger.info("Loading UnifiedNextActivityPredictor...")
-                return UnifiedNextActivityPredictor(str(unified_model_dir))
-            except Exception as e:
-                logger.warning(f"Could not load Unified predictor: {e}")
+        # Try LSTM next activity model
+        # Check both project root and next_activity_prediction module locations
+        possible_paths = [
+            Path("models/next_activity_lstm"),
+            Path("next_activity_prediction/models/next_activity_lstm"),
+        ]
         
-        # Try LSTM models
-        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
-        if lstm_models_dir.exists() and any(lstm_models_dir.iterdir()):
-            try:
-                logger.info("Loading LSTMNextActivityPredictor...")
-                return LSTMNextActivityPredictor(str(lstm_models_dir))
-            except Exception as e:
-                logger.warning(f"Could not load LSTM predictor: {e}")
+        for lstm_model_dir in possible_paths:
+            model_file = lstm_model_dir / "model.keras"
+            checkpoint_file = lstm_model_dir / "checkpoints" / "best_model.keras"
+            
+            if lstm_model_dir.exists() and (model_file.exists() or checkpoint_file.exists()):
+                try:
+                    logger.info(f"Loading LSTMNextActivityPredictor from {lstm_model_dir}...")
+                    from next_activity_prediction import LSTMNextActivityPredictor
+                    # Use checkpoint if available, otherwise use model.keras
+                    if checkpoint_file.exists():
+                        logger.info(f"Using checkpoint: {checkpoint_file}")
+                        return LSTMNextActivityPredictor(str(checkpoint_file))
+                    elif model_file.exists():
+                        logger.info(f"Using model: {model_file}")
+                        return LSTMNextActivityPredictor(str(lstm_model_dir))
+                except Exception as e:
+                    logger.warning(f"Could not load LSTM predictor from {lstm_model_dir}: {e}")
+                    continue
+        
+        # Try ProcessSequencePrediction model
+        psp_model_dir = Path(ProcessSequencePredictor.DEFAULT_MODEL_PATH)
+        if psp_model_dir.exists():
+            model_files = list(psp_model_dir.glob("*.h5"))
+            if model_files:
+                try:
+                    logger.info("Loading ProcessSequencePredictor...")
+                    return ProcessSequencePredictor(str(psp_model_dir))
+                except Exception as e:
+                    logger.warning(f"Could not load ProcessSequencePredictor: {e}")
         
         # Fallback to BranchPredictor
         model_path = Path(BranchNextActivityPredictor.DEFAULT_MODEL_PATH)
@@ -369,8 +388,7 @@ class DESEngine:
                 logger.warning(f"Failed to load next activity model: {e}")
         
         # Last resort: stub
-        logger.info("Using stub next activity predictor "
-                   "(train model with: python Next-Activity-Prediction/train.py)")
+        logger.info("Using stub next activity predictor")
         return _StubNextActivityPredictor()
     
     def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
@@ -1045,196 +1063,9 @@ class _StubCaseArrivalPredictor:
         return timedelta(minutes=minutes)
 
 
-class LSTMNextActivityPredictor:
-    """
-    Advanced next activity predictor using LSTM models per decision point.
-    
-    Wraps the existing decision_function_advanced() from Next-Activity-Prediction/advanced.
-    """
-    
-    END_ACTIVITIES = {"A_Cancelled", "A_Complete"}
-    START_ACTIVITY = "A_Create Application"
-    
-    def __init__(
-        self,
-        models_dir: str = "Next-Activity-Prediction/advanced/models_lstm_new",
-        max_history: int = 15,
-        seed: int = 42,
-    ):
-        """Load LSTM models, process graph, and decision point map."""
-        import sys
-        import importlib
-        from pathlib import Path
-        
-        # Add Next-Activity-Prediction parent to sys.path.
-        # IMPORTANT: avoid importing a top-level module named "simulation" here, because
-        # this project already has a package named "simulation".
-        na_root = Path(__file__).parent.parent / "Next-Activity-Prediction"
-        if str(na_root) not in sys.path:
-            sys.path.insert(0, str(na_root))
-
-        advanced_api = importlib.import_module("advanced.api")
-        advanced_sim = importlib.import_module("advanced.simulation")
-
-        load_models = advanced_api.load_models
-        load_simulation_assets = advanced_sim.load_simulation_assets
-        decision_function_advanced = advanced_sim.decision_function_advanced
-        
-        self.models = load_models(models_dir)
-        self.process_graph, self.decision_point_map = load_simulation_assets()
-        self.decision_function = decision_function_advanced
-        self.max_history = max_history
-        self.rng = random.Random(seed)
-        
-        # Build activity -> DP mapping
-        self._activity_to_dp = {}
-        for dp, info in self.decision_point_map.items():
-            if "incoming" in info:
-                for act in info["incoming"]:
-                    self._activity_to_dp[act] = dp
-        
-        logger.info(
-            f"Loaded LSTMNextActivityPredictor: {len(self.models)} models, "
-            f"{len(self.process_graph)} nodes, {len(self._activity_to_dp)} activity-to-DP mappings"
-        )
-    
-    def predict(self, case_state: CaseState) -> tuple[str, bool]:
-        """Predict next activity using LSTM models at decision points."""
-        if not case_state.activity_history:
-            return self.START_ACTIVITY, False
-        
-        current = case_state.activity_history[-1]
-        
-        if current in self.END_ACTIVITIES:
-            return current, True
-        
-        next_options = self.process_graph.get(current, [])
-        
-        if not next_options:
-            logger.debug(f"No outgoing edges for {current}, ending case")
-            return current, True
-        
-        if len(next_options) == 1:
-            next_act = next_options[0]
-            return next_act, next_act in self.END_ACTIVITIES
-        
-        # Multiple options - use LSTM at decision point
-        decision_point = self._activity_to_dp.get(current)
-        
-        if not decision_point:
-            # No DP mapping - random choice
-            logger.debug(f"No DP for {current}, random choice from {next_options}")
-            next_act = self.rng.choice(next_options)
-            return next_act, next_act in self.END_ACTIVITIES
-
-        # Use outgoing activities from decision point map (matches advanced/simulation.py)
-        dp_info = self.decision_point_map.get(decision_point, {})
-        decision_options_raw = dp_info.get('outgoing', next_options)
-
-        # Filter out DPs/PGs; engine will still handle them, but feeding real activities
-        # to the LSTM decision improves stability and avoids DP->DP loops.
-        decision_options = [
-            act for act in decision_options_raw
-            if not (act.startswith('DP ') or act.startswith('PG '))
-        ]
-        if not decision_options:
-            decision_options = list(decision_options_raw)
-        
-        # Convert CaseState to history format
-        history = self._case_state_to_history(case_state)
-        
-        try:
-            next_act, prob = self.decision_function(
-                current_dp=decision_point,
-                history=history,
-                options=decision_options,
-                models=self.models,
-                decision_point_map=self.decision_point_map,
-                process_graph=self.process_graph,
-                max_history=self.max_history,
-            )
-            logger.debug(f"LSTM predicted {next_act} at {decision_point} (p={prob:.3f})")
-            return next_act, next_act in self.END_ACTIVITIES
-        except Exception as e:
-            logger.warning(f"LSTM prediction failed at {decision_point}: {e}, using random")
-            next_act = self.rng.choice(next_options)
-            return next_act, next_act in self.END_ACTIVITIES
-    
-    def _case_state_to_history(self, case_state: CaseState) -> List[Dict]:
-        """Convert CaseState to history format for decision_function_advanced."""
-        from datetime import timedelta
-        
-        base_time = case_state.start_time or datetime.now()
-        history = []
-        
-        for i, activity in enumerate(case_state.activity_history):
-            history.append({
-                'task': activity,
-                'resource': case_state.current_resource or 'User_1',
-                'timestamp': base_time + timedelta(seconds=i),
-            })
-        
-        return history
-
-
-class UnifiedNextActivityPredictor:
-    """
-    Unified next activity predictor using dual-output LSTM model.
-    
-    Predicts both activity AND lifecycle to avoid simulation loops.
-    Uses repetition penalty on seen (activity, lifecycle) pairs.
-    """
-    
-    END_ACTIVITIES = {"A_Cancelled", "A_Complete", "End"}
-    START_ACTIVITY = "A_Create Application"
-    DEFAULT_MODEL_PATH = "models/unified_next_activity"
-    
-    def __init__(self, model_path: str = None, max_history: int = 15, seed: int = 42):
-        """Initialize the unified predictor."""
-        self.rng = random.Random(seed)
-        self.max_history = max_history
-        model_path = model_path or self.DEFAULT_MODEL_PATH
-        
-        # Import and load the unified predictor
-        from pathlib import Path
-        import sys
-        import importlib
-        
-        # Add Next-Activity-Prediction to path (so we can import advanced.unified)
-        project_root = Path(__file__).parent.parent
-        na_root = project_root / "Next-Activity-Prediction"
-        if str(na_root) not in sys.path:
-            sys.path.insert(0, str(na_root))
-        
-        # Import the unified predictor module
-        # Import parent packages first to ensure package structure is recognized
-        # This ensures relative imports in predictor.py (like "from .persistence") work correctly
-        try:
-            # Import in order to establish package hierarchy
-            import advanced
-            import advanced.unified
-            # Now import the predictor module - relative imports should work
-            predictor_module = importlib.import_module("advanced.unified.predictor")
-            _Impl = predictor_module.UnifiedNextActivityPredictor
-        except ImportError as e:
-            logger.error(f"Failed to import unified predictor: {e}")
-            logger.error(f"Python path: {sys.path[:3]}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
-        
-        self._impl = _Impl(model_path=model_path, max_history=max_history, seed=seed)
-        
-        logger.info(f"Loaded UnifiedNextActivityPredictor from {model_path}")
-    
-    def predict(self, case_state: CaseState) -> tuple[str, bool]:
-        """Predict next activity using unified model."""
-        return self._impl.predict(case_state)
-
-
 class BranchNextActivityPredictor:
     """
-    Model-based next activity predictor using trained BranchPredictor from Next-Activity-Prediction.
+    Model-based next activity predictor using trained BranchPredictor.
     
     Loads a pre-trained model (models/branch_predictor.joblib) that contains XOR gateway
     branch probabilities learned from the BPMN model and event log.
@@ -1333,7 +1164,6 @@ class BranchNextActivityPredictor:
             return next_act, is_end
         
         # 2. Fallback for non-gateway activities
-        # TODO(@next-activity-prediction-team): Replace this with model-based prediction
         if current in self.FALLBACK_TRANSITIONS:
             next_act = self.FALLBACK_TRANSITIONS[current]
             return next_act, next_act in self.END_ACTIVITIES
@@ -1364,6 +1194,271 @@ class BranchNextActivityPredictor:
                 return self.rng.choice(branches)
         
         return None
+
+
+class ProcessSequencePredictor:
+    """
+    Next activity predictor using ProcessSequencePrediction LSTM model.
+    
+    This predictor uses the LSTM-based approach from ProcessSequencePrediction
+    to predict the next activity based on activity sequences and timing information.
+    """
+    
+    END_ACTIVITIES = {"A_Cancelled", "A_Complete", "End"}
+    START_ACTIVITY = "A_Create Application"
+    DEFAULT_MODEL_PATH = "ProcessSequencePrediction-master/code/output_files/models"
+    
+    def __init__(
+        self,
+        model_path: str = None,
+        model_file: str = None,
+        activity_mapping_path: str = None,
+        max_history: int = 50,
+        seed: int = 42,
+    ):
+        """
+        Initialize the predictor.
+        
+        Args:
+            model_path: Directory containing the model file.
+            model_file: Name of the model file (e.g., "model_89-1.50.h5").
+            activity_mapping_path: Path to activity mapping file (JSON or pickle).
+            max_history: Maximum history length for predictions.
+            seed: Random seed for sampling.
+        """
+        import numpy as np
+        from pathlib import Path
+        import json
+        import pickle
+        
+        self.rng = random.Random(seed)
+        self.max_history = max_history
+        self.maxlen = 50
+        
+        model_path = model_path or self.DEFAULT_MODEL_PATH
+        model_path = Path(model_path)
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model directory not found: {model_path}")
+        
+        if model_file:
+            model_file_path = model_path / model_file
+        else:
+            model_files = list(model_path.glob("*.h5"))
+            if not model_files:
+                raise FileNotFoundError(f"No .h5 model files found in {model_path}")
+            model_file_path = model_files[0]
+            logger.info(f"Using model file: {model_file_path.name}")
+        
+        if not model_file_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_file_path}")
+        
+        try:
+            from keras.models import load_model
+            self.model = load_model(str(model_file_path))
+            logger.info(f"Loaded ProcessSequencePrediction model from {model_file_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model: {e}")
+        
+        activity_mapping_path = activity_mapping_path or (model_path.parent / "activity_mapping.json")
+        
+        if activity_mapping_path.exists():
+            try:
+                with open(activity_mapping_path, 'r') as f:
+                    mapping_data = json.load(f)
+                    self.char_indices = {k: int(v) for k, v in mapping_data.get('char_indices', {}).items()}
+                    self.indices_char = {int(k): v for k, v in mapping_data.get('indices_char', {}).items()}
+                    self.target_char_indices = {k: int(v) for k, v in mapping_data.get('target_char_indices', {}).items()}
+                    self.target_indices_char = {int(k): v for k, v in mapping_data.get('target_indices_char', {}).items()}
+                    self.activity_to_char = mapping_data.get('activity_to_char', {})
+                    self.char_to_activity = mapping_data.get('char_to_activity', {})
+                    self.divisor = mapping_data.get('divisor', 3600.0)
+                    self.divisor2 = mapping_data.get('divisor2', 86400.0)
+                    self.ascii_offset = mapping_data.get('ascii_offset', 161)
+                    logger.info("Loaded activity mapping from file")
+            except Exception as e:
+                logger.warning(f"Failed to load activity mapping: {e}. Will attempt to infer from model.")
+                self._infer_mappings()
+        else:
+            logger.warning(f"Activity mapping file not found at {activity_mapping_path}. Attempting to infer mappings.")
+            self._infer_mappings()
+        
+        self.case_histories: Dict[str, Dict] = {}
+    
+    def _infer_mappings(self):
+        """Infer activity mappings from common BPIC17 activities."""
+        self.ascii_offset = 161
+        self.divisor = 3600.0
+        self.divisor2 = 86400.0
+        
+        common_activities = [
+            "A_Create Application", "A_Submitted", "A_Accepted", "A_Validating",
+            "A_Complete", "A_Cancelled", "A_Incomplete", "A_Concept", "A_Pending",
+            "O_Create Offer", "O_Created", "O_Sent (mail and online)", "O_Sent (online only)",
+            "O_Returned", "O_Refused", "O_Cancelled",
+            "W_Validate application", "W_Complete application", "W_Handle leads",
+            "W_Call after offers", "W_Call incomplete files", "W_Assess potential fraud",
+            "W_Personal Loan collection", "W_Shortened completion"
+        ]
+        
+        self.activity_to_char = {}
+        self.char_to_activity = {}
+        self.char_indices = {}
+        self.indices_char = {}
+        self.target_char_indices = {}
+        self.target_indices_char = {}
+        
+        for idx, activity in enumerate(common_activities):
+            char = chr(idx + self.ascii_offset)
+            self.activity_to_char[activity] = char
+            self.char_to_activity[char] = activity
+            self.char_indices[char] = idx
+            self.indices_char[idx] = char
+            self.target_char_indices[char] = idx
+            self.target_indices_char[idx] = char
+        
+        logger.info(f"Inferred mappings for {len(common_activities)} activities")
+    
+    def _get_case_history(self, case_id: str) -> Dict:
+        """Get or create history tracker for a case."""
+        if case_id not in self.case_histories:
+            self.case_histories[case_id] = {
+                'activities': [],
+                'times': [],
+                'times2': [],
+                'times3': [],
+                'start_time': None,
+            }
+        return self.case_histories[case_id]
+    
+    def _encode_sequence(self, activities: List[str], times: List[float], times2: List[float], 
+                        times3: List[datetime], maxlen: int = None):
+        """Encode activity sequence and times into model input format."""
+        import numpy as np
+        from collections import Counter
+        
+        maxlen = maxlen or self.maxlen
+        num_features = len(self.char_indices) + 5
+        
+        X = np.zeros((1, maxlen, num_features), dtype=np.float32)
+        
+        sentence = ''.join([self.activity_to_char.get(act, chr(self.ascii_offset)) for act in activities])
+        leftpad = maxlen - len(sentence)
+        
+        for t, char in enumerate(sentence):
+            if char not in self.char_indices:
+                continue
+            char_idx = self.char_indices[char]
+            X[0, t + leftpad, char_idx] = 1
+            X[0, t + leftpad, len(self.char_indices)] = t + 1
+            if t < len(times):
+                X[0, t + leftpad, len(self.char_indices) + 1] = times[t] / self.divisor
+            if t < len(times2):
+                X[0, t + leftpad, len(self.char_indices) + 2] = times2[t] / self.divisor2
+            if t < len(times3):
+                midnight = times3[t].replace(hour=0, minute=0, second=0, microsecond=0)
+                timesincemidnight = (times3[t] - midnight).total_seconds()
+                X[0, t + leftpad, len(self.char_indices) + 3] = timesincemidnight / 86400
+                X[0, t + leftpad, len(self.char_indices) + 4] = times3[t].weekday() / 7
+        
+        return X
+    
+    def _decode_prediction(self, predictions) -> str:
+        """Decode model prediction to activity name."""
+        import numpy as np
+        activity_probs = predictions[0][0]
+        max_idx = np.argmax(activity_probs)
+        predicted_char = self.target_indices_char.get(max_idx, chr(self.ascii_offset))
+        predicted_activity = self.char_to_activity.get(predicted_char, self.START_ACTIVITY)
+        return predicted_activity
+    
+    def predict(self, case_state: CaseState) -> tuple[str, bool]:
+        """
+        Predict next activity using ProcessSequencePrediction model.
+        
+        Args:
+            case_state: Current case state with activity history.
+            
+        Returns:
+            Tuple of (next_activity_name, is_case_ended).
+        """
+        case_id = case_state.case_id
+        history = self._get_case_history(case_id)
+        
+        if not case_state.activity_history:
+            history['start_time'] = case_state.start_time or datetime.now()
+            return self.START_ACTIVITY, False
+        
+        current_activity = case_state.activity_history[-1]
+        
+        if current_activity in self.END_ACTIVITIES:
+            if case_id in self.case_histories:
+                del self.case_histories[case_id]
+            return current_activity, True
+        
+        activities = case_state.activity_history[-self.max_history:]
+        history['activities'] = activities
+        
+        if not history['start_time']:
+            history['start_time'] = case_state.start_time or datetime.now()
+        
+        if len(history['times']) < len(activities):
+            new_times = []
+            new_times2 = []
+            new_times3 = []
+            base_time = history['start_time']
+            
+            for i, act in enumerate(activities):
+                if i < len(history['times']):
+                    new_times.append(history['times'][i])
+                    new_times2.append(history['times2'][i])
+                    new_times3.append(history['times3'][i])
+                else:
+                    if i == 0:
+                        time_diff = 0.0
+                        event_time = base_time
+                    else:
+                        time_diff = 3600.0
+                        event_time = new_times3[-1] + timedelta(seconds=time_diff)
+                    
+                    new_times.append(time_diff)
+                    new_times2.append((event_time - base_time).total_seconds())
+                    new_times3.append(event_time)
+            
+            history['times'] = new_times
+            history['times2'] = new_times2
+            history['times3'] = new_times3
+        
+        try:
+            X = self._encode_sequence(
+                history['activities'],
+                history['times'],
+                history['times2'],
+                history['times3']
+            )
+            
+            y = self.model.predict(X, verbose=0)
+            next_activity = self._decode_prediction(y)
+            
+            if next_activity == '!' or next_activity not in self.char_to_activity.values():
+                next_activity = "A_Complete"
+            
+            is_end = next_activity in self.END_ACTIVITIES
+            
+            return next_activity, is_end
+            
+        except Exception as e:
+            logger.warning(f"ProcessSequencePrediction failed for case {case_id}: {e}")
+            return "A_Complete", True
+    
+    def reset_case(self, case_id: str):
+        """Reset tracker for a case (when case ends)."""
+        if case_id in self.case_histories:
+            del self.case_histories[case_id]
+    
+    def clear(self):
+        """Clear all case trackers."""
+        self.case_histories.clear()
 
 
 # Main block for testing

@@ -22,9 +22,9 @@ class SimulationConfig:
     processing_time_model_path: Optional[str] = "models/processing_time_model"
 
     # Next activity prediction
-    # "basic" = stub, "advanced" = unified model (preferred) or LSTM fallback
+    # "basic" = auto-load (engine will try to find model), "advanced" = explicit model path
     next_activity_mode: Literal["basic", "advanced"] = "basic"
-    next_activity_model_path: Optional[str] = "models/unified_next_activity"
+    next_activity_model_path: Optional[str] = "models/next_activity_lstm"
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl

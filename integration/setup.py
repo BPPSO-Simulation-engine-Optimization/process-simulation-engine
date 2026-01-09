@@ -34,6 +34,7 @@ def setup_simulation(
 
     Returns:
         Tuple of (arrival_timestamps, next_activity_predictor, processing_time_predictor, case_attribute_predictor)
+        next_activity_predictor may be None if auto-load should be used.
 
     Raises:
         ValueError: If advanced mode requires df but df is None.
@@ -55,7 +56,7 @@ def setup_simulation(
     # 1. Case arrival timestamps
     arrival_timestamps = _setup_arrivals(config, df, start_date)
 
-    # 2. Next activity predictor
+    # 2. Next activity predictor (optional, None = use engine auto-load)
     next_activity_pred = _setup_next_activity(config)
 
     # 3. Processing time predictor
@@ -65,6 +66,90 @@ def setup_simulation(
     case_attr_pred = _setup_case_attributes(config, df)
 
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
+
+
+def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
+    """
+    Set up next activity predictor based on config.
+    
+    Args:
+        config: Simulation configuration
+        
+    Returns:
+        Next activity predictor instance, or None to use engine auto-load
+    """
+    from pathlib import Path
+    
+    if config.next_activity_mode == "advanced" and config.next_activity_model_path:
+        model_path = Path(config.next_activity_model_path)
+        
+        # Check if model directory or checkpoint exists
+        model_file = model_path / "model.keras"
+        checkpoint_file = model_path / "checkpoints" / "best_model.keras"
+        
+        if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
+            try:
+                logger.info("Setting up next activity predictor (LSTM)...")
+                from next_activity_prediction import LSTMNextActivityPredictor
+                
+                # Use checkpoint if available
+                if checkpoint_file.exists():
+                    predictor = LSTMNextActivityPredictor(
+                        model_path=str(checkpoint_file)
+                    )
+                    logger.info(f"✓ LSTM model loaded from checkpoint: {checkpoint_file}")
+                else:
+                    predictor = LSTMNextActivityPredictor(
+                        model_path=str(model_path)
+                    )
+                    logger.info(f"✓ LSTM model loaded from: {model_path}")
+                
+                return predictor
+            except Exception as e:
+                import traceback
+                logger.warning(f"Failed to load next activity predictor: {e}")
+                logger.debug(f"Traceback:\n{traceback.format_exc()}")
+                logger.info("Falling back to engine auto-load")
+                return None
+        else:
+            logger.warning(f"Next activity model not found at {model_path}")
+            logger.info("Falling back to engine auto-load")
+            return None
+    
+    # Basic mode - check both possible locations for auto-load
+    possible_paths = [
+        Path("models/next_activity_lstm"),
+        Path("next_activity_prediction/models/next_activity_lstm"),
+    ]
+    
+    for model_path in possible_paths:
+        model_file = model_path / "model.keras"
+        checkpoint_file = model_path / "checkpoints" / "best_model.keras"
+        
+        if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
+            try:
+                logger.info(f"Auto-loading next activity predictor from {model_path}...")
+                from next_activity_prediction import LSTMNextActivityPredictor
+                
+                if checkpoint_file.exists():
+                    predictor = LSTMNextActivityPredictor(
+                        model_path=str(checkpoint_file)
+                    )
+                    logger.info(f"✓ Auto-loaded LSTM model from checkpoint: {checkpoint_file}")
+                else:
+                    predictor = LSTMNextActivityPredictor(
+                        model_path=str(model_path)
+                    )
+                    logger.info(f"✓ Auto-loaded LSTM model from: {model_path}")
+                
+                return predictor
+            except Exception as e:
+                logger.warning(f"Could not auto-load LSTM predictor from {model_path}: {e}")
+                continue
+    
+    # No model found - return None to trigger engine auto-load (which will try again)
+    logger.info("No next activity model found, using engine auto-load fallback")
+    return None
 
 
 def _setup_arrivals(
@@ -254,64 +339,3 @@ def _setup_case_attributes(
     mode_desc = "retrained from event log" if retrain else "from cached artifacts"
     logger.info(f"Loaded AttributeSimulationEngine ({mode_desc})")
     return predictor
-
-
-def _setup_next_activity(config: SimulationConfig) -> Any:
-    """
-    Set up next activity predictor based on config.
-    
-    Returns predictor based on mode:
-    - "advanced": UnifiedNextActivityPredictor (preferred) or LSTMNextActivityPredictor
-    - "basic": None (engine will auto-load)
-    """
-    from pathlib import Path
-    
-    if config.next_activity_mode == "advanced":
-        # Try Unified model first (best for avoiding loops)
-        unified_model_dir = Path("models/unified_next_activity")
-        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
-            logger.info("Setting up advanced next activity predictor (Unified)...")
-            try:
-                from simulation.engine import UnifiedNextActivityPredictor
-                predictor = UnifiedNextActivityPredictor(
-                    model_path=str(unified_model_dir),
-                    max_history=15,
-                    seed=config.random_seed,
-                )
-                logger.info("✓ UNIFIED ADVANCED MODEL LOADED")
-                return predictor
-            except Exception as e:
-                import traceback
-                logger.warning(f"Unified predictor load failed: {e}")
-                logger.debug(f"Traceback:\n{traceback.format_exc()}")
-        
-        # Fall back to LSTM models
-        logger.info("Setting up advanced next activity predictor (LSTM)...")
-        from simulation.engine import LSTMNextActivityPredictor
-        
-        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
-        if not lstm_models_dir.exists():
-            logger.warning(f"LSTM models directory not found: {lstm_models_dir}")
-            logger.info("Falling back to auto-load (will try BranchPredictor or Stub)")
-            return None
-        
-        try:
-            predictor = LSTMNextActivityPredictor(
-                models_dir=str(lstm_models_dir),
-                max_history=15,
-                seed=config.random_seed,
-            )
-            logger.info(f"✓ LSTM ADVANCED MODEL LOADED: {len(predictor.models)} models")
-            logger.info(f"✓ Process graph: {len(predictor.process_graph)} nodes")
-            logger.info(f"✓ Decision points: {len(predictor.decision_point_map)} DPs")
-            return predictor
-        except Exception as e:
-            import traceback
-            logger.error(f"!!! LSTM predictor load FAILED: {e}")
-            logger.error(f"Traceback:\n{traceback.format_exc()}")
-            logger.info("Falling back to auto-load")
-            return None
-    
-    # Basic mode - return None to trigger auto-load in engine
-    logger.info("Using engine auto-load for next activity prediction")
-    return None
