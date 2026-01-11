@@ -48,13 +48,15 @@ class SimulationBenchmark:
     
     def __init__(self, 
                  original_log: Union[str, pd.DataFrame], 
-                 simulated_log: Union[str, pd.DataFrame]):
+                 simulated_log: Union[str, pd.DataFrame],
+                 filter_lifecycle_complete: bool = False):
         """
         Initialize benchmark with two event logs.
         
         Args:
             original_log: Original event log as DataFrame or path to .xes file
             simulated_log: Simulated event log as DataFrame or path to .xes file
+            filter_lifecycle_complete: Boolean. If True, filter logs to only include "complete" lifecycle events.
         """
         # Load logs (from file or use DataFrame directly)
         self.original_log = self._load_log(original_log, 'original')
@@ -62,6 +64,10 @@ class SimulationBenchmark:
         
         # Standardize column names
         self._standardize_columns()
+        
+        # Optional: Filter for lifecycle transition "complete"
+        if filter_lifecycle_complete:
+            self._filter_lifecycle_complete()
         
         # Results storage
         self.results = {}
@@ -129,6 +135,29 @@ class SimulationBenchmark:
             if 'timestamp' in log.columns:
                 log['timestamp'] = pd.to_datetime(log['timestamp'], format='mixed')
                 
+    def _filter_lifecycle_complete(self):
+        """Filter logs to only keep events with lifecycle:transition == 'complete'."""
+        print("Filtering logs for lifecycle:transition = 'complete'...")
+        col_name = 'lifecycle:transition'
+        
+        # Filter original log
+        if col_name in self.original_log.columns:
+            # Case-insensitive check
+            mask = self.original_log[col_name].astype(str).str.lower() == 'complete'
+            self.original_log = self.original_log[mask].copy()
+            print(f"  - Original log filtered: {len(self.original_log)} events remaining")
+        else:
+            print(f"  - Warning: '{col_name}' not found in original log")
+            
+        # Filter simulated log
+        if col_name in self.simulated_log.columns:
+            # Case-insensitive check
+            mask = self.simulated_log[col_name].astype(str).str.lower() == 'complete'
+            self.simulated_log = self.simulated_log[mask].copy()
+            print(f"  - Simulated log filtered: {len(self.simulated_log)} events remaining")
+        else:
+            print(f"  - Warning: '{col_name}' not found in simulated log")
+
     def compute_all_metrics(self) -> Dict:
         """
         Compute all benchmark metrics and return comprehensive comparison.
@@ -927,10 +956,10 @@ class SimulationBenchmark:
 
 # Example usage
 if __name__ == "__main__":
-    # Option 1: Direkt .xes Dateien laden
     benchmark = SimulationBenchmark(
-        'integration/output/ground_truth_log_100.csv',  # Original BPIC 2017 Log (possible subset)
-        'simulated_log_100.csv'  # Simulated Log
+        'integration/output/ground_truth_log.csv',  # Original BPIC 2017 Log (possible subset)
+        'integration/output/simulated_log.csv',  # Simulated Log
+        filter_lifecycle_complete=True  # Set this to True to filter only "complete" events (necessary for process transformer NAP)
     )
     
     # Analyse durchführen
