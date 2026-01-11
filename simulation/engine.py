@@ -877,8 +877,10 @@ class DESEngine:
         }
 
         processing_seconds = self._processing_time.predict(
-            prev_activity=prev_activity,
-            prev_lifecycle="complete",
+            # Request "Service Time" (Start -> Complete) instead of "Inter-Event Time"
+            # distinct from the "Wait Time" which is already handled by the DES queue.
+            prev_activity=activity,  
+            prev_lifecycle="start",
             curr_activity=activity,
             curr_lifecycle="complete",
             context=context,
