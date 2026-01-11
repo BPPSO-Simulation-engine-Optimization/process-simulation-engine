@@ -112,9 +112,17 @@ class ProcessTransformerPredictor:
         vocab_file = self.model_path / "vocab.json"
         config_file = self.model_path / "config.json"
 
-        # Lazy import TensorFlow
-        import tensorflow as tf
-        self.model = tf.keras.models.load_model(str(model_file))
+        # Lazy import TensorFlow / Keras
+        try:
+            import tf_keras as keras
+            import os
+            # Set internal flag to ensure tf_keras uses legacy format if needed
+            os.environ["TF_USE_LEGACY_KERAS"] = "1"
+        except ImportError:
+            import tensorflow as tf
+            keras = tf.keras
+
+        self.model = keras.models.load_model(str(model_file))
 
         with open(vocab_file, 'r') as f:
             vocab_data = json.load(f)
