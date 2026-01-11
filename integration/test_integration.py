@@ -2,6 +2,7 @@
 Integration test for the simulation engine with all prediction components.
 
 This script runs a full simulation using:
+- Next activity: configurable via --na-predictor (process_transformer, bpic17_simplified, unified, lstm, branch, stub)
 - Case arrivals: basic (stub) or advanced (CaseInterarrivalPipeline)
 - Processing times: basic (stub) or advanced (ProcessingTimePredictionClass)
 - Case attributes: basic (stub) or advanced (AttributeSimulationEngine)
@@ -11,6 +12,7 @@ This script runs a full simulation using:
 Usage:
     python -m integration.test_integration --mode basic
     python -m integration.test_integration --mode advanced --num-cases 31000
+    python -m integration.test_integration --mode advanced --na-predictor process_transformer
     python -m integration.test_integration --mode mixed --arrivals advanced --attributes basic
 """
 
@@ -29,7 +31,7 @@ sys.path.insert(0, str(project_root))
 
 from integration.config import SimulationConfig
 from integration.setup import setup_simulation
-from simulation.engine import DESEngine
+from simulation.engine import DESEngine, NextActivityPredictorType
 from simulation.log_exporter import LogExporter
 
 
@@ -102,6 +104,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print("\n" + "=" * 60)
     print("SIMULATION CONFIGURATION")
     print("=" * 60)
+    print(f"  Next activity predictor: {config.next_activity_predictor_type.value}")
     print(f"  Processing time mode: {config.processing_time_mode}")
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
@@ -115,9 +118,9 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         start_date = datetime(2016, 1, 4, 8, 0)
     print(f"Simulation start date: {start_date}")
 
-    # Setup predictors
+    # Setup predictors (next activity is handled by engine via type)
     print("\nSetting up predictors...")
-    arrivals, next_act_pred, proc_pred, attr_pred = setup_simulation(
+    arrivals, proc_pred, attr_pred = setup_simulation(
         config,
         df=df if config.case_arrival_mode == "advanced" or config.case_attribute_mode == "advanced" else None,
         start_date=start_date,
@@ -126,7 +129,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 
     # Create engine
     print("\nInitializing DESEngine...")
-    
+
     # Adjust start_time to be the earliest of simulation start date or first arrival
     # This prevents "Cannot go back in time" errors if the arrival generator
     # produces timestamps earlier in the day than the log's start time (due to normalization).
@@ -139,7 +142,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
-        next_activity_predictor=next_act_pred,
+        next_activity_predictor_type=config.next_activity_predictor_type,
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
@@ -226,6 +229,12 @@ def main():
         help="Output directory for simulated log"
     )
     parser.add_argument(
+        "--na-predictor",
+        choices=["process_transformer", "bpic17_simplified", "unified", "lstm", "branch", "stub"],
+        default=None,
+        help="Next activity predictor type (overrides mode default)"
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging"
@@ -247,19 +256,30 @@ def main():
         num_cases = df['case:concept:name'].nunique() #
         print(f"Simulating {num_cases} cases (same as original log)")
 
+    # Determine next activity predictor type
+    if args.na_predictor:
+        na_predictor_type = NextActivityPredictorType(args.na_predictor)
+    elif args.mode == "basic":
+        na_predictor_type = NextActivityPredictorType.STUB
+    else:
+        na_predictor_type = NextActivityPredictorType.BPIC17_SIMPLIFIED
+
     # Create configuration
     if args.mode == "basic":
         config = SimulationConfig.all_basic()
+        config.next_activity_predictor_type = na_predictor_type
     elif args.mode == "advanced":
         config = SimulationConfig.all_advanced(
             event_log_path=args.event_log,
             num_cases=num_cases,
+            next_activity_predictor_type=na_predictor_type,
         )
     else:  # mixed
         config = SimulationConfig(
             processing_time_mode=args.processing or "basic",
             case_arrival_mode=args.arrivals or "basic",
             case_attribute_mode=args.attributes or "basic",
+            next_activity_predictor_type=na_predictor_type,
             event_log_path=args.event_log,
             num_cases=num_cases,
             verbose=args.verbose,

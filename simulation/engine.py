@@ -31,6 +31,7 @@ import random
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import List, Dict, Optional, Protocol, Set
 from collections import defaultdict
 import heapq
@@ -43,6 +44,21 @@ from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
 
 logger = logging.getLogger(__name__)
+
+
+class NextActivityPredictorType(Enum):
+    """
+    Available next activity predictor types.
+
+    Use with DESEngine's next_activity_predictor_type parameter to specify
+    which predictor to load automatically.
+    """
+    PROCESS_TRANSFORMER = "process_transformer"
+    BPIC17_SIMPLIFIED = "bpic17_simplified"
+    UNIFIED = "unified"
+    LSTM = "lstm"
+    BRANCH = "branch"
+    STUB = "stub"
 
 
 @dataclass
@@ -261,6 +277,7 @@ class DESEngine:
         resource_allocator: ResourceAllocator,
         arrival_timestamps: List[datetime] = None,
         next_activity_predictor: NextActivityPredictor = None,
+        next_activity_predictor_type: NextActivityPredictorType = None,
         processing_time_predictor: ProcessingTimePredictor = None,
         case_arrival_predictor: CaseArrivalPredictor = None,
         case_attribute_predictor: CaseAttributePredictor = None,
@@ -269,27 +286,38 @@ class DESEngine:
     ):
         """
         Initialize the DES Engine.
-        
+
         Args:
             resource_allocator: Resource allocation component.
             arrival_timestamps: Pre-generated list of case arrival timestamps.
                 If provided, overrides case_arrival_predictor.
-            next_activity_predictor: Predicts next activity (uses stub if None).
-            processing_time_predictor: Predicts processing time (uses stub if None).
+            next_activity_predictor: Predicts next activity. If provided, takes precedence.
+            next_activity_predictor_type: Type of predictor to auto-load if next_activity_predictor
+                is not provided. See NextActivityPredictorType enum.
+            processing_time_predictor: Predicts processing time (required).
             case_arrival_predictor: Predicts inter-arrival time (uses stub if None).
-            case_attribute_predictor: Predicts case attributes (uses stub if None).
+            case_attribute_predictor: Predicts case attributes (required).
             start_time: Simulation start time.
+            max_activities_per_case: Safety limit to prevent infinite loops.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
         self.case_manager = CaseManager()
         self.allocator = resource_allocator
-        
+
         # Pre-generated arrival timestamps (optional)
         self._arrival_timestamps = arrival_timestamps
-        
-        # Predictors
-        self._next_activity = next_activity_predictor or self._create_next_activity_predictor()
+
+        # Next activity predictor: use provided instance, or create from type
+        if next_activity_predictor is not None:
+            self._next_activity = next_activity_predictor
+        elif next_activity_predictor_type is not None:
+            self._next_activity = self._create_next_activity_predictor(next_activity_predictor_type)
+        else:
+            raise ValueError(
+                "Either next_activity_predictor or next_activity_predictor_type is required. "
+                "Use NextActivityPredictorType.BPIC17_SIMPLIFIED or pass a predictor instance."
+            )
         self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
         # Processing time predictor is required (must be ProcessingTimePredictionClass)
@@ -330,75 +358,56 @@ class DESEngine:
             'wait_time_total_seconds': 0,  # Total time spent waiting
         }
     
-    def _create_next_activity_predictor(self):
+    def _create_next_activity_predictor(self, predictor_type: NextActivityPredictorType):
         """
-        Auto-load next activity predictor based on available models.
-        
-        Priority:
-        1. BPIC17 Simplified model (models/bpic17_simplified/) - optimized for start/complete lifecycle
-        2. Unified model (models/unified_next_activity/) - best for avoiding loops
-        3. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
-        4. BranchPredictor model (models/branch_predictor.joblib)
-        5. Stub predictor (fallback)
+        Create a next activity predictor based on the specified type.
+
+        Args:
+            predictor_type: The type of predictor to create.
+
+        Returns:
+            An instance of the requested predictor.
+
+        Raises:
+            ValueError: If the predictor type is unknown or cannot be loaded.
         """
+        import sys
         from pathlib import Path
-        
-        # Try BPIC17 Simplified model first (optimized for start/complete lifecycle)
-        bpic17_model_dir = Path("models/bpic17_simplified")
-        if bpic17_model_dir.exists() and (bpic17_model_dir / "model.keras").exists():
-            try:
-                logger.info("Loading BPIC17SimplifiedPredictor...")
-                import sys
-                import importlib
-                
-                # Add Next-Activity-Prediction to path
-                project_root = Path(__file__).parent.parent
-                na_root = project_root / "Next-Activity-Prediction"
-                if str(na_root) not in sys.path:
-                    sys.path.insert(0, str(na_root))
-                
-                # Try importing the predictor
-                try:
-                    from bpic17_simplified import BPIC17SimplifiedPredictor
-                except ImportError:
-                    # Try alternative import path
-                    predictor_module = importlib.import_module("bpic17_simplified.predictor")
-                    BPIC17SimplifiedPredictor = predictor_module.BPIC17SimplifiedPredictor
-                
-                return BPIC17SimplifiedPredictor(str(bpic17_model_dir))
-            except Exception as e:
-                logger.warning(f"Could not load BPIC17 Simplified predictor: {e}")
-        
-        # Try Unified model (best for avoiding loops)
-        unified_model_dir = Path(UnifiedNextActivityPredictor.DEFAULT_MODEL_PATH)
-        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
-            try:
-                logger.info("Loading UnifiedNextActivityPredictor...")
-                return UnifiedNextActivityPredictor(str(unified_model_dir))
-            except Exception as e:
-                logger.warning(f"Could not load Unified predictor: {e}")
-        
-        # Try LSTM models
-        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
-        if lstm_models_dir.exists() and any(lstm_models_dir.iterdir()):
-            try:
-                logger.info("Loading LSTMNextActivityPredictor...")
-                return LSTMNextActivityPredictor(str(lstm_models_dir))
-            except Exception as e:
-                logger.warning(f"Could not load LSTM predictor: {e}")
-        
-        # Fallback to BranchPredictor
-        model_path = Path(BranchNextActivityPredictor.DEFAULT_MODEL_PATH)
-        if model_path.exists():
-            try:
-                return BranchNextActivityPredictor(str(model_path))
-            except Exception as e:
-                logger.warning(f"Failed to load next activity model: {e}")
-        
-        # Last resort: stub
-        logger.info("Using stub next activity predictor "
-                   "(train model with: python Next-Activity-Prediction/bpic17_simplified/train.py)")
-        return _StubNextActivityPredictor()
+
+        # Add Next-Activity-Prediction to path for imports
+        project_root = Path(__file__).parent.parent
+        na_root = project_root / "Next-Activity-Prediction"
+        if str(na_root) not in sys.path:
+            sys.path.insert(0, str(na_root))
+
+        if predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
+            logger.info("Loading ProcessTransformerPredictor...")
+            from process_transformer import ProcessTransformerPredictor
+            return ProcessTransformerPredictor(model_path="models/process_transformer")
+
+        elif predictor_type == NextActivityPredictorType.BPIC17_SIMPLIFIED:
+            logger.info("Loading BPIC17SimplifiedPredictor...")
+            from bpic17_simplified import BPIC17SimplifiedPredictor
+            return BPIC17SimplifiedPredictor(model_path="models/bpic17_simplified")
+
+        elif predictor_type == NextActivityPredictorType.UNIFIED:
+            logger.info("Loading UnifiedNextActivityPredictor...")
+            return UnifiedNextActivityPredictor(model_path="models/unified_next_activity")
+
+        elif predictor_type == NextActivityPredictorType.LSTM:
+            logger.info("Loading LSTMNextActivityPredictor...")
+            return LSTMNextActivityPredictor(models_dir="Next-Activity-Prediction/advanced/models_lstm_new")
+
+        elif predictor_type == NextActivityPredictorType.BRANCH:
+            logger.info("Loading BranchNextActivityPredictor...")
+            return BranchNextActivityPredictor(model_path="models/branch_predictor.joblib")
+
+        elif predictor_type == NextActivityPredictorType.STUB:
+            logger.info("Using StubNextActivityPredictor...")
+            return _StubNextActivityPredictor()
+
+        else:
+            raise ValueError(f"Unknown predictor type: {predictor_type}")
     
     def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
         """
