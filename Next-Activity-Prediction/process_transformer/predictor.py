@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 # Default HuggingFace repository for auto-download
 DEFAULT_HF_REPO = "lgk03/bpic17-process-transformer_v1"
 
+# Counter for logging progress
+_PREDICTION_COUNT = 0
+
 
 class ProcessTransformerPredictor:
     """
@@ -192,7 +195,18 @@ class ProcessTransformerPredictor:
             padded = prefix_indices[-self.max_seq_len:]
 
         input_array = np.array([padded])
-        probs = self.model.predict(input_array, verbose=0)[0]
+        
+        # Optimize: Use __call__ instead of predict() for single-sample inference
+        # predict() has significant overhead for small batches
+        # training=False is important for dropout/batchnorm layers
+        probs = self.model(input_array, training=False).numpy()[0]
+        
+        # Log progress every 100 predictions to monitor hang
+        global _PREDICTION_COUNT
+        _PREDICTION_COUNT += 1
+        if _PREDICTION_COUNT % 100 == 0:
+            logger.info(f"ProcessTransformer: Generated {_PREDICTION_COUNT} predictions")
+
         return probs
 
     def _apply_repetition_penalty(self, probs, history: List[str]):
