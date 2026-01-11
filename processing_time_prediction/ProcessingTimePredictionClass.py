@@ -315,21 +315,37 @@ class ProcessingTimePredictionClass:
         prev_lifecycle: str,
         curr_activity: str,
         curr_lifecycle: str,
-        context: Optional[Dict] = None
+        context: Optional[Dict] = None,
     ) -> float:
         """
-        Predict processing time for a given transition.
+        Predict processing time (in seconds).
         
         Args:
-            prev_activity: Previous activity name
-            prev_lifecycle: Previous lifecycle transition
-            curr_activity: Current/next activity name
-            curr_lifecycle: Current/next lifecycle transition
-            context: Optional context dictionary (not used for distribution method, but kept for API compatibility)
-        
+            prev_activity: Name of the previous activity/event.
+            prev_lifecycle: Lifecycle transition of previous event (e.g. 'complete', 'start').
+            curr_activity: Name of the current activity/event.
+            curr_lifecycle: Lifecycle transition of current event.
+            context: Additional features (resource, case attributes, etc.)
+            
         Returns:
-            Predicted processing time in seconds (sampled from fitted distribution)
+            Predicted time difference in seconds.
         """
+        # CRITICAL FIX: Detect "Service Time" Query (start -> complete of same activity)
+        # The ML model was trained on "Inter-Event Time" (complete -> complete) and has no concept of 
+        # true service time (duration of the task itself). When asked for service time, it hallucinates 
+        # the average inter-event time (~7 hours), causing massive simulation delays and 200-year backlogs.
+        # We explicitly bypass the ML model for this specific query type and use a heuristic.
+        is_same_activity = (prev_activity == curr_activity)
+        is_service_time_lifecycle = (prev_lifecycle == 'start' and curr_lifecycle == 'complete')
+        
+        if is_service_time_lifecycle and is_same_activity:
+            import random
+            # Return a random duration between 1 minute and 10 minutes
+            # This is a reasonable heuristic for service time in this process
+            return random.uniform(60.0, 600.0)
+
+        # ... proceed with normal prediction for other transitions (e.g. Wait Time) ...
+
         transition_key = (str(prev_activity), str(prev_lifecycle), str(curr_activity), str(curr_lifecycle))
         
         if self.method == "distribution":
@@ -418,8 +434,13 @@ class ProcessingTimePredictionClass:
                     df_prepared = df_prepared[self.feature_names]
                     prediction = self.ml_model.predict(df_prepared)[0]
 
-                prediction = max(0.0, float(prediction))
+                raw_prediction = float(prediction)
+                prediction = max(0.0, raw_prediction)
                 
+                # Clamp to max 1 day to debug "years long" simulation
+                MAX_DURATION = 86400.0
+                prediction = min(prediction, MAX_DURATION)
+
                 return prediction
                 
             except Exception as e:

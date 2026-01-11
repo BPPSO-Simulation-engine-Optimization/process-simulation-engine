@@ -967,12 +967,14 @@ class DESEngine:
         Args:
             max_time: Optional maximum time to advance to.
         """
-        max_iterations = 100  # Safety limit (100 * potential 72h = weeks of simulation time)
+        max_iterations = 50000  # Safety limit increased for large simulations (was 100)
         iterations_without_progress = 0
-        max_no_progress = 3  # Stop if 3 time advances produce no dispatches
+        max_no_progress = 1000  # Stop if 1000 time advances produce no dispatches (was 3)
 
         initial_waiting = self.resource_pool.get_total_waiting_count()
         logger.info(f"Drain phase starting with {initial_waiting} waiting cases")
+
+        failure_reason = "No waiting work"  # Default reason
 
         while self.resource_pool.has_waiting_work() and iterations_without_progress < max_no_progress:
             current_time = self.clock.now
@@ -989,10 +991,10 @@ class DESEngine:
                     if not waiting_work:
                         break
 
-                    resource, failure_reason = self._try_allocate_resource_with_reason(
+                    resource, reason = self._try_allocate_resource_with_reason(
                         activity, current_time, waiting_work.case_state
                     )
-
+                    
                     if resource:
                         # Got a resource - dispatch the work
                         work = self.resource_pool.get_waiting_work(activity)
@@ -1011,6 +1013,7 @@ class DESEngine:
                         dispatched_this_round += 1
                     else:
                         # No resource available for this activity right now
+                        failure_reason = reason
                         break
 
             # Process any completion events that are now schedulable
@@ -1037,8 +1040,9 @@ class DESEngine:
                     return
 
                 time_jump = next_business_hour - current_time
-                logger.info(
-                    f"[Drain] No resources available, advancing {time_jump} to {next_business_hour}"
+                logger.debug(
+                    f"[Drain] No resources available (last reason: {failure_reason}), "
+                    f"advancing {time_jump} to {next_business_hour}"
                 )
                 self.clock.advance_to(next_business_hour)
                 iterations_without_progress += 1
