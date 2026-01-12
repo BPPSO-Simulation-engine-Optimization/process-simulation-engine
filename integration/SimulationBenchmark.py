@@ -176,6 +176,14 @@ class SimulationBenchmark:
         print("  - Activity durations...")
         self.results['activity_durations'] = self._compare_activity_durations()
         
+        # Overall activity distribution
+        print("  - Overall activity distribution...")
+        self.results['activity_distribution'] = self._compare_activity_distribution()
+        
+        # Simple similarity metrics
+        print("  - Simple similarity metrics...")
+        self.results['simple_metrics'] = self._compute_simple_metrics()
+        
         # Resource statistics (if available)
         if 'resource' in self.original_log.columns and 'resource' in self.simulated_log.columns:
             print("  - Resource statistics...")
@@ -622,6 +630,160 @@ class SimulationBenchmark:
         pairs = list(zip(log['activity'], log['resource']))
         return Counter(pairs)
     
+    def _compare_activity_distribution(self) -> pd.DataFrame:
+        """Compare overall activity frequency distribution across all events."""
+        orig_activities = self.original_log['activity'].value_counts()
+        sim_activities = self.simulated_log['activity'].value_counts()
+        
+        # Create rank mappings
+        orig_rank_map = {activity: rank + 1 for rank, activity in enumerate(orig_activities.index)}
+        sim_rank_map = {activity: rank + 1 for rank, activity in enumerate(sim_activities.index)}
+        
+        # Get union of all activities
+        all_activities = list(set(orig_activities.index) | set(sim_activities.index))
+        
+        # Calculate totals
+        orig_total = orig_activities.sum()
+        sim_total = sim_activities.sum()
+        
+        comparison = []
+        for activity in all_activities:
+            orig_count = orig_activities.get(activity, 0)
+            sim_count = sim_activities.get(activity, 0)
+            
+            comparison.append({
+                'Activity': activity,
+                'Original Count': orig_count,
+                'Original Share (%)': 100 * orig_count / orig_total if orig_total > 0 else 0,
+                'Original Rank': orig_rank_map.get(activity),
+                'Simulated Count': sim_count,
+                'Simulated Share (%)': 100 * sim_count / sim_total if sim_total > 0 else 0,
+                'Simulated Rank': sim_rank_map.get(activity),
+                'Count Difference': sim_count - orig_count,
+                'Share Difference (%)': (100 * sim_count / sim_total if sim_total > 0 else 0) - (100 * orig_count / orig_total if orig_total > 0 else 0)
+            })
+        
+        df = pd.DataFrame(comparison)
+        df = df.sort_values('Original Count', ascending=False)
+        
+        return df
+    
+    def _compute_simple_metrics(self) -> pd.DataFrame:
+        """Compute simple similarity and overlap metrics."""
+        metrics = []
+        
+        # Activity overlap
+        orig_activities = set(self.original_log['activity'].unique())
+        sim_activities = set(self.simulated_log['activity'].unique())
+        activity_intersection = orig_activities & sim_activities
+        activity_union = orig_activities | sim_activities
+        activity_jaccard = len(activity_intersection) / len(activity_union) if len(activity_union) > 0 else 0
+        activity_overlap_pct = 100 * len(activity_intersection) / len(orig_activities) if len(orig_activities) > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Activity Overlap',
+            'Value': f'{len(activity_intersection)} / {len(orig_activities)} activities',
+            'Percentage': activity_overlap_pct
+        })
+        metrics.append({
+            'Metric': 'Activity Jaccard Similarity',
+            'Value': f'{activity_jaccard:.4f}',
+            'Percentage': 100 * activity_jaccard
+        })
+        
+        # Trace variant overlap
+        orig_variants = self._extract_variants(self.original_log)
+        sim_variants = self._extract_variants(self.simulated_log)
+        variant_intersection = set(orig_variants.keys()) & set(sim_variants.keys())
+        variant_union = set(orig_variants.keys()) | set(sim_variants.keys())
+        variant_jaccard = len(variant_intersection) / len(variant_union) if len(variant_union) > 0 else 0
+        variant_overlap_pct = 100 * len(variant_intersection) / len(orig_variants) if len(orig_variants) > 0 else 0
+        
+        # Top variant overlap (top 10)
+        orig_top10 = set([v for v, _ in orig_variants.most_common(10)])
+        sim_top10 = set([v for v, _ in sim_variants.most_common(10)])
+        top10_overlap = len(orig_top10 & sim_top10)
+        
+        metrics.append({
+            'Metric': 'Trace Variant Overlap',
+            'Value': f'{len(variant_intersection)} / {len(orig_variants)} variants',
+            'Percentage': variant_overlap_pct
+        })
+        metrics.append({
+            'Metric': 'Trace Variant Jaccard Similarity',
+            'Value': f'{variant_jaccard:.4f}',
+            'Percentage': 100 * variant_jaccard
+        })
+        metrics.append({
+            'Metric': 'Top 10 Variant Overlap',
+            'Value': f'{top10_overlap} / 10 variants',
+            'Percentage': 100 * top10_overlap / 10
+        })
+        
+        # DFG edge overlap
+        orig_dfg = self._extract_dfg(self.original_log)
+        sim_dfg = self._extract_dfg(self.simulated_log)
+        dfg_intersection = set(orig_dfg.keys()) & set(sim_dfg.keys())
+        dfg_union = set(orig_dfg.keys()) | set(sim_dfg.keys())
+        dfg_jaccard = len(dfg_intersection) / len(dfg_union) if len(dfg_union) > 0 else 0
+        dfg_overlap_pct = 100 * len(dfg_intersection) / len(orig_dfg) if len(orig_dfg) > 0 else 0
+        
+        # Top DFG edge overlap (top 20)
+        orig_top20_dfg = set([e for e, _ in orig_dfg.most_common(20)])
+        sim_top20_dfg = set([e for e, _ in sim_dfg.most_common(20)])
+        top20_dfg_overlap = len(orig_top20_dfg & sim_top20_dfg)
+        
+        metrics.append({
+            'Metric': 'DFG Edge Overlap',
+            'Value': f'{len(dfg_intersection)} / {len(orig_dfg)} edges',
+            'Percentage': dfg_overlap_pct
+        })
+        metrics.append({
+            'Metric': 'DFG Edge Jaccard Similarity',
+            'Value': f'{dfg_jaccard:.4f}',
+            'Percentage': 100 * dfg_jaccard
+        })
+        metrics.append({
+            'Metric': 'Top 20 DFG Edge Overlap',
+            'Value': f'{top20_dfg_overlap} / 20 edges',
+            'Percentage': 100 * top20_dfg_overlap / 20
+        })
+        
+        # Case count ratio
+        orig_cases = self.original_log['case_id'].nunique()
+        sim_cases = self.simulated_log['case_id'].nunique()
+        case_ratio = sim_cases / orig_cases if orig_cases > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Case Count Ratio',
+            'Value': f'{sim_cases} / {orig_cases} cases',
+            'Percentage': 100 * case_ratio
+        })
+        
+        # Event count ratio
+        orig_events = len(self.original_log)
+        sim_events = len(self.simulated_log)
+        event_ratio = sim_events / orig_events if orig_events > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Event Count Ratio',
+            'Value': f'{sim_events} / {orig_events} events',
+            'Percentage': 100 * event_ratio
+        })
+        
+        # Average events per case ratio
+        orig_avg_events = orig_events / orig_cases if orig_cases > 0 else 0
+        sim_avg_events = sim_events / sim_cases if sim_cases > 0 else 0
+        avg_events_ratio = sim_avg_events / orig_avg_events if orig_avg_events > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Avg Events per Case Ratio',
+            'Value': f'{sim_avg_events:.2f} / {orig_avg_events:.2f} events',
+            'Percentage': 100 * avg_events_ratio
+        })
+        
+        return pd.DataFrame(metrics)
+    
     def _multiclass_roc_auc_score(self, y_test, y_pred, average='macro'):
         """Calculate multiclass ROC AUC score using LabelBinarizer."""
         lb = LabelBinarizer()
@@ -693,6 +855,14 @@ class SimulationBenchmark:
         print("\n### ACTIVITY DURATIONS (Time to Next Event) ###")
         print(self.results['activity_durations'].to_string(index=False))
         
+        # Overall activity distribution
+        print("\n### OVERALL ACTIVITY DISTRIBUTION ###")
+        print(self.results['activity_distribution'].to_string(index=False))
+        
+        # Simple metrics
+        print("\n### SIMPLE SIMILARITY METRICS ###")
+        print(self.results['simple_metrics'].to_string(index=False))
+        
         # Resources (if available)
         if 'resource_stats' in self.results:
             print("\n### RESOURCE STATISTICS ###")
@@ -729,6 +899,8 @@ class SimulationBenchmark:
             self.results['start_activities'].to_excel(writer, sheet_name='Start Activities', index=False)
             self.results['end_activities'].to_excel(writer, sheet_name='End Activities', index=False)
             self.results['activity_durations'].to_excel(writer, sheet_name='Activity Durations', index=False)
+            self.results['activity_distribution'].to_excel(writer, sheet_name='Activity Distribution', index=False)
+            self.results['simple_metrics'].to_excel(writer, sheet_name='Simple Metrics', index=False)
             
             if 'resource_stats' in self.results:
                 self.results['resource_stats'].to_excel(writer, sheet_name='Resource Stats', index=False)

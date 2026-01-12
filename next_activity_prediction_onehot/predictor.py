@@ -123,8 +123,17 @@ class LSTMNextActivityPredictorOneHot:
             X = np.array([sequence_onehot], dtype=np.float32)
             
             activity_probs = self.model.predict(X, verbose=0)
+            probs = activity_probs[0]
             
-            next_activity_idx = np.argmax(activity_probs[0])
+            # Get top 3 predictions
+            top_3_indices = np.argsort(probs)[-3:][::-1]
+            top_3_probs = probs[top_3_indices]
+            
+            # Normalize probabilities for sampling
+            top_3_probs_normalized = top_3_probs / np.sum(top_3_probs)
+            
+            # Sample from top 3 based on probabilities
+            next_activity_idx = np.random.choice(top_3_indices, p=top_3_probs_normalized)
             next_activity = self.idx_to_activity.get(next_activity_idx, history_for_prediction[-1] if history_for_prediction else "A_Complete")
             
             is_end = (next_activity == "END" or next_activity_idx == self.end_token_idx)
