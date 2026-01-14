@@ -139,7 +139,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
-        next_activity_predictor=next_act_pred,
+        next_activity_predictor=next_act_pred,  # May be None for auto-load
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
@@ -211,7 +211,7 @@ def main():
     )
     parser.add_argument(
         "--event-log",
-        default="eventlog/eventlog.xes.gz",
+        default="Dataset/BPI Challenge 2017.xes",
         help="Path to event log file"
     )
     parser.add_argument(

@@ -5,11 +5,22 @@ Provides factory functions to create and configure prediction components
 based on SimulationConfig settings.
 """
 
+import os
+# TensorFlow Warnungen unterdrücken (muss vor TF-Import sein)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0=alle, 1=INFO weg, 2=WARNING weg, 3=ERROR weg
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # oneDNN Meldungen ausschalten
+
+import warnings
+# Unterdrücke nicht-kritische Warnungen
+warnings.filterwarnings('ignore', message='.*rustxes.*')
+warnings.filterwarnings('ignore', message='.*oneDNN.*')
+warnings.filterwarnings('ignore', message='.*np.object.*')
+
 import random
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Tuple, Optional, Any
-import os
 import pandas as pd
 
 from .config import SimulationConfig
@@ -34,6 +45,7 @@ def setup_simulation(
 
     Returns:
         Tuple of (arrival_timestamps, next_activity_predictor, processing_time_predictor, case_attribute_predictor)
+        next_activity_predictor may be None if auto-load should be used.
 
     Raises:
         ValueError: If advanced mode requires df but df is None.
@@ -55,7 +67,7 @@ def setup_simulation(
     # 1. Case arrival timestamps
     arrival_timestamps = _setup_arrivals(config, df, start_date)
 
-    # 2. Next activity predictor
+    # 2. Next activity predictor (optional, None = use engine auto-load)
     next_activity_pred = _setup_next_activity(config)
 
     # 3. Processing time predictor
@@ -67,6 +79,105 @@ def setup_simulation(
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
+def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
+    """
+    Try to load a next activity predictor from the given path.
+    
+    Args:
+        model_path: Path to model directory
+        model_type: "embedding", "onehot", or "auto"
+        
+    Returns:
+        Predictor instance if successful, None otherwise
+    """
+    model_file = model_path / "model.keras"
+    checkpoint_file = model_path / "checkpoints" / "best_model.keras"
+    
+    if not model_path.exists() or (not model_file.exists() and not checkpoint_file.exists()):
+        return None
+    
+    # Determine which predictor to try based on model_type
+    # If "auto", try both in order
+    predictors_to_try = []
+    if model_type == "embedding":
+        predictors_to_try = [("embedding", "next_activity_prediction", "LSTMNextActivityPredictor")]
+    elif model_type == "onehot":
+        predictors_to_try = [("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot")]
+    else:  # auto
+        predictors_to_try = [
+            ("embedding", "next_activity_prediction", "LSTMNextActivityPredictor"),
+            ("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot"),
+        ]
+    
+    for pred_type, module_name, class_name in predictors_to_try:
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            PredictorClass = getattr(module, class_name)
+            
+            if checkpoint_file.exists():
+                predictor = PredictorClass(model_path=str(checkpoint_file))
+                logger.info(f"✓ {pred_type.capitalize()} model loaded from checkpoint: {checkpoint_file}")
+            else:
+                predictor = PredictorClass(model_path=str(model_path))
+                logger.info(f"✓ {pred_type.capitalize()} model loaded from: {model_path}")
+            
+            return predictor
+        except ImportError:
+            continue
+        except Exception as e:
+            logger.debug(f"Could not load {pred_type} predictor from {model_path}: {e}")
+            continue
+    
+    return None
+
+
+def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
+    """
+    Set up next activity predictor based on config.
+    
+    Supports both embedding-based and one-hot encoded models.
+    
+    Args:
+        config: Simulation configuration
+        
+    Returns:
+        Next activity predictor instance, or None to use engine auto-load
+    """
+    from pathlib import Path
+    
+    model_type = getattr(config, 'next_activity_model_type', 'auto')
+    
+    if config.next_activity_mode == "advanced" and config.next_activity_model_path:
+        model_path = Path(config.next_activity_model_path)
+        
+        predictor = _try_load_predictor(model_path, model_type)
+        if predictor:
+            logger.info("Setting up next activity predictor...")
+            return predictor
+        else:
+            logger.warning(f"Next activity model not found at {model_path}")
+            logger.info("Falling back to engine auto-load")
+            return None
+    
+    # Basic mode - check both possible locations for auto-load
+    possible_paths = [
+        Path("models/next_activity_lstm"),
+        Path("next_activity_prediction/models/next_activity_lstm"),
+        Path("models/next_activity_lstm_onehot"),
+        Path("next_activity_prediction_onehot/models/next_activity_lstm_onehot"),
+    ]
+    
+    for model_path in possible_paths:
+        predictor = _try_load_predictor(model_path, model_type)
+        if predictor:
+            logger.info(f"Auto-loading next activity predictor from {model_path}...")
+            return predictor
+    
+    # No model found - return None to trigger engine auto-load (which will try again)
+    logger.info("No next activity model found, using engine auto-load fallback")
+    return None
+
+
 def _setup_arrivals(
     config: SimulationConfig,
     df: Optional[pd.DataFrame],
@@ -76,6 +187,13 @@ def _setup_arrivals(
     if config.case_arrival_mode == "advanced":
         logger.info("Setting up advanced case arrival using runner API...")
         try:
+            import sys
+            from pathlib import Path
+            # Add Instance Spawn Rate/Advanced to path
+            advanced_path = Path(__file__).parent.parent / "Instance Spawn Rate" / "Advanced"
+            if str(advanced_path) not in sys.path:
+                sys.path.insert(0, str(advanced_path))
+            
             from case_arrival_times_prediction import run
             from case_arrival_times_prediction.config import SimulationConfig as ArrivalConfig
 
@@ -126,8 +244,8 @@ def _setup_arrivals(
                     start_date=start_date,
                 )
 
-                # Convert to datetime objects
-                arrival_timestamps = [ts.to_pydatetime() for ts in timestamps]
+                # Convert to datetime objects (floor to microseconds to avoid nanosecond precision loss)
+                arrival_timestamps = [ts.floor('us').to_pydatetime() for ts in timestamps]
 
                 if len(arrival_timestamps) >= config.num_cases:
                     # Success: slice to exact num_cases and return
@@ -226,6 +344,13 @@ def _setup_case_attributes(
     Always returns an AttributeSimulationEngine instance.
     By default loads from cached artifacts. Only retrains if explicitly requested.
     """
+    import sys
+    from pathlib import Path
+    # Add Instance Spawn Rate/Advanced to path
+    advanced_path = Path(__file__).parent.parent / "Instance Spawn Rate" / "Advanced"
+    if str(advanced_path) not in sys.path:
+        sys.path.insert(0, str(advanced_path))
+    
     from case_attribute_prediction.simulator import AttributeSimulationEngine
 
     logger.info("Setting up case attribute predictor (AttributeSimulationEngine)...")
@@ -254,64 +379,3 @@ def _setup_case_attributes(
     mode_desc = "retrained from event log" if retrain else "from cached artifacts"
     logger.info(f"Loaded AttributeSimulationEngine ({mode_desc})")
     return predictor
-
-
-def _setup_next_activity(config: SimulationConfig) -> Any:
-    """
-    Set up next activity predictor based on config.
-    
-    Returns predictor based on mode:
-    - "advanced": UnifiedNextActivityPredictor (preferred) or LSTMNextActivityPredictor
-    - "basic": None (engine will auto-load)
-    """
-    from pathlib import Path
-    
-    if config.next_activity_mode == "advanced":
-        # Try Unified model first (best for avoiding loops)
-        unified_model_dir = Path("models/unified_next_activity")
-        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
-            logger.info("Setting up advanced next activity predictor (Unified)...")
-            try:
-                from simulation.engine import UnifiedNextActivityPredictor
-                predictor = UnifiedNextActivityPredictor(
-                    model_path=str(unified_model_dir),
-                    max_history=15,
-                    seed=config.random_seed,
-                )
-                logger.info("✓ UNIFIED ADVANCED MODEL LOADED")
-                return predictor
-            except Exception as e:
-                import traceback
-                logger.warning(f"Unified predictor load failed: {e}")
-                logger.debug(f"Traceback:\n{traceback.format_exc()}")
-        
-        # Fall back to LSTM models
-        logger.info("Setting up advanced next activity predictor (LSTM)...")
-        from simulation.engine import LSTMNextActivityPredictor
-        
-        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
-        if not lstm_models_dir.exists():
-            logger.warning(f"LSTM models directory not found: {lstm_models_dir}")
-            logger.info("Falling back to auto-load (will try BranchPredictor or Stub)")
-            return None
-        
-        try:
-            predictor = LSTMNextActivityPredictor(
-                models_dir=str(lstm_models_dir),
-                max_history=15,
-                seed=config.random_seed,
-            )
-            logger.info(f"✓ LSTM ADVANCED MODEL LOADED: {len(predictor.models)} models")
-            logger.info(f"✓ Process graph: {len(predictor.process_graph)} nodes")
-            logger.info(f"✓ Decision points: {len(predictor.decision_point_map)} DPs")
-            return predictor
-        except Exception as e:
-            import traceback
-            logger.error(f"!!! LSTM predictor load FAILED: {e}")
-            logger.error(f"Traceback:\n{traceback.format_exc()}")
-            logger.info("Falling back to auto-load")
-            return None
-    
-    # Basic mode - return None to trigger auto-load in engine
-    logger.info("Using engine auto-load for next activity prediction")
-    return None
