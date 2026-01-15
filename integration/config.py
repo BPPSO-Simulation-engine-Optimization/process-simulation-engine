@@ -7,8 +7,6 @@ Provides a dataclass to configure basic vs advanced mode for each prediction com
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
-from simulation.engine import NextActivityPredictorType
-
 
 @dataclass
 class SimulationConfig:
@@ -23,8 +21,11 @@ class SimulationConfig:
     processing_time_method: Literal["distribution", "ml", "probabilistic_ml"] = "ml"
     processing_time_model_path: Optional[str] = "models/processing_time_model"
 
-    # Next activity prediction - use enum for explicit predictor selection
-    next_activity_predictor_type: NextActivityPredictorType = NextActivityPredictorType.BPIC17_SIMPLIFIED
+    # Next activity prediction
+    # "basic" = auto-load (engine will try to find model), "advanced" = explicit model path
+    next_activity_mode: Literal["basic", "advanced"] = "basic"
+    next_activity_model_path: Optional[str] = "next_activity_prediction/models/next_activity_lstm"
+    next_activity_model_type: Literal["embedding", "onehot", "auto"] = "auto"
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
@@ -56,7 +57,7 @@ class SimulationConfig:
     @classmethod
     def all_basic(cls) -> "SimulationConfig":
         """Create configuration with all basic/stub predictors."""
-        return cls(next_activity_predictor_type=NextActivityPredictorType.STUB)
+        return cls()
 
     @classmethod
     def all_advanced(
@@ -64,13 +65,12 @@ class SimulationConfig:
         event_log_path: str,
         processing_time_model_path: str = "models/processing_time_model",
         num_cases: int = 100,
-        next_activity_predictor_type: NextActivityPredictorType = NextActivityPredictorType.BPIC17_SIMPLIFIED,
     ) -> "SimulationConfig":
         """Create configuration with all advanced predictors."""
         return cls(
             processing_time_mode="advanced",
             processing_time_model_path=processing_time_model_path,
-            next_activity_predictor_type=next_activity_predictor_type,
+            next_activity_mode="advanced",
             case_arrival_mode="advanced",
             case_attribute_mode="advanced",
             event_log_path=event_log_path,

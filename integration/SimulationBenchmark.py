@@ -25,7 +25,6 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    warnings.warn("sklearn not available. Next activity prediction metrics will not work.")
 
 warnings.filterwarnings('ignore')
 
@@ -206,9 +205,13 @@ class SimulationBenchmark:
         print("  - Activity durations...")
         self.results['activity_durations'] = self._compare_activity_durations()
         
-        # Next Activity Prediction metrics
-        print("  - Next Activity Prediction metrics...")
-        self.results['next_activity_metrics'] = self._compute_next_activity_metrics()
+        # Overall activity distribution
+        print("  - Overall activity distribution...")
+        self.results['activity_distribution'] = self._compare_activity_distribution()
+        
+        # Simple similarity metrics
+        print("  - Simple similarity metrics...")
+        self.results['simple_metrics'] = self._compute_simple_metrics()
         
         # Resource statistics (if available)
         if 'resource' in self.original_log.columns and 'resource' in self.simulated_log.columns:
@@ -656,6 +659,160 @@ class SimulationBenchmark:
         pairs = list(zip(log['activity'], log['resource']))
         return Counter(pairs)
     
+    def _compare_activity_distribution(self) -> pd.DataFrame:
+        """Compare overall activity frequency distribution across all events."""
+        orig_activities = self.original_log['activity'].value_counts()
+        sim_activities = self.simulated_log['activity'].value_counts()
+        
+        # Create rank mappings
+        orig_rank_map = {activity: rank + 1 for rank, activity in enumerate(orig_activities.index)}
+        sim_rank_map = {activity: rank + 1 for rank, activity in enumerate(sim_activities.index)}
+        
+        # Get union of all activities
+        all_activities = list(set(orig_activities.index) | set(sim_activities.index))
+        
+        # Calculate totals
+        orig_total = orig_activities.sum()
+        sim_total = sim_activities.sum()
+        
+        comparison = []
+        for activity in all_activities:
+            orig_count = orig_activities.get(activity, 0)
+            sim_count = sim_activities.get(activity, 0)
+            
+            comparison.append({
+                'Activity': activity,
+                'Original Count': orig_count,
+                'Original Share (%)': 100 * orig_count / orig_total if orig_total > 0 else 0,
+                'Original Rank': orig_rank_map.get(activity),
+                'Simulated Count': sim_count,
+                'Simulated Share (%)': 100 * sim_count / sim_total if sim_total > 0 else 0,
+                'Simulated Rank': sim_rank_map.get(activity),
+                'Count Difference': sim_count - orig_count,
+                'Share Difference (%)': (100 * sim_count / sim_total if sim_total > 0 else 0) - (100 * orig_count / orig_total if orig_total > 0 else 0)
+            })
+        
+        df = pd.DataFrame(comparison)
+        df = df.sort_values('Original Count', ascending=False)
+        
+        return df
+    
+    def _compute_simple_metrics(self) -> pd.DataFrame:
+        """Compute simple similarity and overlap metrics."""
+        metrics = []
+        
+        # Activity overlap
+        orig_activities = set(self.original_log['activity'].unique())
+        sim_activities = set(self.simulated_log['activity'].unique())
+        activity_intersection = orig_activities & sim_activities
+        activity_union = orig_activities | sim_activities
+        activity_jaccard = len(activity_intersection) / len(activity_union) if len(activity_union) > 0 else 0
+        activity_overlap_pct = 100 * len(activity_intersection) / len(orig_activities) if len(orig_activities) > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Activity Overlap',
+            'Value': f'{len(activity_intersection)} / {len(orig_activities)} activities',
+            'Percentage': activity_overlap_pct
+        })
+        metrics.append({
+            'Metric': 'Activity Jaccard Similarity',
+            'Value': f'{activity_jaccard:.4f}',
+            'Percentage': 100 * activity_jaccard
+        })
+        
+        # Trace variant overlap
+        orig_variants = self._extract_variants(self.original_log)
+        sim_variants = self._extract_variants(self.simulated_log)
+        variant_intersection = set(orig_variants.keys()) & set(sim_variants.keys())
+        variant_union = set(orig_variants.keys()) | set(sim_variants.keys())
+        variant_jaccard = len(variant_intersection) / len(variant_union) if len(variant_union) > 0 else 0
+        variant_overlap_pct = 100 * len(variant_intersection) / len(orig_variants) if len(orig_variants) > 0 else 0
+        
+        # Top variant overlap (top 10)
+        orig_top10 = set([v for v, _ in orig_variants.most_common(10)])
+        sim_top10 = set([v for v, _ in sim_variants.most_common(10)])
+        top10_overlap = len(orig_top10 & sim_top10)
+        
+        metrics.append({
+            'Metric': 'Trace Variant Overlap',
+            'Value': f'{len(variant_intersection)} / {len(orig_variants)} variants',
+            'Percentage': variant_overlap_pct
+        })
+        metrics.append({
+            'Metric': 'Trace Variant Jaccard Similarity',
+            'Value': f'{variant_jaccard:.4f}',
+            'Percentage': 100 * variant_jaccard
+        })
+        metrics.append({
+            'Metric': 'Top 10 Variant Overlap',
+            'Value': f'{top10_overlap} / 10 variants',
+            'Percentage': 100 * top10_overlap / 10
+        })
+        
+        # DFG edge overlap
+        orig_dfg = self._extract_dfg(self.original_log)
+        sim_dfg = self._extract_dfg(self.simulated_log)
+        dfg_intersection = set(orig_dfg.keys()) & set(sim_dfg.keys())
+        dfg_union = set(orig_dfg.keys()) | set(sim_dfg.keys())
+        dfg_jaccard = len(dfg_intersection) / len(dfg_union) if len(dfg_union) > 0 else 0
+        dfg_overlap_pct = 100 * len(dfg_intersection) / len(orig_dfg) if len(orig_dfg) > 0 else 0
+        
+        # Top DFG edge overlap (top 20)
+        orig_top20_dfg = set([e for e, _ in orig_dfg.most_common(20)])
+        sim_top20_dfg = set([e for e, _ in sim_dfg.most_common(20)])
+        top20_dfg_overlap = len(orig_top20_dfg & sim_top20_dfg)
+        
+        metrics.append({
+            'Metric': 'DFG Edge Overlap',
+            'Value': f'{len(dfg_intersection)} / {len(orig_dfg)} edges',
+            'Percentage': dfg_overlap_pct
+        })
+        metrics.append({
+            'Metric': 'DFG Edge Jaccard Similarity',
+            'Value': f'{dfg_jaccard:.4f}',
+            'Percentage': 100 * dfg_jaccard
+        })
+        metrics.append({
+            'Metric': 'Top 20 DFG Edge Overlap',
+            'Value': f'{top20_dfg_overlap} / 20 edges',
+            'Percentage': 100 * top20_dfg_overlap / 20
+        })
+        
+        # Case count ratio
+        orig_cases = self.original_log['case_id'].nunique()
+        sim_cases = self.simulated_log['case_id'].nunique()
+        case_ratio = sim_cases / orig_cases if orig_cases > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Case Count Ratio',
+            'Value': f'{sim_cases} / {orig_cases} cases',
+            'Percentage': 100 * case_ratio
+        })
+        
+        # Event count ratio
+        orig_events = len(self.original_log)
+        sim_events = len(self.simulated_log)
+        event_ratio = sim_events / orig_events if orig_events > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Event Count Ratio',
+            'Value': f'{sim_events} / {orig_events} events',
+            'Percentage': 100 * event_ratio
+        })
+        
+        # Average events per case ratio
+        orig_avg_events = orig_events / orig_cases if orig_cases > 0 else 0
+        sim_avg_events = sim_events / sim_cases if sim_cases > 0 else 0
+        avg_events_ratio = sim_avg_events / orig_avg_events if orig_avg_events > 0 else 0
+        
+        metrics.append({
+            'Metric': 'Avg Events per Case Ratio',
+            'Value': f'{sim_avg_events:.2f} / {orig_avg_events:.2f} events',
+            'Percentage': 100 * avg_events_ratio
+        })
+        
+        return pd.DataFrame(metrics)
+    
     def _multiclass_roc_auc_score(self, y_test, y_pred, average='macro'):
         """Calculate multiclass ROC AUC score using LabelBinarizer."""
         lb = LabelBinarizer()
@@ -671,143 +828,6 @@ class SimulationBenchmark:
         y_test_bin = lb.transform(y_test)
         y_pred_bin = lb.transform(y_pred)
         return average_precision_score(y_test_bin, y_pred_bin, average=average)
-    
-    def _compute_next_activity_metrics(self) -> Dict:
-        """
-        Compute Next Activity Prediction metrics by comparing simulated vs original logs.
-        
-        Uses sklearn classification metrics similar to LSTM next activity prediction:
-        - Classification report (precision, recall, f1-score per class)
-        - Macro-averaged metrics
-        - Weighted metrics
-        - AUC and AUC-PR scores
-        
-        Returns:
-            Dictionary with classification report and all metrics
-        """
-        if not SKLEARN_AVAILABLE:
-            return {
-                'error': 'sklearn not available. Install with: pip install scikit-learn'
-            }
-        
-        try:
-            # Align next activity sequences between logs
-            y_true, y_pred = self._align_next_activity_sequences()
-            
-            if len(y_true) == 0 or len(y_pred) == 0:
-                return {
-                    'error': 'Could not align sequences between logs',
-                    'note': 'Original and simulated logs have different case structures'
-                }
-            
-            # Calculate macro-averaged metrics
-            precision, recall, fscore, support = precision_recall_fscore_support(
-                y_true, y_pred, average='macro', zero_division=0
-            )
-            
-            # Calculate weighted metrics
-            precision_weighted, recall_weighted, fscore_weighted, _ = precision_recall_fscore_support(
-                y_true, y_pred, average='weighted', zero_division=0
-            )
-            
-            # Calculate accuracy
-            accuracy = accuracy_score(y_true, y_pred)
-            
-            # Calculate AUC scores
-            try:
-                auc_score_macro = self._multiclass_roc_auc_score(y_true, y_pred, average='macro')
-                prauc_score_macro = self._multiclass_pr_auc_score(y_true, y_pred, average='macro')
-            except Exception as e:
-                auc_score_macro = f"Error: {str(e)}"
-                prauc_score_macro = f"Error: {str(e)}"
-            
-            # Generate classification report as string
-            class_report_str = classification_report(y_true, y_pred, digits=3, zero_division=0)
-            
-            # Generate classification report as dict for detailed analysis
-            class_report_dict = classification_report(y_true, y_pred, digits=3, 
-                                                     output_dict=True, zero_division=0)
-            
-            # Extract per-class metrics for DataFrame
-            per_class_metrics = []
-            for activity, metrics in class_report_dict.items():
-                if activity not in ['accuracy', 'macro avg', 'weighted avg']:
-                    if isinstance(metrics, dict):
-                        per_class_metrics.append({
-                            'Activity': activity,
-                            'Precision': metrics['precision'],
-                            'Recall': metrics['recall'],
-                            'F1-Score': metrics['f1-score'],
-                            'Support': int(metrics['support'])
-                        })
-            
-            per_class_df = pd.DataFrame(per_class_metrics).sort_values('Support', ascending=False)
-            
-            return {
-                'classification_report': class_report_str,
-                'overall_metrics': {
-                    'Accuracy': accuracy,
-                    'Precision (Macro)': precision,
-                    'Recall (Macro)': recall,
-                    'F1-Score (Macro)': fscore,
-                    'Precision (Weighted)': precision_weighted,
-                    'Recall (Weighted)': recall_weighted,
-                    'F1-Score (Weighted)': fscore_weighted,
-                    'AUC (Macro)': auc_score_macro,
-                    'AUC-PR (Macro)': prauc_score_macro,
-                    'Total Samples': len(y_true)
-                },
-                'per_class_metrics': per_class_df,
-                'confusion_summary': {
-                    'Total Predictions': len(y_pred),
-                    'Correct Predictions': int((y_true == y_pred).sum()),
-                    'Incorrect Predictions': int((y_true != y_pred).sum()),
-                    'Accuracy Rate': float((y_true == y_pred).sum() / len(y_true))
-                }
-            }
-        
-        except Exception as e:
-            return {
-                'error': f'Error computing next activity metrics: {str(e)}'
-            }
-    
-    def _align_next_activity_sequences(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Align next activity sequences between original and simulated logs.
-        
-        Creates aligned pairs of (actual_next_activity, predicted_next_activity)
-        by comparing traces from both logs position by position. Since case IDs differ,
-        we compare cases by their order (first case in original vs first case in simulated).
-        
-        Returns:
-            Tuple of (y_true, y_pred) as numpy arrays
-        """
-        y_true = []
-        y_pred = []
-        
-        # Get sorted list of cases from both logs
-        orig_cases = sorted(self.original_log['case_id'].unique())
-        sim_cases = sorted(self.simulated_log['case_id'].unique())
-        
-        # Compare up to the minimum number of cases
-        num_cases = min(len(orig_cases), len(sim_cases))
-        
-        for i in range(num_cases):
-            orig_case = self.original_log[self.original_log['case_id'] == orig_cases[i]].sort_values('timestamp')
-            sim_case = self.simulated_log[self.simulated_log['case_id'] == sim_cases[i]].sort_values('timestamp')
-            
-            orig_activities = orig_case['activity'].tolist()
-            sim_activities = sim_case['activity'].tolist()
-            
-            # Align by position (take minimum length to avoid index errors)
-            min_len = min(len(orig_activities), len(sim_activities))
-            
-            # For each position (except last), compare next activity
-            for j in range(min_len - 1):
-                y_true.append(orig_activities[j + 1])
-                y_pred.append(sim_activities[j + 1])
-        
-        return np.array(y_true), np.array(y_pred)
     
     def print_summary(self):
         """Print all comparison results in a formatted way."""
@@ -864,35 +884,13 @@ class SimulationBenchmark:
         print("\n### ACTIVITY DURATIONS (Time to Next Event) ###")
         print(self.results['activity_durations'].to_string(index=False))
         
-        # Next Activity Prediction Metrics
-        if 'next_activity_metrics' in self.results:
-            print("\n### NEXT ACTIVITY PREDICTION METRICS ###")
-            nap_metrics = self.results['next_activity_metrics']
-            
-            if 'error' in nap_metrics:
-                print(f"Error: {nap_metrics['error']}")
-                if 'note' in nap_metrics:
-                    print(f"Note: {nap_metrics['note']}")
-            else:
-                # Overall metrics
-                print("\nOverall Metrics:")
-                for metric, value in nap_metrics['overall_metrics'].items():
-                    if isinstance(value, float):
-                        print(f"  {metric}: {value:.4f}")
-                    else:
-                        print(f"  {metric}: {value}")
-                
-                # Classification report
-                print("\nDetailed Classification Report:")
-                print(nap_metrics['classification_report'])
-                
-                # Confusion summary
-                print("\nPrediction Summary:")
-                for key, value in nap_metrics['confusion_summary'].items():
-                    if isinstance(value, float):
-                        print(f"  {key}: {value:.4f}")
-                    else:
-                        print(f"  {key}: {value}")
+        # Overall activity distribution
+        print("\n### OVERALL ACTIVITY DISTRIBUTION ###")
+        print(self.results['activity_distribution'].to_string(index=False))
+        
+        # Simple metrics
+        print("\n### SIMPLE SIMILARITY METRICS ###")
+        print(self.results['simple_metrics'].to_string(index=False))
         
         # Resources (if available)
         if 'resource_stats' in self.results:
@@ -930,22 +928,8 @@ class SimulationBenchmark:
             self.results['start_activities'].to_excel(writer, sheet_name='Start Activities', index=False)
             self.results['end_activities'].to_excel(writer, sheet_name='End Activities', index=False)
             self.results['activity_durations'].to_excel(writer, sheet_name='Activity Durations', index=False)
-            
-            # Next Activity Prediction Metrics
-            if 'next_activity_metrics' in self.results:
-                nap = self.results['next_activity_metrics']
-                if 'error' not in nap:
-                    # Overall metrics
-                    overall_df = pd.DataFrame([nap['overall_metrics']])
-                    overall_df.to_excel(writer, sheet_name='NAP Overall', index=False)
-                    
-                    # Per-class metrics
-                    if 'per_class_metrics' in nap and not nap['per_class_metrics'].empty:
-                        nap['per_class_metrics'].to_excel(writer, sheet_name='NAP Per Class', index=False)
-                    
-                    # Confusion summary
-                    confusion_df = pd.DataFrame([nap['confusion_summary']])
-                    confusion_df.to_excel(writer, sheet_name='NAP Confusion', index=False)
+            self.results['activity_distribution'].to_excel(writer, sheet_name='Activity Distribution', index=False)
+            self.results['simple_metrics'].to_excel(writer, sheet_name='Simple Metrics', index=False)
             
             if 'resource_stats' in self.results:
                 self.results['resource_stats'].to_excel(writer, sheet_name='Resource Stats', index=False)
@@ -958,8 +942,7 @@ class SimulationBenchmark:
 if __name__ == "__main__":
     benchmark = SimulationBenchmark(
         'integration/output/ground_truth_log.csv',  # Original BPIC 2017 Log (possible subset)
-        'integration/output/simulated_log.csv',  # Simulated Log
-        filter_lifecycle_complete=True  # Set this to True to filter only "complete" events (necessary for process transformer NAP)
+        'integration/output/simulated_log.csv'  # Simulated Log
     )
     
     # Analyse durchführen
