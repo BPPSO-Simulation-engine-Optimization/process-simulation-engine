@@ -147,6 +147,12 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
 
     model_type = getattr(config, 'next_activity_model_type', 'auto')
 
+    if config.next_activity_class == "process_transformer":
+        # Return None to allow DESEngine to load it via next_activity_predictor_type
+        # (or we could load it here, but engine has the logic)
+        logger.info("Process Transformer selected: delegating loading to DESEngine")
+        return None
+
     if config.next_activity_mode == "advanced" and config.next_activity_model_path:
         model_path = Path(config.next_activity_model_path)
 

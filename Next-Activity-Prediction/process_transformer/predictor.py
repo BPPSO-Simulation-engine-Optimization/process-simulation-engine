@@ -36,11 +36,12 @@ class ProcessTransformerPredictor:
         self,
         model_path: str = "models/process_transformer",
         hf_repo_id: Optional[str] = None,
-        temperature: float = 1.0,
-        repetition_penalty: float = 0.5,
+        temperature: float = 2.0,
+        repetition_penalty: float = 1.0,
         repetition_window: int = 3,
         seed: int = 42,
         auto_download: bool = True,
+        end_token_penalty: float = 1.0,
     ):
         """
         Initialize the ProcessTransformer predictor.
@@ -53,12 +54,14 @@ class ProcessTransformerPredictor:
             repetition_window: How many recent activities to apply penalty to.
             seed: Random seed for reproducibility.
             auto_download: If True, automatically download model from HuggingFace if not found locally.
+            end_token_penalty: Divisor for end activity probabilities (1.0 = no change, >1.0 = suppress ending).
         """
         self.model_path = Path(model_path)
         self.hf_repo_id = hf_repo_id or DEFAULT_HF_REPO
         self.temperature = temperature
         self.repetition_penalty = repetition_penalty
         self.repetition_window = repetition_window
+        self.end_token_penalty = end_token_penalty
         self.rng = random.Random(seed)
         self.auto_download = auto_download
 
@@ -166,6 +169,7 @@ class ProcessTransformerPredictor:
         prefix_indices = self._encode_prefix(case_state.activity_history)
         probs = self._get_probabilities(prefix_indices)
         probs = self._apply_repetition_penalty(probs, case_state.activity_history)
+        probs = self._apply_end_penalty(probs)
 
         if self.temperature != 1.0:
             probs = np.power(probs, 1.0 / self.temperature)
@@ -249,3 +253,23 @@ class ProcessTransformerPredictor:
             for i, p in enumerate(probs)
             if p > 0.001
         }
+
+    def _apply_end_penalty(self, probs):
+        """Apply penalty to end activities to encourage longer traces."""
+        import numpy as np
+        
+        if self.end_token_penalty == 1.0:
+            return probs
+            
+        probs = probs.copy()
+        for end_act in self.END_ACTIVITIES:
+            if end_act in self.activity_to_idx:
+                idx = self.activity_to_idx[end_act]
+                probs[idx] /= self.end_token_penalty
+        
+        # Normalize
+        total = np.sum(probs)
+        if total > 0:
+            probs /= total
+            
+        return probs

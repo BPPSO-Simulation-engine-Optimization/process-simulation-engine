@@ -29,7 +29,7 @@ sys.path.insert(0, str(project_root))
 
 from integration.config import SimulationConfig
 from integration.setup import setup_simulation
-from simulation.engine import DESEngine
+from simulation.engine import DESEngine, NextActivityPredictorType
 from simulation.log_exporter import LogExporter
 
 
@@ -136,10 +136,20 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
              engine_start_time = arrivals[0]
              print(f"Adjusting simulation start time to first arrival: {engine_start_time}")
 
+    # Determine appropriate predictor type argument
+    pred_type = None
+    if config.next_activity_class == "process_transformer":
+        pred_type = NextActivityPredictorType.PROCESS_TRANSFORMER
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
-        next_activity_predictor=next_act_pred,  # May be None for auto-load
+        next_activity_predictor=next_act_pred,  # May be None for auto-load or if delegated
+        next_activity_predictor_type=pred_type,  # Explicit type trigger if predictor is None
+        next_activity_config={
+            "temperature": config.next_activity_temperature,
+            "end_token_penalty": config.next_activity_end_token_penalty
+        },
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
@@ -210,6 +220,24 @@ def main():
         help="Case attribute mode (for mixed mode)"
     )
     parser.add_argument(
+        "--next-activity",
+        choices=["lstm", "process_transformer"],
+        default="lstm",
+        help="Next activity predictor implementation"
+    )
+    parser.add_argument(
+        "--next-activity-temperature",
+        type=float,
+        default=2.0,
+        help="Sampling temperature for Process Transformer (default: 2.0)"
+    )
+    parser.add_argument(
+        "--next-activity-end-penalty",
+        type=float,
+        default=1.0,
+        help="Penalty divisor for END tokens to encourage longer traces (default: 1.0)"
+    )
+    parser.add_argument(
         "--event-log",
         default="Dataset/BPI Challenge 2017.xes",
         help="Path to event log file"
@@ -264,6 +292,13 @@ def main():
             num_cases=num_cases,
             verbose=args.verbose,
         )
+
+
+    
+    # Set the implementation class (lstm vs process_transformer)
+    config.next_activity_class = args.next_activity
+    config.next_activity_temperature = args.next_activity_temperature
+    config.next_activity_end_token_penalty = args.next_activity_end_penalty
 
     config.num_cases = num_cases
 

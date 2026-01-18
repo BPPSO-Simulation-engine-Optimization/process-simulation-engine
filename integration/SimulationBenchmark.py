@@ -940,12 +940,14 @@ class SimulationBenchmark:
 
 # Example usage
 if __name__ == "__main__":
+    BASE_PATH = 'integration/output/pt_test/'
     benchmark = SimulationBenchmark(
-        'integration/output/ground_truth_log.csv',  # Original BPIC 2017 Log (possible subset)
-        'integration/output/simulated_log.csv'  # Simulated Log
+        BASE_PATH + 'ground_truth_log.csv',
+        BASE_PATH + 'simulated_log.csv',
+        True
     )
     
     # Analyse durchführen
     results = benchmark.compute_all_metrics()
     benchmark.print_summary()
-    benchmark.export_results('integration/output/benchmark_results.xlsx')
+    benchmark.export_results(BASE_PATH + 'benchmark_results.xlsx')

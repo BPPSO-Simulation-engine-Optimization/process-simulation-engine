@@ -70,7 +70,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download ProcessTransformer model")
     parser.add_argument(
         "--repo-id",
-        default="lgk03/bpic17-process-transformer_v1",
+        default="lgk03/process-transformerv2", # lgk03/bpic17-process-transformer_v1
         help="HuggingFace repository ID",
     )
     parser.add_argument(

@@ -278,6 +278,7 @@ class DESEngine:
         arrival_timestamps: List[datetime] = None,
         next_activity_predictor: NextActivityPredictor = None,
         next_activity_predictor_type: NextActivityPredictorType = None,
+        next_activity_config: Dict = None,
         processing_time_predictor: ProcessingTimePredictor = None,
         case_arrival_predictor: CaseArrivalPredictor = None,
         case_attribute_predictor: CaseAttributePredictor = None,
@@ -312,7 +313,10 @@ class DESEngine:
         if next_activity_predictor is not None:
             self._next_activity = next_activity_predictor
         elif next_activity_predictor_type is not None:
-            self._next_activity = self._create_next_activity_predictor(next_activity_predictor_type)
+            self._next_activity = self._create_next_activity_predictor(
+                next_activity_predictor_type,
+                next_activity_config or {}
+            )
         else:
             raise ValueError(
                 "Either next_activity_predictor or next_activity_predictor_type is required. "
@@ -358,12 +362,17 @@ class DESEngine:
             'wait_time_total_seconds': 0,  # Total time spent waiting
         }
     
-    def _create_next_activity_predictor(self, predictor_type: NextActivityPredictorType):
+    def _create_next_activity_predictor(
+        self, 
+        predictor_type: NextActivityPredictorType,
+        config: Dict = None
+    ):
         """
         Create a next activity predictor based on the specified type.
 
         Args:
             predictor_type: The type of predictor to create.
+            config: Configuration dict (temperature, end_token_penalty for Process Transformer).
 
         Returns:
             An instance of the requested predictor.
@@ -371,6 +380,7 @@ class DESEngine:
         Raises:
             ValueError: If the predictor type is unknown or cannot be loaded.
         """
+        config = config or {}
         import sys
         from pathlib import Path
 
@@ -383,7 +393,14 @@ class DESEngine:
         if predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
             logger.info("Loading ProcessTransformerPredictor...")
             from process_transformer import ProcessTransformerPredictor
-            return ProcessTransformerPredictor(model_path="models/process_transformer")
+            temperature = config.get("temperature", 2.0)
+            end_token_penalty = config.get("end_token_penalty", 1.0)
+            logger.info(f"Using temperature={temperature}, end_token_penalty={end_token_penalty}")
+            return ProcessTransformerPredictor(
+                model_path="models/process_transformer",
+                temperature=temperature,
+                end_token_penalty=end_token_penalty
+            )
 
         elif predictor_type == NextActivityPredictorType.BPIC17_SIMPLIFIED:
             logger.info("Loading BPIC17SimplifiedPredictor...")
@@ -877,10 +894,10 @@ class DESEngine:
         }
 
         processing_seconds = self._processing_time.predict(
-            # Request "Service Time" (Start -> Complete) instead of "Inter-Event Time"
-            # distinct from the "Wait Time" which is already handled by the DES queue.
-            prev_activity=activity,  
-            prev_lifecycle="start",
+            # Request inter-event time (complete → complete) to use trained distributions
+            # This allows the model to predict realistic processing times based on training data
+            prev_activity=prev_activity,
+            prev_lifecycle="complete",
             curr_activity=activity,
             curr_lifecycle="complete",
             context=context,
