@@ -940,7 +940,7 @@ class SimulationBenchmark:
 
 # Example usage
 if __name__ == "__main__":
-    BASE_PATH = 'integration/output/pt_test/'
+    BASE_PATH = 'integration/output/'
     benchmark = SimulationBenchmark(
         BASE_PATH + 'ground_truth_log.csv',
         BASE_PATH + 'simulated_log.csv',

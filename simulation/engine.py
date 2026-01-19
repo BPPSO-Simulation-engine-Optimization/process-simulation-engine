@@ -53,12 +53,12 @@ class NextActivityPredictorType(Enum):
     Use with DESEngine's next_activity_predictor_type parameter to specify
     which predictor to load automatically.
     """
-    PROCESS_TRANSFORMER = "process_transformer"
     BPIC17_SIMPLIFIED = "bpic17_simplified"
     UNIFIED = "unified"
     LSTM = "lstm"
     BRANCH = "branch"
     STUB = "stub"
+    PROCESS_TRANSFORMER = "process_transformer"
 
 
 @dataclass
@@ -112,6 +112,11 @@ class ResourcePool:
 
     def is_busy(self, resource_id: str, current_time: datetime) -> bool:
         """Check if a resource is currently busy."""
+        # INFINITE CAPACITY FIX: User_1 is the 'Applicant' and has infinite capacity.
+        # They are never busy in the sense of being blocked.
+        if resource_id == 'User_1':
+            return False
+
         if resource_id not in self._busy_resources:
             return False
         busy_until, _, _ = self._busy_resources[resource_id]
@@ -124,6 +129,10 @@ class ResourcePool:
     def mark_busy(self, resource_id: str, until: datetime,
                   case_id: str, activity: str) -> None:
         """Mark a resource as busy until a given time."""
+        # INFINITE CAPACITY FIX: User_1 never gets marked as busy
+        if resource_id == 'User_1':
+            return
+            
         self._busy_resources[resource_id] = (until, case_id, activity)
 
     def release(self, resource_id: str) -> None:
@@ -390,19 +399,7 @@ class DESEngine:
         if str(na_root) not in sys.path:
             sys.path.insert(0, str(na_root))
 
-        if predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
-            logger.info("Loading ProcessTransformerPredictor...")
-            from process_transformer import ProcessTransformerPredictor
-            temperature = config.get("temperature", 2.0)
-            end_token_penalty = config.get("end_token_penalty", 1.0)
-            logger.info(f"Using temperature={temperature}, end_token_penalty={end_token_penalty}")
-            return ProcessTransformerPredictor(
-                model_path="models/process_transformer",
-                temperature=temperature,
-                end_token_penalty=end_token_penalty
-            )
-
-        elif predictor_type == NextActivityPredictorType.BPIC17_SIMPLIFIED:
+        if predictor_type == NextActivityPredictorType.BPIC17_SIMPLIFIED:
             logger.info("Loading BPIC17SimplifiedPredictor...")
             from bpic17_simplified import BPIC17SimplifiedPredictor
             return BPIC17SimplifiedPredictor(model_path="models/bpic17_simplified")
@@ -422,6 +419,29 @@ class DESEngine:
         elif predictor_type == NextActivityPredictorType.STUB:
             logger.info("Using StubNextActivityPredictor...")
             return _StubNextActivityPredictor()
+
+        elif predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
+            logger.info("Loading ProcessTransformerV2Predictor (Unified) as main Process Transformer...")
+            from process_transformer_v2.inference import ProcessTransformerV2Predictor, PTActivityAdapter, PTTimeAdapter
+            
+            # Unified wrapper
+            # We assume the models are in the default location relative to the inference file
+            # or we can pass a specific path if config has it.
+            unified = ProcessTransformerV2Predictor() 
+            
+            # Register BOTH parts
+            # 1. Activity Predictor (returned here)
+            activity_adapter = PTActivityAdapter(unified)
+            
+            # 2. Time Predictor (injected into self)
+            # This is a bit of a hack: The engine calls this method to get the *Activity* predictor.
+            # But we also need to set the *Time* predictor.
+            # Since we have reference to 'self', we can override it!
+            time_adapter = PTTimeAdapter(unified)
+            self._processing_time = time_adapter
+            logger.info("ProcessTransformerV2: Also registered as ProcessingTimePredictor.")
+            
+            return activity_adapter
 
         else:
             raise ValueError(f"Unknown predictor type: {predictor_type}")
@@ -635,6 +655,8 @@ class DESEngine:
             self._schedule_case_end(event.case_id, event.timestamp)
             return
 
+
+
         # Log the event for export
         log_record = event.to_log_record()
         log_record.update(case.get_payload())
@@ -790,6 +812,7 @@ class DESEngine:
                 curr_activity=activity,
                 curr_lifecycle="complete",
                 context={
+                    'case_id': case_id,
                     'hour': current_time.hour,
                     'weekday': current_time.weekday(),
                     'month': current_time.month,
@@ -891,6 +914,7 @@ class DESEngine:
             # Offer-level attributes (available after O_Create Offer)
             'Accepted': case.accepted,
             'Selected': case.selected,
+            'case_id': case_id,
         }
 
         processing_seconds = self._processing_time.predict(
@@ -948,7 +972,9 @@ class DESEngine:
         hour = current_time.hour
 
         # Working days (Mon-Fri = 0-4)
-        if weekday < 5 and start_hour <= hour < end_hour:
+        # BUG FIX: Also check holidays!
+        is_holiday = current_time.date() in self.allocator.availability.nl_holidays
+        if weekday < 5 and start_hour <= hour < end_hour and not is_holiday:
             # Already in business hours
             return current_time
 
@@ -967,9 +993,11 @@ class DESEngine:
                 hour=start_hour, minute=0, second=0, microsecond=0
             )
 
-        # Skip weekends
-        while next_time.weekday() >= 5:
+        # Skip weekends AND holidays
+        while next_time.weekday() >= 5 or next_time.date() in self.allocator.availability.nl_holidays:
             next_time += timedelta(days=1)
+            # Reset to start of day when skipping
+            next_time = next_time.replace(hour=start_hour, minute=0, second=0, microsecond=0)
 
         return next_time
 

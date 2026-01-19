@@ -330,19 +330,7 @@ class ProcessingTimePredictionClass:
         Returns:
             Predicted time difference in seconds.
         """
-        # CRITICAL FIX: Detect "Service Time" Query (start -> complete of same activity)
-        # The ML model was trained on "Inter-Event Time" (complete -> complete) and has no concept of 
-        # true service time (duration of the task itself). When asked for service time, it hallucinates 
-        # the average inter-event time (~7 hours), causing massive simulation delays and 200-year backlogs.
-        # We explicitly bypass the ML model for this specific query type and use a heuristic.
-        is_same_activity = (prev_activity == curr_activity)
-        is_service_time_lifecycle = (prev_lifecycle == 'start' and curr_lifecycle == 'complete')
-        
-        if is_service_time_lifecycle and is_same_activity:
-            import random
-            # Return a random duration between 1 minute and 10 minutes
-            # This is a reasonable heuristic for service time in this process
-            return random.uniform(60.0, 600.0)
+
 
         # ... proceed with normal prediction for other transitions (e.g. Wait Time) ...
 
