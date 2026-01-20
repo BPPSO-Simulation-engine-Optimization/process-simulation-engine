@@ -13,7 +13,7 @@ class SimulationConfig:
     """
     Configuration for the DES simulation engine.
 
-    Each component can be set to 'basic' (use stubs) or 'advanced' (use ML/statistical models).
+    Each component can be set to 'basic' or 'advanced'.
     """
 
     # Processing time prediction
