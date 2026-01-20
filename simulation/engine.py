@@ -53,7 +53,6 @@ class NextActivityPredictorType(Enum):
     Use with DESEngine's next_activity_predictor_type parameter to specify
     which predictor to load automatically.
     """
-    BPIC17_SIMPLIFIED = "bpic17_simplified"
     UNIFIED = "unified"
     LSTM = "lstm"
     BRANCH = "branch"
@@ -329,7 +328,7 @@ class DESEngine:
         else:
             raise ValueError(
                 "Either next_activity_predictor or next_activity_predictor_type is required. "
-                "Use NextActivityPredictorType.BPIC17_SIMPLIFIED or pass a predictor instance."
+                "Use a valid NextActivityPredictorType or pass a predictor instance."
             )
         self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
@@ -393,24 +392,19 @@ class DESEngine:
         import sys
         from pathlib import Path
 
-        # Add Next-Activity-Prediction to path for imports
+        # Add next_activity_prediction to path for imports
         project_root = Path(__file__).parent.parent
-        na_root = project_root / "Next-Activity-Prediction"
+        na_root = project_root / "next_activity_prediction"
         if str(na_root) not in sys.path:
             sys.path.insert(0, str(na_root))
 
-        if predictor_type == NextActivityPredictorType.BPIC17_SIMPLIFIED:
-            logger.info("Loading BPIC17SimplifiedPredictor...")
-            from bpic17_simplified import BPIC17SimplifiedPredictor
-            return BPIC17SimplifiedPredictor(model_path="models/bpic17_simplified")
-
-        elif predictor_type == NextActivityPredictorType.UNIFIED:
+        if predictor_type == NextActivityPredictorType.UNIFIED:
             logger.info("Loading UnifiedNextActivityPredictor...")
             return UnifiedNextActivityPredictor(model_path="models/unified_next_activity")
 
         elif predictor_type == NextActivityPredictorType.LSTM:
             logger.info("Loading LSTMNextActivityPredictor...")
-            return LSTMNextActivityPredictor(models_dir="Next-Activity-Prediction/advanced/models_lstm_new")
+            return LSTMNextActivityPredictor(models_dir="next_activity_prediction/advanced/models_lstm_new")
 
         elif predictor_type == NextActivityPredictorType.BRANCH:
             logger.info("Loading BranchNextActivityPredictor...")
