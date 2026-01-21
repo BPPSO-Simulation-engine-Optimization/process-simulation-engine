@@ -26,6 +26,7 @@ class SimulationConfig:
     next_activity_mode: Literal["basic", "advanced"] = "basic"
     next_activity_model_path: Optional[str] = "next_activity_prediction/models/next_activity_lstm"
     next_activity_model_type: Literal["embedding", "onehot", "auto"] = "auto"
+    next_activity_temperature: float = 1.0
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl

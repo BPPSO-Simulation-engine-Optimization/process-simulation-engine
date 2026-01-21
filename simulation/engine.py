@@ -421,7 +421,9 @@ class DESEngine:
             # Unified wrapper
             # We assume the models are in the default location relative to the inference file
             # or we can pass a specific path if config has it.
-            unified = ProcessTransformerV2Predictor() 
+            temperature = config.get('temperature', 1.5)
+            logger.info(f"ProcessTransformerV2: Setting temperature to {temperature}")
+            unified = ProcessTransformerV2Predictor(temperature=temperature) 
             
             # Register BOTH parts
             # 1. Activity Predictor (returned here)
