@@ -82,20 +82,20 @@ def setup_simulation(
 def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
     """
     Try to load a next activity predictor from the given path.
-    
+
     Args:
         model_path: Path to model directory
         model_type: "embedding", "onehot", or "auto"
-        
+
     Returns:
         Predictor instance if successful, None otherwise
     """
     model_file = model_path / "model.keras"
     checkpoint_file = model_path / "checkpoints" / "best_model.keras"
-    
+
     if not model_path.exists() or (not model_file.exists() and not checkpoint_file.exists()):
         return None
-    
+
     # Determine which predictor to try based on model_type
     # If "auto", try both in order
     predictors_to_try = []
@@ -108,48 +108,54 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
             ("embedding", "next_activity_prediction", "LSTMNextActivityPredictor"),
             ("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot"),
         ]
-    
+
     for pred_type, module_name, class_name in predictors_to_try:
         try:
             module = __import__(module_name, fromlist=[class_name])
             PredictorClass = getattr(module, class_name)
-            
+
             if checkpoint_file.exists():
                 predictor = PredictorClass(model_path=str(checkpoint_file))
                 logger.info(f"✓ {pred_type.capitalize()} model loaded from checkpoint: {checkpoint_file}")
             else:
                 predictor = PredictorClass(model_path=str(model_path))
                 logger.info(f"✓ {pred_type.capitalize()} model loaded from: {model_path}")
-            
+
             return predictor
         except ImportError:
             continue
         except Exception as e:
             logger.debug(f"Could not load {pred_type} predictor from {model_path}: {e}")
             continue
-    
+
     return None
 
 
 def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     """
     Set up next activity predictor based on config.
-    
+
     Supports both embedding-based and one-hot encoded models.
-    
+
     Args:
         config: Simulation configuration
-        
+
     Returns:
         Next activity predictor instance, or None to use engine auto-load
     """
     from pathlib import Path
-    
+
     model_type = getattr(config, 'next_activity_model_type', 'auto')
-    
+
+    if config.next_activity_class == "process_transformer":
+        # Return None to allow DESEngine to load it via next_activity_predictor_type
+        # (or we could load it here, but engine has the logic)
+        logger.info("Process Transformer selected: delegating loading to DESEngine")
+        return None
+
     if config.next_activity_mode == "advanced" and config.next_activity_model_path:
         model_path = Path(config.next_activity_model_path)
-        
+
         predictor = _try_load_predictor(model_path, model_type)
         if predictor:
             logger.info("Setting up next activity predictor...")
@@ -158,7 +164,7 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
             logger.warning(f"Next activity model not found at {model_path}")
             logger.info("Falling back to engine auto-load")
             return None
-    
+
     # Basic mode - check both possible locations for auto-load
     possible_paths = [
         Path("models/next_activity_lstm"),
@@ -166,13 +172,13 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
         Path("models/next_activity_lstm_onehot"),
         Path("next_activity_prediction_onehot/models/next_activity_lstm_onehot"),
     ]
-    
+
     for model_path in possible_paths:
         predictor = _try_load_predictor(model_path, model_type)
         if predictor:
             logger.info(f"Auto-loading next activity predictor from {model_path}...")
             return predictor
-    
+
     # No model found - return None to trigger engine auto-load (which will try again)
     logger.info("No next activity model found, using engine auto-load fallback")
     return None
@@ -193,7 +199,7 @@ def _setup_arrivals(
             advanced_path = Path(__file__).parent.parent / "Instance Spawn Rate" / "Advanced"
             if str(advanced_path) not in sys.path:
                 sys.path.insert(0, str(advanced_path))
-            
+
             from case_arrival_times_prediction import run
             from case_arrival_times_prediction.config import SimulationConfig as ArrivalConfig
 
@@ -214,7 +220,7 @@ def _setup_arrivals(
 
             # Determine whether to retrain or load cached model
             model_path = "models/case_arrival_model.pkl"
-            
+
             # Use cached model if it exists, otherwise retrain if data is available
             if os.path.exists(model_path):
                 logger.info(f"Found existing case arrival model at {model_path}, using cached version.")
@@ -350,7 +356,7 @@ def _setup_case_attributes(
     advanced_path = Path(__file__).parent.parent / "Instance Spawn Rate" / "Advanced"
     if str(advanced_path) not in sys.path:
         sys.path.insert(0, str(advanced_path))
-    
+
     from case_attribute_prediction.simulator import AttributeSimulationEngine
 
     logger.info("Setting up case attribute predictor (AttributeSimulationEngine)...")

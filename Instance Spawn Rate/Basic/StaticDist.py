@@ -5,7 +5,7 @@ from datetime import datetime
 
 
 LOG_FILE = r"Dataset\BPI Challenge 2017.xes"
-LAMBDA = 0.000997770693997961
+LAMBDA = 0.000997770693997961 # fitted value
 
 def fit_static_exponential_distribution():
     log = pm4py.read_xes(LOG_FILE) 

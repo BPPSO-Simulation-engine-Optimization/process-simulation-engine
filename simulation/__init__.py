@@ -13,7 +13,7 @@ MVP Components:
 from .events import SimulationEvent, EventType
 from .event_queue import EventQueue
 from .clock import SimulationClock
-from .engine import DESEngine
+from .engine import DESEngine, NextActivityPredictorType
 from .case_manager import CaseState
 from .log_exporter import LogExporter
 
@@ -33,10 +33,11 @@ except ImportError:
 
 __all__ = [
     'SimulationEvent',
-    'EventType', 
+    'EventType',
     'EventQueue',
     'SimulationClock',
     'DESEngine',
+    'NextActivityPredictorType',
     'CaseState',
     'LogExporter',
     'load_simulation_assets',

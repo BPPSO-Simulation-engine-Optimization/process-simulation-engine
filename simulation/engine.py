@@ -31,6 +31,7 @@ import random
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import List, Dict, Optional, Protocol, Set
 from collections import defaultdict
 import heapq
@@ -43,6 +44,20 @@ from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
 
 logger = logging.getLogger(__name__)
+
+
+class NextActivityPredictorType(Enum):
+    """
+    Available next activity predictor types.
+
+    Use with DESEngine's next_activity_predictor_type parameter to specify
+    which predictor to load automatically.
+    """
+    UNIFIED = "unified"
+    LSTM = "lstm"
+    BRANCH = "branch"
+    STUB = "stub"
+    PROCESS_TRANSFORMER = "process_transformer"
 
 
 @dataclass
@@ -96,6 +111,11 @@ class ResourcePool:
 
     def is_busy(self, resource_id: str, current_time: datetime) -> bool:
         """Check if a resource is currently busy."""
+        # INFINITE CAPACITY FIX: User_1 is the 'Applicant' and has infinite capacity.
+        # They are never busy in the sense of being blocked.
+        if resource_id == 'User_1':
+            return False
+
         if resource_id not in self._busy_resources:
             return False
         busy_until, _, _ = self._busy_resources[resource_id]
@@ -108,6 +128,10 @@ class ResourcePool:
     def mark_busy(self, resource_id: str, until: datetime,
                   case_id: str, activity: str) -> None:
         """Mark a resource as busy until a given time."""
+        # INFINITE CAPACITY FIX: User_1 never gets marked as busy
+        if resource_id == 'User_1':
+            return
+            
         self._busy_resources[resource_id] = (until, case_id, activity)
 
     def release(self, resource_id: str) -> None:
@@ -261,6 +285,8 @@ class DESEngine:
         resource_allocator: ResourceAllocator,
         arrival_timestamps: List[datetime] = None,
         next_activity_predictor: NextActivityPredictor = None,
+        next_activity_predictor_type: NextActivityPredictorType = None,
+        next_activity_config: Dict = None,
         processing_time_predictor: ProcessingTimePredictor = None,
         case_arrival_predictor: CaseArrivalPredictor = None,
         case_attribute_predictor: CaseAttributePredictor = None,
@@ -269,27 +295,41 @@ class DESEngine:
     ):
         """
         Initialize the DES Engine.
-        
+
         Args:
             resource_allocator: Resource allocation component.
             arrival_timestamps: Pre-generated list of case arrival timestamps.
                 If provided, overrides case_arrival_predictor.
-            next_activity_predictor: Predicts next activity (uses stub if None).
-            processing_time_predictor: Predicts processing time (uses stub if None).
+            next_activity_predictor: Predicts next activity. If provided, takes precedence.
+            next_activity_predictor_type: Type of predictor to auto-load if next_activity_predictor
+                is not provided. See NextActivityPredictorType enum.
+            processing_time_predictor: Predicts processing time (required).
             case_arrival_predictor: Predicts inter-arrival time (uses stub if None).
-            case_attribute_predictor: Predicts case attributes (uses stub if None).
+            case_attribute_predictor: Predicts case attributes (required).
             start_time: Simulation start time.
+            max_activities_per_case: Safety limit to prevent infinite loops.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
         self.case_manager = CaseManager()
         self.allocator = resource_allocator
-        
+
         # Pre-generated arrival timestamps (optional)
         self._arrival_timestamps = arrival_timestamps
-        
-        # Predictors
-        self._next_activity = next_activity_predictor or self._create_next_activity_predictor()
+
+        # Next activity predictor: use provided instance, or create from type
+        if next_activity_predictor is not None:
+            self._next_activity = next_activity_predictor
+        elif next_activity_predictor_type is not None:
+            self._next_activity = self._create_next_activity_predictor(
+                next_activity_predictor_type,
+                next_activity_config or {}
+            )
+        else:
+            raise ValueError(
+                "Either next_activity_predictor or next_activity_predictor_type is required. "
+                "Use a valid NextActivityPredictorType or pass a predictor instance."
+            )
         self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
         # Processing time predictor is required (must be ProcessingTimePredictionClass)
@@ -330,48 +370,77 @@ class DESEngine:
             'wait_time_total_seconds': 0,  # Total time spent waiting
         }
     
-    def _create_next_activity_predictor(self):
+    def _create_next_activity_predictor(
+        self, 
+        predictor_type: NextActivityPredictorType,
+        config: Dict = None
+    ):
         """
-        Auto-load next activity predictor based on available models.
-        
-        Priority:
-        1. Unified model (models/unified_next_activity/) - best for avoiding loops
-        2. LSTM models (Next-Activity-Prediction/advanced/models_lstm_new/)
-        3. BranchPredictor model (models/branch_predictor.joblib)
-        4. Stub predictor (fallback)
+        Create a next activity predictor based on the specified type.
+
+        Args:
+            predictor_type: The type of predictor to create.
+            config: Configuration dict (temperature, end_token_penalty for Process Transformer).
+
+        Returns:
+            An instance of the requested predictor.
+
+        Raises:
+            ValueError: If the predictor type is unknown or cannot be loaded.
         """
+        config = config or {}
+        import sys
         from pathlib import Path
-        
-        # Try Unified model first (best for avoiding loops)
-        unified_model_dir = Path(UnifiedNextActivityPredictor.DEFAULT_MODEL_PATH)
-        if unified_model_dir.exists() and (unified_model_dir / "model.keras").exists():
-            try:
-                logger.info("Loading UnifiedNextActivityPredictor...")
-                return UnifiedNextActivityPredictor(str(unified_model_dir))
-            except Exception as e:
-                logger.warning(f"Could not load Unified predictor: {e}")
-        
-        # Try LSTM models
-        lstm_models_dir = Path("Next-Activity-Prediction/advanced/models_lstm_new")
-        if lstm_models_dir.exists() and any(lstm_models_dir.iterdir()):
-            try:
-                logger.info("Loading LSTMNextActivityPredictor...")
-                return LSTMNextActivityPredictor(str(lstm_models_dir))
-            except Exception as e:
-                logger.warning(f"Could not load LSTM predictor: {e}")
-        
-        # Fallback to BranchPredictor
-        model_path = Path(BranchNextActivityPredictor.DEFAULT_MODEL_PATH)
-        if model_path.exists():
-            try:
-                return BranchNextActivityPredictor(str(model_path))
-            except Exception as e:
-                logger.warning(f"Failed to load next activity model: {e}")
-        
-        # Last resort: stub
-        logger.info("Using stub next activity predictor "
-                   "(train model with: python Next-Activity-Prediction/train.py)")
-        return _StubNextActivityPredictor()
+
+        # Add next_activity_prediction to path for imports
+        project_root = Path(__file__).parent.parent
+        na_root = project_root / "next_activity_prediction"
+        if str(na_root) not in sys.path:
+            sys.path.insert(0, str(na_root))
+
+        if predictor_type == NextActivityPredictorType.UNIFIED:
+            logger.info("Loading UnifiedNextActivityPredictor...")
+            return UnifiedNextActivityPredictor(model_path="models/unified_next_activity")
+
+        elif predictor_type == NextActivityPredictorType.LSTM:
+            logger.info("Loading LSTMNextActivityPredictor...")
+            return LSTMNextActivityPredictor(models_dir="next_activity_prediction/advanced/models_lstm_new")
+
+        elif predictor_type == NextActivityPredictorType.BRANCH:
+            logger.info("Loading BranchNextActivityPredictor...")
+            return BranchNextActivityPredictor(model_path="models/branch_predictor.joblib")
+
+        elif predictor_type == NextActivityPredictorType.STUB:
+            logger.info("Using StubNextActivityPredictor...")
+            return _StubNextActivityPredictor()
+
+        elif predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
+            logger.info("Loading ProcessTransformerV2Predictor (Unified) as main Process Transformer...")
+            from process_transformer_v2.inference import ProcessTransformerV2Predictor, PTActivityAdapter, PTTimeAdapter
+            
+            # Unified wrapper
+            # We assume the models are in the default location relative to the inference file
+            # or we can pass a specific path if config has it.
+            temperature = config.get('temperature', 1.5)
+            logger.info(f"ProcessTransformerV2: Setting temperature to {temperature}")
+            unified = ProcessTransformerV2Predictor(temperature=temperature) 
+            
+            # Register BOTH parts
+            # 1. Activity Predictor (returned here)
+            activity_adapter = PTActivityAdapter(unified)
+            
+            # 2. Time Predictor (injected into self)
+            # This is a bit of a hack: The engine calls this method to get the *Activity* predictor.
+            # But we also need to set the *Time* predictor.
+            # Since we have reference to 'self', we can override it!
+            time_adapter = PTTimeAdapter(unified)
+            self._processing_time = time_adapter
+            logger.info("ProcessTransformerV2: Also registered as ProcessingTimePredictor.")
+            
+            return activity_adapter
+
+        else:
+            raise ValueError(f"Unknown predictor type: {predictor_type}")
     
     def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
         """
@@ -582,6 +651,8 @@ class DESEngine:
             self._schedule_case_end(event.case_id, event.timestamp)
             return
 
+
+
         # Log the event for export
         log_record = event.to_log_record()
         log_record.update(case.get_payload())
@@ -737,6 +808,7 @@ class DESEngine:
                 curr_activity=activity,
                 curr_lifecycle="complete",
                 context={
+                    'case_id': case_id,
                     'hour': current_time.hour,
                     'weekday': current_time.weekday(),
                     'month': current_time.month,
@@ -838,9 +910,12 @@ class DESEngine:
             # Offer-level attributes (available after O_Create Offer)
             'Accepted': case.accepted,
             'Selected': case.selected,
+            'case_id': case_id,
         }
 
         processing_seconds = self._processing_time.predict(
+            # Request inter-event time (complete → complete) to use trained distributions
+            # This allows the model to predict realistic processing times based on training data
             prev_activity=prev_activity,
             prev_lifecycle="complete",
             curr_activity=activity,
@@ -893,7 +968,9 @@ class DESEngine:
         hour = current_time.hour
 
         # Working days (Mon-Fri = 0-4)
-        if weekday < 5 and start_hour <= hour < end_hour:
+        # BUG FIX: Also check holidays!
+        is_holiday = current_time.date() in self.allocator.availability.nl_holidays
+        if weekday < 5 and start_hour <= hour < end_hour and not is_holiday:
             # Already in business hours
             return current_time
 
@@ -912,9 +989,11 @@ class DESEngine:
                 hour=start_hour, minute=0, second=0, microsecond=0
             )
 
-        # Skip weekends
-        while next_time.weekday() >= 5:
+        # Skip weekends AND holidays
+        while next_time.weekday() >= 5 or next_time.date() in self.allocator.availability.nl_holidays:
             next_time += timedelta(days=1)
+            # Reset to start of day when skipping
+            next_time = next_time.replace(hour=start_hour, minute=0, second=0, microsecond=0)
 
         return next_time
 
@@ -929,12 +1008,14 @@ class DESEngine:
         Args:
             max_time: Optional maximum time to advance to.
         """
-        max_iterations = 100  # Safety limit (100 * potential 72h = weeks of simulation time)
+        max_iterations = 50000  # Safety limit increased for large simulations (was 100)
         iterations_without_progress = 0
-        max_no_progress = 3  # Stop if 3 time advances produce no dispatches
+        max_no_progress = 1000  # Stop if 1000 time advances produce no dispatches (was 3)
 
         initial_waiting = self.resource_pool.get_total_waiting_count()
         logger.info(f"Drain phase starting with {initial_waiting} waiting cases")
+
+        failure_reason = "No waiting work"  # Default reason
 
         while self.resource_pool.has_waiting_work() and iterations_without_progress < max_no_progress:
             current_time = self.clock.now
@@ -951,10 +1032,10 @@ class DESEngine:
                     if not waiting_work:
                         break
 
-                    resource, failure_reason = self._try_allocate_resource_with_reason(
+                    resource, reason = self._try_allocate_resource_with_reason(
                         activity, current_time, waiting_work.case_state
                     )
-
+                    
                     if resource:
                         # Got a resource - dispatch the work
                         work = self.resource_pool.get_waiting_work(activity)
@@ -973,6 +1054,7 @@ class DESEngine:
                         dispatched_this_round += 1
                     else:
                         # No resource available for this activity right now
+                        failure_reason = reason
                         break
 
             # Process any completion events that are now schedulable
@@ -999,8 +1081,9 @@ class DESEngine:
                     return
 
                 time_jump = next_business_hour - current_time
-                logger.info(
-                    f"[Drain] No resources available, advancing {time_jump} to {next_business_hour}"
+                logger.debug(
+                    f"[Drain] No resources available (last reason: {failure_reason}), "
+                    f"advancing {time_jump} to {next_business_hour}"
                 )
                 self.clock.advance_to(next_business_hour)
                 iterations_without_progress += 1
