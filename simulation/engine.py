@@ -476,6 +476,14 @@ class DESEngine:
         self._schedule_case_arrivals(num_cases)
         
         # Main simulation loop
+        print(f"\n{'='*60}", flush=True)
+        print(f"Starting simulation loop with {len(self.queue)} scheduled events...", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        event_count = 0
+        last_progress_print = 0
+        progress_interval = max(10, num_cases // 20)  # Print every ~5% or at least every 10 cases
+        
         while not self.queue.is_empty():
             event = self.queue.pop()
 
@@ -485,6 +493,16 @@ class DESEngine:
 
             self.clock.advance_to(event.timestamp)
             self._handle_event(event)
+            
+            event_count += 1
+            
+            # Print progress periodically
+            if event_count - last_progress_print >= progress_interval:
+                print(f"Progress: {self.stats['cases_started']} cases started, "
+                      f"{self.stats['cases_completed']} completed, "
+                      f"{len(self.completed_events)} events logged, "
+                      f"{self.resource_pool.get_total_waiting_count()} waiting", flush=True)
+                last_progress_print = event_count
 
         # Drain phase: process remaining waiting work by advancing time
         if self.resource_pool.has_waiting_work():
@@ -579,6 +597,10 @@ class DESEngine:
     def _on_case_arrival(self, event: SimulationEvent) -> None:
         """Handle case arrival: create case state, schedule first activity."""
         self.stats['cases_started'] += 1
+        
+        # Print arrival info for visibility
+        if self.stats['cases_started'] <= 5 or self.stats['cases_started'] % 100 == 0:
+            print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {event.timestamp.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
         # Get case attributes from AttributeSimulationEngine
         attr_case = self._case_attribute.start_new_case()
