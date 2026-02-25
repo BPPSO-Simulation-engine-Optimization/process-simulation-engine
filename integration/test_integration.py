@@ -31,6 +31,7 @@ from integration.config import SimulationConfig
 from integration.setup import setup_simulation
 from simulation.engine import DESEngine, NextActivityPredictorType
 from simulation.log_exporter import LogExporter
+from resources.selection_strategies import create_strategy
 
 
 def load_event_log(path: str) -> pd.DataFrame:
@@ -105,6 +106,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Processing time mode: {config.processing_time_mode}")
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
+    print(f"  Resource selection: {config.resource_selection_strategy}")
     print(f"  Number of cases: {config.num_cases}")
     print("=" * 60 + "\n")
 
@@ -141,6 +143,9 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     if config.next_activity_class == "process_transformer":
         pred_type = NextActivityPredictorType.PROCESS_TRANSFORMER
 
+    # Create resource selection strategy
+    resource_strategy = create_strategy(config.resource_selection_strategy)
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
@@ -150,6 +155,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
+        resource_selection_strategy=resource_strategy,
     )
 
     # Run simulation
@@ -249,6 +255,12 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--resource-strategy",
+        choices=["random", "round_robin", "shortest_queue"],
+        default="random",
+        help="Resource selection heuristic (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)"
+    )
 
     args = parser.parse_args()
 
@@ -300,6 +312,7 @@ def main():
     config.next_activity_temperature = args.temperature
 
     config.num_cases = num_cases
+    config.resource_selection_strategy = args.resource_strategy
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)

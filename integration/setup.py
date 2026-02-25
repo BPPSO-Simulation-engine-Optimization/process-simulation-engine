@@ -319,25 +319,46 @@ def _generate_basic_arrivals(
     return timestamps
 
 
+class StubProcessingTimePredictor:
+    def predict(
+        self,
+        prev_activity: str,
+        prev_lifecycle: str,
+        curr_activity: str,
+        curr_lifecycle: str,
+        context: dict = None,
+    ) -> float:
+        return 3600.0
+
+
 def _setup_processing_time(config: SimulationConfig) -> Any:
     """
     Set up processing time predictor.
 
-    Always returns a ProcessingTimePredictionClass instance.
-    Requires a trained model at the configured path.
+    Attempts to return a ProcessingTimePredictionClass instance.
+    If the model files at the configured path are missing, returns a basic stub.
     """
     from processing_time_prediction.ProcessingTimePredictionClass import (
         ProcessingTimePredictionClass
     )
 
-    logger.info("Setting up processing time predictor (ProcessingTimePredictionClass)...")
+    logger.info("Setting up processing time predictor...")
 
-    predictor = ProcessingTimePredictionClass(
-        method=config.processing_time_method,
-        model_path=config.processing_time_model_path,
-    )
-    logger.info(f"Loaded processing time model: {config.processing_time_method}")
-    return predictor
+    if config.processing_time_mode == "basic":
+        logger.info("Using basic (stub) processing time predictor...")
+        return StubProcessingTimePredictor()
+
+    try:
+        predictor = ProcessingTimePredictionClass(
+            method=config.processing_time_method,
+            model_path=config.processing_time_model_path,
+        )
+        logger.info(f"Loaded processing time model: {config.processing_time_method}")
+        return predictor
+    except FileNotFoundError as e:
+        logger.warning(f"Processing time model missing: {e}")
+        logger.info("Falling back to basic (stub) processing time predictor...")
+        return StubProcessingTimePredictor()
 
 
 def _setup_case_attributes(

@@ -42,6 +42,7 @@ from .events import SimulationEvent, EventType
 from .event_queue import EventQueue
 from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
+from resources.selection_strategies import ResourceSelectionStrategy, RandomStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +293,7 @@ class DESEngine:
         case_attribute_predictor: CaseAttributePredictor = None,
         start_time: datetime = None,
         max_activities_per_case: int = 500,
+        resource_selection_strategy: ResourceSelectionStrategy = None,
     ):
         """
         Initialize the DES Engine.
@@ -308,6 +310,8 @@ class DESEngine:
             case_attribute_predictor: Predicts case attributes (required).
             start_time: Simulation start time.
             max_activities_per_case: Safety limit to prevent infinite loops.
+            resource_selection_strategy: Heuristic for selecting among available resources.
+                Defaults to RandomStrategy (R-RMA).
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -355,6 +359,9 @@ class DESEngine:
         self.resource_pool = ResourcePool(
             availability_model=resource_allocator.availability if resource_allocator else None
         )
+
+        # Resource selection heuristic (R-RMA, R-RRA, or R-SHQ)
+        self._resource_strategy = resource_selection_strategy or RandomStrategy()
 
         # Output: collected events for export
         self.completed_events: List[Dict] = []
@@ -728,6 +735,9 @@ class DESEngine:
                     f"to {freed_resource} (waited {wait_seconds:.0f}s)"
                 )
 
+                # Track assignment for strategy (keeps SHQ counts accurate)
+                self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
                 # Schedule the activity with the freed resource
                 self._schedule_activity_with_resource(
                     waiting_work.case_id,
@@ -899,9 +909,10 @@ class DESEngine:
             # Everyone qualified is busy
             return None, 'all_busy'
 
-        # Select randomly from truly available resources
-        import random
-        return random.choice(truly_available), None
+        # Apply resource selection heuristic (R-RMA / R-RRA / R-SHQ)
+        selected = self._resource_strategy.select(truly_available, activity)
+        self._resource_strategy.notify_assignment(selected, activity)
+        return selected, None
 
     def _schedule_activity_with_resource(self, case_id: str, activity: str,
                                           current_time: datetime, case: CaseState,

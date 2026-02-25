@@ -49,6 +49,9 @@ class SimulationConfig:
     case_attribute_monthly_artifact_path: Optional[str] = None
     case_attribute_retrain: bool = False  # If True, retrain from df instead of using cached artifacts
 
+    # Resource selection strategy (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)
+    resource_selection_strategy: Literal["random", "round_robin", "shortest_queue"] = "random"
+
     # Global settings
     event_log_path: Optional[str] = None
     num_cases: int = 100
