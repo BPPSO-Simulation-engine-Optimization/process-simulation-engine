@@ -189,6 +189,40 @@ class ResourcePool:
         """Get summary of waiting work per activity."""
         return {act: len(q) for act, q in self._waiting_queues.items() if q}
 
+    def get_all_waiting_tasks(self) -> List[WaitingWork]:
+        """
+        Return a flat list of all waiting work across all queues.
+
+        Non-destructive: items remain in their queues.
+        """
+        result = []
+        for q in self._waiting_queues.values():
+            result.extend(q)
+        return result
+
+    def remove_task_by_id(
+        self, allocation_activity: str, case_id: str
+    ) -> Optional[WaitingWork]:
+        """
+        Remove a specific task from its waiting queue by case_id.
+
+        O(n) scan + heapify.  Only called on worker-idle events so
+        performance is fine for queue sizes in the hundreds.
+
+        Returns:
+            The removed WaitingWork, or None if not found.
+        """
+        q = self._waiting_queues.get(allocation_activity)
+        if not q:
+            return None
+
+        for idx, work in enumerate(q):
+            if work.case_id == case_id:
+                q.pop(idx)
+                heapq.heapify(q)
+                return work
+        return None
+
 
 # Protocol definitions for pluggable predictors
 class NextActivityPredictor(Protocol):
@@ -294,6 +328,8 @@ class DESEngine:
         start_time: datetime = None,
         max_activities_per_case: int = 500,
         resource_selection_strategy: ResourceSelectionStrategy = None,
+        batch_allocation_policy=None,
+        processing_time_estimator=None,
     ):
         """
         Initialize the DES Engine.
@@ -312,6 +348,10 @@ class DESEngine:
             max_activities_per_case: Safety limit to prevent infinite loops.
             resource_selection_strategy: Heuristic for selecting among available resources.
                 Defaults to RandomStrategy (R-RMA).
+            batch_allocation_policy: Optional BatchAllocationPolicy (e.g. OneBatchOnePolicy).
+                When set, _process_waiting_queue uses holistic MILP instead of greedy.
+            processing_time_estimator: Optional ProcessingTimeEstimator for batch policy
+                p_{ij} lookups.  Required when batch_allocation_policy is set.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -362,6 +402,10 @@ class DESEngine:
 
         # Resource selection heuristic (R-RMA, R-RRA, or R-SHQ)
         self._resource_strategy = resource_selection_strategy or RandomStrategy()
+
+        # Batch allocation policy (optional, overrides greedy waiting-queue logic)
+        self._batch_policy = batch_allocation_policy
+        self._pt_estimator = processing_time_estimator
 
         # Output: collected events for export
         self.completed_events: List[Dict] = []
@@ -701,6 +745,11 @@ class DESEngine:
 
         Tries to dispatch waiting work to the freed resource if it's eligible.
         """
+        # Batch allocation policy overrides greedy logic
+        if self._batch_policy is not None:
+            self._process_waiting_queue_batch(freed_resource, current_time)
+            return
+
         # Check which activities have waiting work
         waiting_activities = self.resource_pool.get_all_waiting_activities()
         if not waiting_activities:
@@ -748,7 +797,165 @@ class DESEngine:
                 )
                 # Resource is now busy again, stop looking
                 return
-    
+
+    def _process_waiting_queue_batch(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        Batch-mode waiting-queue processing (1-Batch-1 / MSA).
+
+        Collects all waiting tasks, builds the eligible worker set, and
+        delegates to the configured BatchAllocationPolicy.  Only the
+        assignment for *freed_resource* is committed.
+        """
+        from resources.batch_policies import TaskInfo, WorkerInfo
+
+        # 1. Collect all waiting tasks
+        all_waiting = self.resource_pool.get_all_waiting_tasks()
+        if not all_waiting:
+            return
+
+        # 2. Build TaskInfo list
+        tasks: list[TaskInfo] = []
+        for w in all_waiting:
+            hours_waited = (current_time - w.arrival_time).total_seconds() / 3600.0
+            tasks.append(TaskInfo(
+                task_id=f"{w.case_id}::{w.allocation_activity}",
+                case_id=w.case_id,
+                activity=w.activity,
+                allocation_activity=w.allocation_activity,
+                hours_waited=max(0.0, hours_waited),
+            ))
+
+        # 3. Build eligible_map: allocation_activity -> set of eligible worker IDs
+        #    Cache per activity since many tasks share the same activity
+        eligible_map: dict[str, set[str]] = {}
+        unique_activities = {t.allocation_activity for t in tasks}
+
+        for act in unique_activities:
+            # Tier 1: permissions
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    act, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(act)
+
+            # Tier 2: availability (working hours)
+            available = {
+                r for r in eligible
+                if self.allocator.availability.is_available(r, current_time)
+            }
+            eligible_map[act] = available
+
+        # 3b. Scope to freed worker's competitive neighborhood
+        neighbor_tasks = {t.allocation_activity for t in tasks
+                         if freed_resource in eligible_map.get(t.allocation_activity, set())}
+        neighbor_workers: set[str] = set()
+        for act in neighbor_tasks:
+            neighbor_workers.update(eligible_map[act])
+        for act, workers_set in eligible_map.items():
+            if neighbor_workers & workers_set:
+                neighbor_tasks.add(act)
+        tasks = [t for t in tasks if t.allocation_activity in neighbor_tasks]
+        eligible_map = {act: ws for act, ws in eligible_map.items() if act in neighbor_tasks}
+
+        # 3c. Neighborhood too large — skip MILP entirely, dispatch greedily
+        if len(tasks) > 50:
+            sorted_tasks = sorted(tasks, key=lambda t: t.hours_waited, reverse=True)
+            for t in sorted_tasks:
+                if freed_resource in eligible_map.get(t.allocation_activity, set()):
+                    parts = t.task_id.split("::", 1)
+                    if len(parts) != 2:
+                        break
+                    case_id, allocation_activity = parts
+                    removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+                    if removed is None:
+                        break
+                    wait_seconds = (current_time - removed.arrival_time).total_seconds()
+                    self.stats['wait_time_total_seconds'] += wait_seconds
+                    logger.debug(
+                        "Neighborhood too large (%d tasks), greedy dispatch %s for case %s to %s (waited %.0fs)",
+                        len(tasks), removed.activity, removed.case_id, freed_resource, wait_seconds,
+                    )
+                    self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+                    self._batch_policy._diag_greedy_neighborhood_too_large += 1
+                    self._schedule_activity_with_resource(
+                        removed.case_id, removed.activity, current_time,
+                        removed.case_state, freed_resource,
+                    )
+                    return
+            # No eligible task found for freed worker in this large neighborhood
+            return
+
+        # 4. Build WorkerInfo list: union of all eligible workers (including busy)
+        all_eligible_ids: set[str] = set()
+        for s in eligible_map.values():
+            all_eligible_ids.update(s)
+
+        workers: list[WorkerInfo] = []
+        for wid in all_eligible_ids:
+            busy_until = self.resource_pool.get_busy_until(wid)
+            if busy_until is not None:
+                remaining = max(0.0, (busy_until - current_time).total_seconds())
+            else:
+                remaining = 0.0
+            workers.append(WorkerInfo(worker_id=wid, remaining_busy_seconds=remaining))
+
+        # 5. Call batch policy
+        decision = self._batch_policy.decide(
+            freed_resource=freed_resource,
+            current_time_s=current_time.timestamp(),
+            tasks=tasks,
+            workers=workers,
+            eligible_map=eligible_map,
+            processing_time_fn=self._pt_estimator.estimate,
+        )
+
+        if decision is None:
+            logger.debug(
+                "Batch policy returned no assignment for %s at %s",
+                freed_resource, current_time,
+            )
+            return
+
+        # 6. Parse task_id -> (case_id, allocation_activity)
+        parts = decision.task_id.split("::", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid task_id from batch policy: %s", decision.task_id)
+            return
+        case_id, allocation_activity = parts
+
+        # Remove the task from its waiting queue
+        removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+        if removed is None:
+            logger.warning(
+                "Batch policy assigned task %s but it was not found in queue",
+                decision.task_id,
+            )
+            return
+
+        # Calculate wait time for stats
+        wait_seconds = (current_time - removed.arrival_time).total_seconds()
+        self.stats['wait_time_total_seconds'] += wait_seconds
+
+        logger.debug(
+            "Batch dispatching %s for case %s to %s (waited %.0fs)",
+            removed.activity, removed.case_id, freed_resource, wait_seconds,
+        )
+
+        # Track assignment for strategy (keeps SHQ counts accurate)
+        self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
+        # Schedule the activity with the freed resource
+        self._schedule_activity_with_resource(
+            removed.case_id,
+            removed.activity,
+            current_time,
+            removed.case_state,
+            freed_resource,
+        )
+
     def _on_case_end(self, event: SimulationEvent) -> None:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1

@@ -107,6 +107,9 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Resource selection: {config.resource_selection_strategy}")
+    print(f"  Resource allocation mode: {config.resource_allocation_mode}")
+    if config.resource_allocation_mode == "batch":
+        print(f"  Batch policy: {config.batch_policy}")
     print(f"  Number of cases: {config.num_cases}")
     print("=" * 60 + "\n")
 
@@ -146,6 +149,17 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     # Create resource selection strategy
     resource_strategy = create_strategy(config.resource_selection_strategy)
 
+    # Create batch allocation policy (if requested)
+    batch_policy = None
+    pt_estimator = None
+    if config.resource_allocation_mode == "batch":
+        from resources.batch_policies import create_batch_policy
+        from resources.processing_time_estimator import ProcessingTimeEstimator
+
+        batch_policy = create_batch_policy(config.batch_policy)
+        pt_estimator = ProcessingTimeEstimator(df=df)
+        print(f"Created batch policy: {config.batch_policy}")
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
@@ -156,6 +170,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
         resource_selection_strategy=resource_strategy,
+        batch_allocation_policy=batch_policy,
+        processing_time_estimator=pt_estimator,
     )
 
     # Run simulation
@@ -171,6 +187,9 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Outside hours: {engine.stats['outside_hours_count']}")
     print(f"  No eligible: {engine.stats['no_eligible_failures']}")
     print("=" * 60)
+
+    if batch_policy is not None and hasattr(batch_policy, 'print_diagnostics_summary'):
+        batch_policy.print_diagnostics_summary()
 
     # Export results
     os.makedirs(output_dir, exist_ok=True)
@@ -261,6 +280,12 @@ def main():
         default="random",
         help="Resource selection heuristic (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)"
     )
+    parser.add_argument(
+        "--resource-allocation-mode",
+        choices=["greedy", "batch"],
+        default="greedy",
+        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1)"
+    )
 
     args = parser.parse_args()
 
@@ -313,6 +338,7 @@ def main():
 
     config.num_cases = num_cases
     config.resource_selection_strategy = args.resource_strategy
+    config.resource_allocation_mode = args.resource_allocation_mode
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)

@@ -52,6 +52,11 @@ class SimulationConfig:
     # Resource selection strategy (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)
     resource_selection_strategy: Literal["random", "round_robin", "shortest_queue"] = "random"
 
+    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy
+    resource_allocation_mode: Literal["greedy", "batch"] = "greedy"
+    # Batch policy (only when resource_allocation_mode="batch")
+    batch_policy: Literal["1_batch_1"] = "1_batch_1"
+
     # Global settings
     event_log_path: Optional[str] = None
     num_cases: int = 100
