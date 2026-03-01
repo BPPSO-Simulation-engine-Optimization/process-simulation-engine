@@ -85,7 +85,7 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
 
     Args:
         model_path: Path to model directory
-        model_type: "embedding", "onehot", or "auto"
+        model_type: "embedding", "onehot", "lifecycle_dual", or "auto"
 
     Returns:
         Predictor instance if successful, None otherwise
@@ -103,10 +103,13 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
         predictors_to_try = [("embedding", "next_activity_prediction", "LSTMNextActivityPredictor")]
     elif model_type == "onehot":
         predictors_to_try = [("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot")]
+    elif model_type == "lifecycle_dual":
+        predictors_to_try = [("lifecycle_dual", "next_activity_prediction_lifecycle_dual", "DualLifecycleNextActivityPredictor")]
     else:  # auto
         predictors_to_try = [
             ("embedding", "next_activity_prediction", "LSTMNextActivityPredictor"),
             ("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot"),
+            ("lifecycle_dual", "next_activity_prediction_lifecycle_dual", "DualLifecycleNextActivityPredictor"),
         ]
 
     for pred_type, module_name, class_name in predictors_to_try:
@@ -167,6 +170,8 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
 
     # Basic mode - check both possible locations for auto-load
     possible_paths = [
+        Path("next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
+        Path("next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
         Path("models/next_activity_lstm"),
         Path("next_activity_prediction/models/next_activity_lstm"),
         Path("models/next_activity_lstm_onehot"),
@@ -391,18 +396,35 @@ def _setup_case_attributes(
         except Exception as e:
             logger.warning(f"Could not load monthly artifact: {e}")
 
-    # By default, load from cached artifacts (df=None, retrain_models=False)
-    # Only pass df if retraining is explicitly requested
+    # By default, load from cached artifacts (df=None, retrain_models=False).
+    # If cache is missing/corrupt, auto-fallback to retraining when df is available.
     retrain = getattr(config, 'case_attribute_retrain', False)
+    used_retrain = retrain
 
-    predictor = AttributeSimulationEngine(
-        df=df if retrain else None,
-        seed=config.case_attribute_seed,
-        monthly_artifact=monthly_artifact,
-        offer_create_activity=config.case_attribute_offer_activity,
-        retrain_models=retrain,
-    )
+    try:
+        predictor = AttributeSimulationEngine(
+            df=df if retrain else None,
+            seed=config.case_attribute_seed,
+            monthly_artifact=monthly_artifact,
+            offer_create_activity=config.case_attribute_offer_activity,
+            retrain_models=retrain,
+        )
+    except ValueError as e:
+        if (not retrain) and (df is not None):
+            logger.warning(
+                "Case attribute artifacts missing or invalid. Falling back to retraining from event log."
+            )
+            predictor = AttributeSimulationEngine(
+                df=df,
+                seed=config.case_attribute_seed,
+                monthly_artifact=monthly_artifact,
+                offer_create_activity=config.case_attribute_offer_activity,
+                retrain_models=True,
+            )
+            used_retrain = True
+        else:
+            raise
 
-    mode_desc = "retrained from event log" if retrain else "from cached artifacts"
+    mode_desc = "retrained from event log" if used_retrain else "from cached artifacts"
     logger.info(f"Loaded AttributeSimulationEngine ({mode_desc})")
     return predictor
