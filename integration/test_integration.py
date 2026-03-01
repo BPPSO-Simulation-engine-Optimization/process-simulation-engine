@@ -218,7 +218,7 @@ def main():
     )
     parser.add_argument(
         "--next-activity",
-        choices=["lstm", "process_transformer"],
+        choices=["lstm", "process_transformer", "lifecycle_dual_full_baseline", "lifecycle_dual_start_complete_baseline"],
         default="lstm",
         help="Next activity predictor implementation"
     )
@@ -295,9 +295,43 @@ def main():
 
 
     
-    # Set the implementation class (lstm vs process_transformer)
+    # Set the implementation class
     config.next_activity_class = args.next_activity
     config.next_activity_temperature = args.temperature
+    if args.next_activity == "lifecycle_dual_full_baseline":
+        candidate_model_paths = [
+            "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
+            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
+        ]
+        selected_model_path = None
+        for candidate in candidate_model_paths:
+            if Path(candidate).exists():
+                selected_model_path = candidate
+                break
+        if selected_model_path is None:
+            selected_model_path = candidate_model_paths[0]
+
+        config.next_activity_class = "lstm"
+        config.next_activity_mode = "advanced"
+        config.next_activity_model_type = "lifecycle_dual"
+        config.next_activity_model_path = selected_model_path
+    elif args.next_activity == "lifecycle_dual_start_complete_baseline":
+        candidate_model_paths = [
+            "next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
+            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
+        ]
+        selected_model_path = None
+        for candidate in candidate_model_paths:
+            if Path(candidate).exists():
+                selected_model_path = candidate
+                break
+        if selected_model_path is None:
+            selected_model_path = candidate_model_paths[0]
+
+        config.next_activity_class = "lstm"
+        config.next_activity_mode = "advanced"
+        config.next_activity_model_type = "lifecycle_dual"
+        config.next_activity_model_path = selected_model_path
 
     config.num_cases = num_cases
 
