@@ -218,4 +218,6 @@ class ResourceAllocator:
 
         # 3. Selection (Random for now, TODO improve in optimization?)
         selected_resource = random.choice(available_resources)
+
+
         return selected_resource
