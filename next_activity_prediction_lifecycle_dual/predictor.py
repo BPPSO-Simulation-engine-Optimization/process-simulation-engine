@@ -13,6 +13,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_HF_REPO = "Nixion/next_activity_prediction_lifecycle_dual"
+
+
 class DualLifecycleNextActivityPredictor:
     """
     Runtime predictor for the dual-head lifecycle model.
@@ -21,9 +24,10 @@ class DualLifecycleNextActivityPredictor:
     next-activity behavior expected by the simulation engine.
     """
 
-    def __init__(self, model_path: str, seed: Optional[int] = None):
+    def __init__(self, model_path: str, seed: Optional[int] = None, hf_repo: Optional[str] = None):
         self.model_path = Path(model_path)
-        self.model, metadata = self._load_model_and_metadata(self.model_path)
+        self.hf_repo = hf_repo
+        self.model, metadata = self._load_model_and_metadata(self.model_path, hf_repo=hf_repo)
 
         self.sequence_length = int(metadata["sequence_length"])
         self.activity_to_idx = {k: int(v) for k, v in metadata["activity_to_idx"].items()}
@@ -43,7 +47,7 @@ class DualLifecycleNextActivityPredictor:
         logger.info("Loaded DualLifecycleNextActivityPredictor from %s", model_path)
 
     @staticmethod
-    def _load_model_and_metadata(model_path: Path):
+    def _load_model_and_metadata(model_path: Path, hf_repo: Optional[str] = None):
         if model_path.is_file() and model_path.suffix == ".keras":
             model_file = model_path
             model_dir = model_path.parent if model_path.name == "model.keras" else model_path.parent.parent
@@ -54,12 +58,16 @@ class DualLifecycleNextActivityPredictor:
                 checkpoint = model_dir / "checkpoints" / "best_model.keras"
                 if checkpoint.exists():
                     model_file = checkpoint
-                else:
-                    raise FileNotFoundError(f"No model found in {model_dir}")
 
         metadata_file = model_dir / "metadata.json"
-        if not metadata_file.exists():
-            raise FileNotFoundError(f"Metadata not found: {metadata_file}")
+        local_ok = model_file.exists() and metadata_file.exists()
+
+        if not local_ok:
+            repo = hf_repo or DEFAULT_HF_REPO
+            logger.info("Local model not found at %s, downloading from HuggingFace repo '%s'...", model_path, repo)
+            from huggingface_hub import hf_hub_download
+            model_file = Path(hf_hub_download(repo_id=repo, filename="model.keras"))
+            metadata_file = Path(hf_hub_download(repo_id=repo, filename="metadata.json"))
 
         model = keras.models.load_model(str(model_file))
         with open(metadata_file, "r", encoding="utf-8") as f:
