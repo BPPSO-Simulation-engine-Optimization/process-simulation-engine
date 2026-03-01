@@ -32,7 +32,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import List, Dict, Optional, Protocol, Set
+from typing import List, Dict, Optional, Protocol, Set, Tuple
 from collections import defaultdict
 import heapq
 
@@ -44,6 +44,16 @@ from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
 
 logger = logging.getLogger(__name__)
+
+# Import resource optimization (lazy import to avoid circular dependencies)
+try:
+    from resources.resource_optimization.resource_optimization import (
+        choose_resource,
+        SelectionConfig
+    )
+except ImportError:
+    choose_resource = None
+    SelectionConfig = None
 
 
 class NextActivityPredictorType(Enum):
@@ -58,6 +68,17 @@ class NextActivityPredictorType(Enum):
     BRANCH = "branch"
     STUB = "stub"
     PROCESS_TRANSFORMER = "process_transformer"
+
+
+class ResourceSelectionMode(Enum):
+    """
+    Available resource selection modes.
+    
+    - RANDOM: Random selection from available resources (default, baseline)
+    - OPTIMIZATION: Optimization-based selection using resource_optimization module
+    """
+    RANDOM = "random"
+    OPTIMIZATION = "optimization"
 
 
 @dataclass
@@ -292,6 +313,7 @@ class DESEngine:
         case_attribute_predictor: CaseAttributePredictor = None,
         start_time: datetime = None,
         max_activities_per_case: int = 500,
+        resource_selection_mode: ResourceSelectionMode = ResourceSelectionMode.RANDOM,
     ):
         """
         Initialize the DES Engine.
@@ -308,6 +330,8 @@ class DESEngine:
             case_attribute_predictor: Predicts case attributes (required).
             start_time: Simulation start time.
             max_activities_per_case: Safety limit to prevent infinite loops.
+            resource_selection_mode: Mode for resource selection (RANDOM or OPTIMIZATION).
+                Defaults to RANDOM for backward compatibility.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -355,6 +379,9 @@ class DESEngine:
         self.resource_pool = ResourcePool(
             availability_model=resource_allocator.availability if resource_allocator else None
         )
+
+        # Resource selection mode
+        self.resource_selection_mode = resource_selection_mode
 
         # Output: collected events for export
         self.completed_events: List[Dict] = []
@@ -899,9 +926,42 @@ class DESEngine:
             # Everyone qualified is busy
             return None, 'all_busy'
 
-        # Select randomly from truly available resources
-        import random
-        return random.choice(truly_available), None
+        # Hier soll von dem random modeabwichen werden. Es soll ein Optimierungsverfahren eingeführt werden. Erstelle einen modus, der von dem random mode abweicht, den ich dann implemntiern werden
+        if self.resource_selection_mode == ResourceSelectionMode.RANDOM:
+            # Select randomly from truly available resources
+            import random
+            return random.choice(truly_available), None
+        elif self.resource_selection_mode == ResourceSelectionMode.OPTIMIZATION:
+            print("Optimization mode selected! It begins here!")
+            # Select resource using optimization strategy from resource_optimization
+            if choose_resource is None or SelectionConfig is None:
+                # Fallback to random if optimization module not available
+                logger.warning("Resource optimization module not available. Falling back to random selection.")
+                import random
+                return random.choice(truly_available), None
+            
+            # Create selection config based on optimization mode
+            # TODO: Make this configurable via engine parameters
+            cfg = SelectionConfig(
+                dummy_delta=1.0,
+                rng_seed=None
+            )
+            
+            # Use choose_resource from resource_optimization
+            selected_resource, debug_info = choose_resource(
+                cfg=cfg,
+                activity=activity,
+                timestamp=timestamp,
+                case=case,
+                available_resources=truly_available,
+                eligible_resources=eligible_resources,
+                processing_time_predictor=self._processing_time
+            )
+            
+            # Log debug info if needed (optional)
+            # logger.debug(f"Resource selection: {debug_info}")
+            
+            return selected_resource, None
 
     def _schedule_activity_with_resource(self, case_id: str, activity: str,
                                           current_time: datetime, case: CaseState,

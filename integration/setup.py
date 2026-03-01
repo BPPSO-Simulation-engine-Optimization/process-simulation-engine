@@ -71,7 +71,17 @@ def setup_simulation(
     next_activity_pred = _setup_next_activity(config)
 
     # 3. Processing time predictor
-    processing_time_pred = _setup_processing_time(config)
+    # Skip if using ProcessTransformer (it handles both next activity and processing time)
+    use_transformer = (
+        config.next_activity_mode == "advanced" and 
+        hasattr(config, 'next_activity_class') and 
+        config.next_activity_class == "process_transformer"
+    )
+    if use_transformer:
+        logger.info("Skipping ProcessingTimePredictionClass setup - ProcessTransformer will handle processing time prediction")
+        processing_time_pred = None
+    else:
+        processing_time_pred = _setup_processing_time(config)
 
     # 4. Case attribute predictor
     case_attr_pred = _setup_case_attributes(config, df)
@@ -373,14 +383,27 @@ def _setup_case_attributes(
     # By default, load from cached artifacts (df=None, retrain_models=False)
     # Only pass df if retraining is explicitly requested
     retrain = getattr(config, 'case_attribute_retrain', False)
-
-    predictor = AttributeSimulationEngine(
-        df=df if retrain else None,
-        seed=config.case_attribute_seed,
-        monthly_artifact=monthly_artifact,
-        offer_create_activity=config.case_attribute_offer_activity,
-        retrain_models=retrain,
-    )
+    
+    # If advanced mode is enabled and df is available, use it
+    # The AttributeSimulationEngine will check if models exist and train if needed
+    if config.case_attribute_mode == "advanced" and df is not None:
+        # Pass df so it can train models if they don't exist
+        predictor = AttributeSimulationEngine(
+            df=df,
+            seed=config.case_attribute_seed,
+            monthly_artifact=monthly_artifact,
+            offer_create_activity=config.case_attribute_offer_activity,
+            retrain_models=retrain,
+        )
+    else:
+        # Try to load from cached artifacts
+        predictor = AttributeSimulationEngine(
+            df=None,
+            seed=config.case_attribute_seed,
+            monthly_artifact=monthly_artifact,
+            offer_create_activity=config.case_attribute_offer_activity,
+            retrain_models=False,
+        )
 
     mode_desc = "retrained from event log" if retrain else "from cached artifacts"
     logger.info(f"Loaded AttributeSimulationEngine ({mode_desc})")

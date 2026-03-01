@@ -29,7 +29,7 @@ sys.path.insert(0, str(project_root))
 
 from integration.config import SimulationConfig
 from integration.setup import setup_simulation
-from simulation.engine import DESEngine, NextActivityPredictorType
+from simulation.engine import DESEngine, NextActivityPredictorType, ResourceSelectionMode
 from simulation.log_exporter import LogExporter
 
 
@@ -97,7 +97,7 @@ def save_ground_truth_subset(df: pd.DataFrame, num_cases: int, output_dir: str):
     return reduced_df
 
 
-def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str):
+def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str, resource_selection_mode: ResourceSelectionMode = ResourceSelectionMode.RANDOM):
     """Run the simulation with given configuration."""
     print("\n" + "=" * 60)
     print("SIMULATION CONFIGURATION")
@@ -106,6 +106,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Number of cases: {config.num_cases}")
+    print(f"  Resource selection mode: {resource_selection_mode.value}")
     print("=" * 60 + "\n")
 
     # Get start date from event log
@@ -117,9 +118,15 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 
     # Setup predictors
     print("\nSetting up predictors...")
+    # Always pass df if any advanced mode is enabled
+    use_df = (
+        config.case_arrival_mode == "advanced" or 
+        config.case_attribute_mode == "advanced" or
+        config.processing_time_mode == "advanced"
+    )
     arrivals, next_act_pred, proc_pred, attr_pred = setup_simulation(
         config,
-        df=df if config.case_arrival_mode == "advanced" or config.case_attribute_mode == "advanced" else None,
+        df=df if use_df else None,
         start_date=start_date,
     )
     print(f"Generated {len(arrivals)} arrival timestamps")
@@ -150,6 +157,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
+        resource_selection_mode=resource_selection_mode,
     )
 
     # Run simulation
@@ -249,6 +257,12 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--resource-selection-mode",
+        choices=["random", "optimization"],
+        default="random",
+        help="Resource selection mode: 'random' (default) or 'optimization' (uses resource_optimization module)"
+    )
 
     args = parser.parse_args()
 
@@ -308,8 +322,11 @@ def main():
     print(f"\nSaving ground truth subset ({num_cases} cases) for comparison...")
     save_ground_truth_subset(df, num_cases, args.output_dir)
 
+    # Parse resource selection mode
+    resource_selection_mode = ResourceSelectionMode.RANDOM if args.resource_selection_mode == "random" else ResourceSelectionMode.OPTIMIZATION
+
     # Run simulation
-    events = run_simulation(config, df, allocator, args.output_dir)
+    events = run_simulation(config, df, allocator, args.output_dir, resource_selection_mode=resource_selection_mode)
 
     print("\n" + "=" * 60)
     print("INTEGRATION TEST COMPLETE")
