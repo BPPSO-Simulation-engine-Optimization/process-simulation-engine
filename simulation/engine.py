@@ -30,6 +30,7 @@ import uuid
 import random
 import logging
 import threading
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -317,6 +318,16 @@ class DESEngine:
     2. ACTIVITY_COMPLETE -> log event, predict next -> schedule next or CASE_END
     3. CASE_END -> cleanup
     """
+
+    PT_LIFECYCLE_MODES = {"native", "gt_activity_gated"}
+    PT_GT_START_ACTIVITIES = {
+        "W_Assess potential fraud",
+        "W_Call after offers",
+        "W_Call incomplete files",
+        "W_Complete application",
+        "W_Handle leads",
+        "W_Validate application",
+    }
     
     def __init__(
         self,
@@ -334,6 +345,7 @@ class DESEngine:
         batch_allocation_policy=None,
         processing_time_estimator=None,
         drl_policy=None,
+        pt_lifecycle_mode: str = "native",
     ):
         """
         Initialize the DES Engine.
@@ -358,6 +370,10 @@ class DESEngine:
                 p_{ij} lookups.  Required when batch_allocation_policy is set.
             drl_policy: Optional DRL allocation policy (DRLAllocationPolicy or
                 InteractiveBatchPolicy).  When set, overrides both batch and greedy.
+            pt_lifecycle_mode: PT-only lifecycle logging mode.
+                "native": keep predictor lifecycle output.
+                "gt_activity_gated": emit synthetic "start" for GT start-capable
+                activities and force completion logs to "complete".
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -379,6 +395,22 @@ class DESEngine:
             raise ValueError(
                 "Either next_activity_predictor or next_activity_predictor_type is required. "
                 "Use a valid NextActivityPredictorType or pass a predictor instance."
+            )
+
+        self._is_process_transformer_predictor = self._detect_process_transformer_predictor(
+            predictor=self._next_activity,
+            predictor_type=next_activity_predictor_type,
+        )
+        self._pt_lifecycle_mode = str(pt_lifecycle_mode or "native")
+        if self._pt_lifecycle_mode not in self.PT_LIFECYCLE_MODES:
+            raise ValueError(
+                f"Unknown pt_lifecycle_mode: {self._pt_lifecycle_mode}. "
+                f"Expected one of: {sorted(self.PT_LIFECYCLE_MODES)}"
+            )
+        if self._pt_lifecycle_mode == "gt_activity_gated" and not self._is_process_transformer_predictor:
+            raise ValueError(
+                "pt_lifecycle_mode='gt_activity_gated' is only valid with the "
+                "Process Transformer next activity predictor."
             )
         self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
@@ -429,6 +461,24 @@ class DESEngine:
             'waiting_events': 0,  # Cases that had to wait for resources
             'wait_time_total_seconds': 0,  # Total time spent waiting
         }
+
+    @staticmethod
+    def _detect_process_transformer_predictor(
+        predictor,
+        predictor_type: Optional[NextActivityPredictorType],
+    ) -> bool:
+        """Best-effort detection of Process Transformer predictor wiring."""
+        if predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
+            return True
+        if predictor is None:
+            return False
+
+        cls = predictor.__class__
+        module_name = getattr(cls, "__module__", "")
+        class_name = getattr(cls, "__name__", "")
+        if "process_transformer_v2" in module_name:
+            return True
+        return class_name in {"PTActivityAdapter", "ProcessTransformerV2Predictor"}
     
     def _create_next_activity_predictor(
         self, 
@@ -733,8 +783,12 @@ class DESEngine:
             case.selected = attr.selected
             case.accepted = attr.accepted
 
+        completion_lifecycle = event.lifecycle
+        if self._pt_lifecycle_mode == "gt_activity_gated" and self._is_process_transformer_predictor:
+            completion_lifecycle = "complete"
+
         # Record activity in case history
-        case.add_activity(event.activity, event.resource, event.lifecycle)
+        case.add_activity(event.activity, event.resource, completion_lifecycle)
 
         # Safety guard: if a case keeps looping, stop it instead of hanging the run
         if self._max_activities_per_case and len(case.activity_history) >= self._max_activities_per_case:
@@ -743,6 +797,7 @@ class DESEngine:
                 f"ending to avoid infinite loop (last={case.activity_history[-1]})."
             )
             log_record = event.to_log_record()
+            log_record['lifecycle:transition'] = completion_lifecycle
             log_record.update(case.get_payload())
             self.completed_events.append(log_record)
             self._schedule_case_end(event.case_id, event.timestamp)
@@ -752,6 +807,7 @@ class DESEngine:
 
         # Log the event for export
         log_record = event.to_log_record()
+        log_record['lifecycle:transition'] = completion_lifecycle
         log_record.update(case.get_payload())
         self.completed_events.append(log_record)
 
@@ -1184,18 +1240,48 @@ class DESEngine:
 
     def _normalize_activity_for_resources(self, activity: str) -> str:
         """Normalize activity labels to match the resource permission model."""
-        # Do not normalize control-flow artifacts (already treated as resource-free)
-        if not activity or activity.startswith('DP ') or activity.startswith('PG '):
+        return self._normalize_activity_label(activity)
+
+    def _normalize_activity_label(self, activity: Optional[str]) -> Optional[str]:
+        """Normalize labels by removing loop suffixes (e.g. 'X 2' -> 'X')."""
+        if not activity:
+            return activity
+        if activity.startswith('DP ') or activity.startswith('PG '):
             return activity
 
-        # Many parts of this project generate duplicate labels to avoid loops
-        # (e.g., "W_Complete application 1", "A_Cancelled 2").
-        # The permission model is typically trained on the base label.
-        parts = activity.rsplit(' ', 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            base = parts[0].strip()
-            return base or activity
-        return activity
+        normalized = re.sub(r"\s+\d+$", "", activity).strip()
+        return normalized or activity
+
+    def _should_emit_pt_gt_start(self, activity: Optional[str]) -> bool:
+        """Return True if this activity gets a synthetic start in PT GT-gated mode."""
+        if self._pt_lifecycle_mode != "gt_activity_gated":
+            return False
+        if not self._is_process_transformer_predictor:
+            return False
+        normalized = self._normalize_activity_label(activity)
+        return normalized in self.PT_GT_START_ACTIVITIES
+
+    def _append_synthetic_start_record(
+        self,
+        case_id: str,
+        activity: str,
+        resource: Optional[str],
+        timestamp: datetime,
+        case: CaseState,
+    ) -> None:
+        """Append synthetic 'start' event directly to export records."""
+        if not self._should_emit_pt_gt_start(activity):
+            return
+
+        log_record = {
+            'case:concept:name': case_id,
+            'concept:name': activity,
+            'org:resource': resource,
+            'time:timestamp': timestamp,
+            'lifecycle:transition': 'start',
+        }
+        log_record.update(case.get_payload())
+        self.completed_events.append(log_record)
 
     def _schedule_activity_without_resource(
         self,
@@ -1238,6 +1324,7 @@ class DESEngine:
             processing_seconds = 0.0
 
         completion_time = current_time + timedelta(seconds=processing_seconds)
+        self._append_synthetic_start_record(case_id, activity, None, current_time, case)
 
         event = SimulationEvent(
             timestamp=completion_time,
@@ -1341,6 +1428,7 @@ class DESEngine:
 
         # Mark resource as busy until completion
         self.resource_pool.mark_busy(resource, completion_time, case_id, activity)
+        self._append_synthetic_start_record(case_id, activity, resource, current_time, case)
 
         # Schedule completion event
         event = SimulationEvent(

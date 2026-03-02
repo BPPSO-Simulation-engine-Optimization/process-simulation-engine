@@ -108,6 +108,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Resource selection: {config.resource_selection_strategy}")
     print(f"  Resource allocation mode: {config.resource_allocation_mode}")
+    if config.next_activity_class == "process_transformer":
+        print(f"  PT lifecycle mode: {config.pt_lifecycle_mode}")
     if config.resource_allocation_mode == "batch":
         print(f"  Batch policy: {config.batch_policy}")
     elif config.resource_allocation_mode == "drl":
@@ -195,6 +197,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         next_activity_predictor=next_act_pred,  # May be None for auto-load or if delegated
         next_activity_predictor_type=pred_type,  # Explicit type trigger if predictor is None
         next_activity_config={'temperature': config.next_activity_temperature},
+        pt_lifecycle_mode=config.pt_lifecycle_mode,
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
@@ -284,6 +287,12 @@ def main():
         help="Sampling temperature for next activity prediction (process_transformer only)"
     )
     parser.add_argument(
+        "--pt-lifecycle-mode",
+        choices=["native", "gt_activity_gated"],
+        default="native",
+        help="PT-only lifecycle logging mode: native predictor output, or GT activity-gated synthetic starts"
+    )
+    parser.add_argument(
         "--event-log",
         default="Dataset/BPI Challenge 2017.xes",
         help="Path to event log file"
@@ -323,6 +332,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.pt_lifecycle_mode == "gt_activity_gated" and args.next_activity != "process_transformer":
+        raise ValueError(
+            "--pt-lifecycle-mode=gt_activity_gated is only valid with "
+            "--next-activity process_transformer. "
+            "Use --pt-lifecycle-mode native for non-PT predictors."
+        )
 
     # Setup logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -370,6 +386,7 @@ def main():
     # Set the implementation class
     config.next_activity_class = args.next_activity
     config.next_activity_temperature = args.temperature
+    config.pt_lifecycle_mode = args.pt_lifecycle_mode
     if args.next_activity == "lifecycle_dual_full_baseline":
         raise NotImplementedError(
             "lifecycle_dual_full_baseline is not yet available. "

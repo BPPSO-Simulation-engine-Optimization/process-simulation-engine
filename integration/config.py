@@ -28,6 +28,8 @@ class SimulationConfig:
     next_activity_model_type: Literal["embedding", "onehot", "lifecycle_dual", "auto"] = "auto"
     next_activity_hf_repo: Optional[str] = None
     next_activity_temperature: float = 1.0
+    # PT-only lifecycle logging mode (ignored unless next_activity_class is process_transformer)
+    pt_lifecycle_mode: Literal["native", "gt_activity_gated"] = "native"
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
@@ -53,10 +55,14 @@ class SimulationConfig:
     # Resource selection strategy (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)
     resource_selection_strategy: Literal["random", "round_robin", "shortest_queue"] = "random"
 
-    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy
-    resource_allocation_mode: Literal["greedy", "batch"] = "greedy"
+    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy, "drl" uses trained PPO
+    resource_allocation_mode: Literal["greedy", "batch", "drl"] = "greedy"
     # Batch policy (only when resource_allocation_mode="batch")
     batch_policy: Literal["1_batch_1"] = "1_batch_1"
+    # DRL policy settings (only when resource_allocation_mode="drl")
+    drl_model_path: Optional[str] = "models/drl_allocation/drl_allocation_model"
+    drl_deterministic: bool = True
+    drl_reward_tau: float = 100.0
 
     # Global settings
     event_log_path: Optional[str] = None
