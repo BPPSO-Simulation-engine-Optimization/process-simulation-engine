@@ -29,6 +29,7 @@ This creates realistic resource contention and waiting times.
 import uuid
 import random
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -332,6 +333,7 @@ class DESEngine:
         resource_selection_strategy: ResourceSelectionStrategy = None,
         batch_allocation_policy=None,
         processing_time_estimator=None,
+        drl_policy=None,
     ):
         """
         Initialize the DES Engine.
@@ -354,6 +356,8 @@ class DESEngine:
                 When set, _process_waiting_queue uses holistic MILP instead of greedy.
             processing_time_estimator: Optional ProcessingTimeEstimator for batch policy
                 p_{ij} lookups.  Required when batch_allocation_policy is set.
+            drl_policy: Optional DRL allocation policy (DRLAllocationPolicy or
+                InteractiveBatchPolicy).  When set, overrides both batch and greedy.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -408,6 +412,9 @@ class DESEngine:
         # Batch allocation policy (optional, overrides greedy waiting-queue logic)
         self._batch_policy = batch_allocation_policy
         self._pt_estimator = processing_time_estimator
+
+        # DRL allocation policy (optional, overrides both batch and greedy)
+        self._drl_policy = drl_policy
 
         # Output: collected events for export
         self.completed_events: List[Dict] = []
@@ -762,6 +769,11 @@ class DESEngine:
 
         Tries to dispatch waiting work to the freed resource if it's eligible.
         """
+        # DRL policy overrides both batch and greedy
+        if self._drl_policy is not None:
+            self._process_waiting_queue_drl(freed_resource, current_time)
+            return
+
         # Batch allocation policy overrides greedy logic
         if self._batch_policy is not None:
             self._process_waiting_queue_batch(freed_resource, current_time)
@@ -899,7 +911,7 @@ class DESEngine:
                     self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
                     self._batch_policy._diag_greedy_neighborhood_too_large += 1
                     self._schedule_activity_with_resource(
-                        removed.case_id, removed.activity, current_time,
+                        removed.case_id, removed.activity, removed.lifecycle, current_time,
                         removed.case_state, freed_resource,
                     )
                     return
@@ -969,10 +981,149 @@ class DESEngine:
         self._schedule_activity_with_resource(
             removed.case_id,
             removed.activity,
+            removed.lifecycle,
             current_time,
             removed.case_state,
             freed_resource,
         )
+
+    def _process_waiting_queue_drl(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        DRL-mode waiting-queue processing.
+
+        Builds TaskInfo list and eligible_map (no neighborhood scoping),
+        applies auto-postpone filter, then delegates to the DRL policy.
+        """
+        from resources.batch_policies import TaskInfo
+
+        # 1. Collect all waiting tasks
+        all_waiting = self.resource_pool.get_all_waiting_tasks()
+        if not all_waiting:
+            return
+
+        # 2. Build TaskInfo list
+        tasks: list[TaskInfo] = []
+        for w in all_waiting:
+            hours_waited = (current_time - w.arrival_time).total_seconds() / 3600.0
+            tasks.append(TaskInfo(
+                task_id=f"{w.case_id}::{w.allocation_activity}",
+                case_id=w.case_id,
+                activity=w.activity,
+                allocation_activity=w.allocation_activity,
+                hours_waited=max(0.0, hours_waited),
+            ))
+
+        # 3. Build eligible_map (no neighborhood scoping for DRL)
+        eligible_map: dict[str, set[str]] = {}
+        unique_activities = {t.allocation_activity for t in tasks}
+
+        for act in unique_activities:
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    act, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(act)
+
+            available = {
+                r for r in eligible
+                if self.allocator.availability.is_available(r, current_time)
+            }
+            eligible_map[act] = available
+
+        # 4. Auto-postpone: skip decide() if freed resource can't serve any waiting activity
+        any_feasible = any(
+            freed_resource in eligible_map.get(t.allocation_activity, set())
+            for t in tasks
+        )
+        if not any_feasible:
+            return
+
+        # 5. Provide engine state to policy (for observation building)
+        if hasattr(self._drl_policy, 'set_engine_state'):
+            self._drl_policy.set_engine_state(self.resource_pool, self.case_manager)
+
+        # 6. Build pool snapshot for training bridge (InteractiveBatchPolicy)
+        pool_snapshot = self._build_pool_snapshot()
+        waiting_activities = {t.allocation_activity for t in tasks if self.resource_pool.has_waiting_work(t.allocation_activity)}
+
+        # 7. Call policy
+        decision = self._drl_policy.decide(
+            freed_resource=freed_resource,
+            current_time_s=current_time.timestamp(),
+            tasks=tasks,
+            workers=[],  # Not used by DRL policy
+            eligible_map=eligible_map,
+            processing_time_fn=lambda w, a: 0.0,  # Not used by DRL policy
+            current_time_dt=current_time,
+            waiting_activities=waiting_activities,
+            pool_snapshot=pool_snapshot,
+            active_case_count=self.case_manager.active_count(),
+        )
+
+        if decision is None:
+            return
+
+        # 8. Parse task_id and dispatch
+        parts = decision.task_id.split("::", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid task_id from DRL policy: %s", decision.task_id)
+            return
+        case_id, allocation_activity = parts
+
+        removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+        if removed is None:
+            logger.warning(
+                "DRL policy assigned task %s but it was not found in queue",
+                decision.task_id,
+            )
+            return
+
+        wait_seconds = (current_time - removed.arrival_time).total_seconds()
+        self.stats['wait_time_total_seconds'] += wait_seconds
+
+        logger.debug(
+            "DRL dispatching %s for case %s to %s (waited %.0fs)",
+            removed.activity, removed.case_id, freed_resource, wait_seconds,
+        )
+
+        self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
+        self._schedule_activity_with_resource(
+            removed.case_id,
+            removed.activity,
+            removed.lifecycle,
+            current_time,
+            removed.case_state,
+            freed_resource,
+        )
+
+    def _build_pool_snapshot(self) -> dict:
+        """Serialize resource pool state into plain dicts for thread-safe access."""
+        busy = {}
+        for res_id, (busy_until, case_id, activity) in self.resource_pool._busy_resources.items():
+            busy[res_id] = {
+                "busy_until": busy_until,
+                "case_id": case_id,
+                "activity": activity,
+            }
+
+        waiting = {}
+        for act, queue_items in self.resource_pool._waiting_queues.items():
+            if queue_items:
+                waiting[act] = [
+                    {
+                        "case_id": w.case_id,
+                        "activity": w.activity,
+                        "allocation_activity": w.allocation_activity,
+                        "arrival_time": w.arrival_time,
+                    }
+                    for w in queue_items
+                ]
+
+        return {"busy_resources": busy, "waiting_queues": waiting}
 
     def _on_case_end(self, event: SimulationEvent) -> None:
         """Handle case end: cleanup."""
@@ -1360,6 +1511,49 @@ class DESEngine:
         final_waiting = self.resource_pool.get_total_waiting_count()
         drained = initial_waiting - final_waiting
         logger.info(f"Drain phase complete: {drained} cases dispatched, {final_waiting} remaining")
+
+
+# ---------------------------------------------------------------------------
+# Training DES Engine — subclass for DRL training
+# ---------------------------------------------------------------------------
+
+class TrainingDESEngine(DESEngine):
+    """
+    DESEngine subclass that captures per-case cycle times for reward computation.
+
+    Used during DRL training: the Gym env reads completed case cycle times
+    via pop_completed_cases() after each decision step.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._completed_cycle_times: list[float] = []
+        self._lock = threading.Lock()
+
+    def _on_case_end(self, event: SimulationEvent) -> None:
+        """Override: capture cycle time before cleanup."""
+        case = self.case_manager.get_case(event.case_id)
+        if case and case.start_time:
+            ct_hours = (event.timestamp - case.start_time).total_seconds() / 3600.0
+            with self._lock:
+                self._completed_cycle_times.append(ct_hours)
+        super()._on_case_end(event)
+
+    def pop_completed_cases(self) -> list[float]:
+        """Return and clear accumulated cycle times (thread-safe)."""
+        with self._lock:
+            times = self._completed_cycle_times[:]
+            self._completed_cycle_times.clear()
+        return times
+
+    def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
+        """Override: signal episode end to DRL bridge after run completes."""
+        try:
+            result = super().run(num_cases=num_cases, max_time=max_time)
+        finally:
+            if self._drl_policy is not None and hasattr(self._drl_policy, 'signal_episode_end'):
+                self._drl_policy.signal_episode_end()
+        return result
 
 
 # Stub predictors for testing/fallback

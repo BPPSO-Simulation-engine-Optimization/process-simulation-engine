@@ -110,6 +110,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Resource allocation mode: {config.resource_allocation_mode}")
     if config.resource_allocation_mode == "batch":
         print(f"  Batch policy: {config.batch_policy}")
+    elif config.resource_allocation_mode == "drl":
+        print(f"  DRL model: {config.drl_model_path}")
     print(f"  Number of cases: {config.num_cases}")
     print("=" * 60 + "\n")
 
@@ -160,6 +162,33 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         pt_estimator = ProcessingTimeEstimator(df=df)
         print(f"Created batch policy: {config.batch_policy}")
 
+    # Create DRL allocation policy (if requested)
+    drl_policy = None
+    if config.resource_allocation_mode == "drl":
+        import pickle
+        from resources.drl_state import DRLStateBuilder
+        from resources.drl_policy import DRLAllocationPolicy
+
+        model_path = config.drl_model_path
+        config_path = os.path.join(os.path.dirname(model_path), "state_builder_config.pkl")
+
+        with open(config_path, "rb") as f:
+            sb_config = pickle.load(f)
+
+        state_builder = DRLStateBuilder(
+            activity_list=sb_config["activity_list"],
+            role_groups=sb_config["role_groups"],
+            resource_to_role=sb_config["resource_to_role"],
+            activity_to_roles=sb_config["activity_to_roles"],
+        )
+
+        drl_policy = DRLAllocationPolicy(
+            model_path=model_path,
+            state_builder=state_builder,
+            deterministic=config.drl_deterministic,
+        )
+        print(f"Created DRL policy from: {model_path}")
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
@@ -172,6 +201,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         resource_selection_strategy=resource_strategy,
         batch_allocation_policy=batch_policy,
         processing_time_estimator=pt_estimator,
+        drl_policy=drl_policy,
     )
 
     # Run simulation
@@ -282,9 +312,14 @@ def main():
     )
     parser.add_argument(
         "--resource-allocation-mode",
-        choices=["greedy", "batch"],
+        choices=["greedy", "batch", "drl"],
         default="greedy",
-        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1)"
+        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1, drl=trained PPO)"
+    )
+    parser.add_argument(
+        "--drl-model-path",
+        default="models/drl_allocation/drl_allocation_model",
+        help="Path to trained DRL model (for --resource-allocation-mode drl)"
     )
 
     args = parser.parse_args()
@@ -336,22 +371,12 @@ def main():
     config.next_activity_class = args.next_activity
     config.next_activity_temperature = args.temperature
     if args.next_activity == "lifecycle_dual_full_baseline":
-        candidate_model_paths = [
-            "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
-            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
-        ]
-        selected_model_path = None
-        for candidate in candidate_model_paths:
-            if Path(candidate).exists():
-                selected_model_path = candidate
-                break
-        if selected_model_path is None:
-            selected_model_path = candidate_model_paths[0]
-
-        config.next_activity_class = "lstm"
-        config.next_activity_mode = "advanced"
-        config.next_activity_model_type = "lifecycle_dual"
-        config.next_activity_model_path = selected_model_path
+        raise NotImplementedError(
+            "lifecycle_dual_full_baseline is not yet available. "
+            "The full lifecycle model has not been uploaded to HuggingFace. "
+            "Update the HF repo URL in next_activity_prediction_lifecycle_dual/predictor.py "
+            "to point to a full lifecycle model, or use lifecycle_dual_start_complete_baseline instead."
+        )
     elif args.next_activity == "lifecycle_dual_start_complete_baseline":
         candidate_model_paths = [
             "next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
@@ -373,6 +398,8 @@ def main():
     config.num_cases = num_cases
     config.resource_selection_strategy = args.resource_strategy
     config.resource_allocation_mode = args.resource_allocation_mode
+    if hasattr(args, 'drl_model_path') and args.drl_model_path:
+        config.drl_model_path = args.drl_model_path
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)
