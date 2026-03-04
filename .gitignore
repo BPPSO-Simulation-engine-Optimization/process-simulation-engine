@@ -43,6 +43,7 @@ integration/output/
 .env
 .claude
 CLAUDE.md
+AGENTS.md
 tasks/
 .vscode/
 .idea/
