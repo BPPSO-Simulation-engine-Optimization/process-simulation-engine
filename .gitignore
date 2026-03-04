@@ -28,6 +28,8 @@ models/
 *.h5
 *.onnx
 
+next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/*
+
 # Data & Datasets
 data/
 DataSet/

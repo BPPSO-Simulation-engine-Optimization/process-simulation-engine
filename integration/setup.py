@@ -79,13 +79,14 @@ def setup_simulation(
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
-def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
+def _try_load_predictor(model_path: Path, model_type: str, hf_repo: Optional[str] = None) -> Optional[Any]:
     """
     Try to load a next activity predictor from the given path.
 
     Args:
         model_path: Path to model directory
-        model_type: "embedding", "onehot", or "auto"
+        model_type: "embedding", "onehot", "lifecycle_dual", or "auto"
+        hf_repo: Optional HuggingFace repo ID for lifecycle_dual fallback download
 
     Returns:
         Predictor instance if successful, None otherwise
@@ -93,7 +94,10 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
     model_file = model_path / "model.keras"
     checkpoint_file = model_path / "checkpoints" / "best_model.keras"
 
-    if not model_path.exists() or (not model_file.exists() and not checkpoint_file.exists()):
+    local_exists = model_path.exists() and (model_file.exists() or checkpoint_file.exists())
+
+    # If no local model and not lifecycle_dual (which can download from HF), skip
+    if not local_exists and model_type not in ("lifecycle_dual",):
         return None
 
     # Determine which predictor to try based on model_type
@@ -103,10 +107,15 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
         predictors_to_try = [("embedding", "next_activity_prediction", "LSTMNextActivityPredictor")]
     elif model_type == "onehot":
         predictors_to_try = [("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot")]
+    elif model_type == "lifecycle_dual":
+        predictors_to_try = [("lifecycle_dual", "next_activity_prediction_lifecycle_dual", "DualLifecycleNextActivityPredictor")]
     else:  # auto
+        if not local_exists:
+            return None
         predictors_to_try = [
             ("embedding", "next_activity_prediction", "LSTMNextActivityPredictor"),
             ("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot"),
+            ("lifecycle_dual", "next_activity_prediction_lifecycle_dual", "DualLifecycleNextActivityPredictor"),
         ]
 
     for pred_type, module_name, class_name in predictors_to_try:
@@ -114,11 +123,15 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
             module = __import__(module_name, fromlist=[class_name])
             PredictorClass = getattr(module, class_name)
 
+            kwargs = {}
+            if pred_type == "lifecycle_dual" and hf_repo is not None:
+                kwargs["hf_repo"] = hf_repo
+
             if checkpoint_file.exists():
-                predictor = PredictorClass(model_path=str(checkpoint_file))
+                predictor = PredictorClass(model_path=str(checkpoint_file), **kwargs)
                 logger.info(f"✓ {pred_type.capitalize()} model loaded from checkpoint: {checkpoint_file}")
             else:
-                predictor = PredictorClass(model_path=str(model_path))
+                predictor = PredictorClass(model_path=str(model_path), **kwargs)
                 logger.info(f"✓ {pred_type.capitalize()} model loaded from: {model_path}")
 
             return predictor
@@ -153,10 +166,12 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
         logger.info("Process Transformer selected: delegating loading to DESEngine")
         return None
 
+    hf_repo = getattr(config, 'next_activity_hf_repo', None)
+
     if config.next_activity_mode == "advanced" and config.next_activity_model_path:
         model_path = Path(config.next_activity_model_path)
 
-        predictor = _try_load_predictor(model_path, model_type)
+        predictor = _try_load_predictor(model_path, model_type, hf_repo=hf_repo)
         if predictor:
             logger.info("Setting up next activity predictor...")
             return predictor
@@ -167,6 +182,8 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
 
     # Basic mode - check both possible locations for auto-load
     possible_paths = [
+        Path("next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
+        Path("next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
         Path("models/next_activity_lstm"),
         Path("next_activity_prediction/models/next_activity_lstm"),
         Path("models/next_activity_lstm_onehot"),
@@ -174,7 +191,7 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     ]
 
     for model_path in possible_paths:
-        predictor = _try_load_predictor(model_path, model_type)
+        predictor = _try_load_predictor(model_path, model_type, hf_repo=hf_repo)
         if predictor:
             logger.info(f"Auto-loading next activity predictor from {model_path}...")
             return predictor
@@ -370,18 +387,35 @@ def _setup_case_attributes(
         except Exception as e:
             logger.warning(f"Could not load monthly artifact: {e}")
 
-    # By default, load from cached artifacts (df=None, retrain_models=False)
-    # Only pass df if retraining is explicitly requested
+    # By default, load from cached artifacts (df=None, retrain_models=False).
+    # If cache is missing/corrupt, auto-fallback to retraining when df is available.
     retrain = getattr(config, 'case_attribute_retrain', False)
+    used_retrain = retrain
 
-    predictor = AttributeSimulationEngine(
-        df=df if retrain else None,
-        seed=config.case_attribute_seed,
-        monthly_artifact=monthly_artifact,
-        offer_create_activity=config.case_attribute_offer_activity,
-        retrain_models=retrain,
-    )
+    try:
+        predictor = AttributeSimulationEngine(
+            df=df if retrain else None,
+            seed=config.case_attribute_seed,
+            monthly_artifact=monthly_artifact,
+            offer_create_activity=config.case_attribute_offer_activity,
+            retrain_models=retrain,
+        )
+    except ValueError as e:
+        if (not retrain) and (df is not None):
+            logger.warning(
+                "Case attribute artifacts missing or invalid. Falling back to retraining from event log."
+            )
+            predictor = AttributeSimulationEngine(
+                df=df,
+                seed=config.case_attribute_seed,
+                monthly_artifact=monthly_artifact,
+                offer_create_activity=config.case_attribute_offer_activity,
+                retrain_models=True,
+            )
+            used_retrain = True
+        else:
+            raise
 
-    mode_desc = "retrained from event log" if retrain else "from cached artifacts"
+    mode_desc = "retrained from event log" if used_retrain else "from cached artifacts"
     logger.info(f"Loaded AttributeSimulationEngine ({mode_desc})")
     return predictor

@@ -25,7 +25,8 @@ class SimulationConfig:
     # "basic" = auto-load (engine will try to find model), "advanced" = explicit model path
     next_activity_mode: Literal["basic", "advanced"] = "basic"
     next_activity_model_path: Optional[str] = "next_activity_prediction/models/next_activity_lstm"
-    next_activity_model_type: Literal["embedding", "onehot", "auto"] = "auto"
+    next_activity_model_type: Literal["embedding", "onehot", "lifecycle_dual", "auto"] = "auto"
+    next_activity_hf_repo: Optional[str] = None
     next_activity_temperature: float = 1.0
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)

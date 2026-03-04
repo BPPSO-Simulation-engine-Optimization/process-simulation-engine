@@ -66,6 +66,7 @@ class WaitingWork:
     case_id: str
     # Original activity label used for logging/simulation semantics
     activity: str
+    lifecycle: str
     # Normalized label used for permission/availability checks and queue routing
     allocation_activity: str
     arrival_time: datetime  # When the work arrived (for FIFO ordering)
@@ -192,7 +193,7 @@ class ResourcePool:
 # Protocol definitions for pluggable predictors
 class NextActivityPredictor(Protocol):
     """Interface for next activity prediction."""
-    def predict(self, case_state: CaseState) -> tuple[str, bool]:
+    def predict(self, case_state: CaseState):
         """
         Predict the next activity for a case.
         
@@ -200,7 +201,8 @@ class NextActivityPredictor(Protocol):
             case_state: Current case state.
             
         Returns:
-            Tuple of (activity_name, is_case_ended).
+            Either (activity_name, is_case_ended) or
+            (activity_name, lifecycle_transition, is_case_ended).
         """
         ...
 
@@ -593,6 +595,21 @@ class DESEngine:
             handler(event)
         else:
             logger.warning(f"Unknown event type: {event.event_type}")
+
+    def _normalize_next_prediction(self, prediction_result) -> tuple[str, str, bool]:
+        """Normalize predictor output to (activity, lifecycle, is_end)."""
+        if not isinstance(prediction_result, tuple):
+            raise ValueError("Next activity predictor must return a tuple")
+
+        if len(prediction_result) == 2:
+            activity, is_end = prediction_result
+            return activity, "complete", is_end
+
+        if len(prediction_result) == 3:
+            activity, lifecycle, is_end = prediction_result
+            return activity, (lifecycle or "complete"), is_end
+
+        raise ValueError("Next activity predictor must return 2 or 3 values")
     
     def _on_case_arrival(self, event: SimulationEvent) -> None:
         """Handle case arrival: create case state, schedule first activity."""
@@ -620,7 +637,7 @@ class DESEngine:
         case._attr_engine_case = attr_case
 
         # Predict first activity
-        activity, is_end = self._next_activity.predict(case)
+        activity, lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
 
         if is_end:
             # Edge case: case ends immediately
@@ -628,7 +645,7 @@ class DESEngine:
             return
 
         # Allocate resource and schedule activity
-        self._schedule_activity(event.case_id, activity, event.timestamp, case)
+        self._schedule_activity(event.case_id, activity, lifecycle, event.timestamp, case)
     
     def _on_activity_complete(self, event: SimulationEvent) -> None:
         """Handle activity completion: log event, release resource, process waiting queue."""
@@ -659,7 +676,7 @@ class DESEngine:
             case.accepted = attr.accepted
 
         # Record activity in case history
-        case.add_activity(event.activity, event.resource)
+        case.add_activity(event.activity, event.resource, event.lifecycle)
 
         # Safety guard: if a case keeps looping, stop it instead of hanging the run
         if self._max_activities_per_case and len(case.activity_history) >= self._max_activities_per_case:
@@ -681,12 +698,12 @@ class DESEngine:
         self.completed_events.append(log_record)
 
         # Predict next activity
-        next_activity, is_end = self._next_activity.predict(case)
+        next_activity, next_lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
 
         if is_end:
             self._schedule_case_end(event.case_id, event.timestamp)
         else:
-            self._schedule_activity(event.case_id, next_activity, event.timestamp, case)
+            self._schedule_activity(event.case_id, next_activity, next_lifecycle, event.timestamp, case)
 
     def _process_waiting_queue(self, freed_resource: str, current_time: datetime) -> None:
         """
@@ -732,6 +749,7 @@ class DESEngine:
                 self._schedule_activity_with_resource(
                     waiting_work.case_id,
                     waiting_work.activity,
+                    waiting_work.lifecycle,
                     current_time,
                     waiting_work.case_state,
                     freed_resource,
@@ -744,13 +762,13 @@ class DESEngine:
         self.stats['cases_completed'] += 1
         self.case_manager.remove_case(event.case_id)
     
-    def _schedule_activity(self, case_id: str, activity: str,
+    def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
         # Some activities are control-flow artifacts (e.g., decision points) and must not
         # require an organizational resource.
         if not self._activity_requires_resource(activity):
-            self._schedule_activity_without_resource(case_id, activity, current_time, case)
+            self._schedule_activity_without_resource(case_id, activity, lifecycle, current_time, case)
             return
 
         allocation_activity = self._normalize_activity_for_resources(activity)
@@ -764,6 +782,7 @@ class DESEngine:
             waiting_work = WaitingWork(
                 case_id=case_id,
                 activity=activity,
+                lifecycle=lifecycle,
                 allocation_activity=allocation_activity,
                 arrival_time=current_time,
                 case_state=case,
@@ -785,7 +804,7 @@ class DESEngine:
 
         # Resource allocated - schedule the activity
         self._schedule_activity_with_resource(
-            case_id, activity, current_time, case, resource
+            case_id, activity, lifecycle, current_time, case, resource
         )
 
     def _activity_requires_resource(self, activity: Optional[str]) -> bool:
@@ -814,11 +833,13 @@ class DESEngine:
         self,
         case_id: str,
         activity: str,
+        lifecycle: str,
         current_time: datetime,
         case: CaseState,
     ) -> None:
         """Schedule an activity completion without allocating any resource."""
         prev_activity = case.activity_history[-1] if case.activity_history else "START"
+        prev_lifecycle = case.lifecycle_history[-1] if case.lifecycle_history else "complete"
 
         # Many learned processing-time models won't know DP/PG labels.
         # For control-flow artifacts, treat duration as instantaneous.
@@ -826,9 +847,9 @@ class DESEngine:
         try:
             processing_seconds = float(self._processing_time.predict(
                 prev_activity=prev_activity,
-                prev_lifecycle="complete",
+                prev_lifecycle=prev_lifecycle,
                 curr_activity=activity,
-                curr_lifecycle="complete",
+                curr_lifecycle=lifecycle,
                 context={
                     'case_id': case_id,
                     'hour': current_time.hour,
@@ -855,6 +876,7 @@ class DESEngine:
             event_type=EventType.ACTIVITY_COMPLETE,
             case_id=case_id,
             activity=activity,
+            lifecycle=lifecycle,
             resource=None,
             payload=case.get_payload(),
         )
@@ -903,11 +925,12 @@ class DESEngine:
         import random
         return random.choice(truly_available), None
 
-    def _schedule_activity_with_resource(self, case_id: str, activity: str,
+    def _schedule_activity_with_resource(self, case_id: str, activity: str, lifecycle: str,
                                           current_time: datetime, case: CaseState,
                                           resource: str) -> None:
         """Schedule activity completion with an allocated resource."""
         prev_activity = case.activity_history[-1] if case.activity_history else "START"
+        prev_lifecycle = case.lifecycle_history[-1] if case.lifecycle_history else "complete"
 
         # Build context for processing time prediction
         context = {
@@ -939,9 +962,9 @@ class DESEngine:
             # Request inter-event time (complete → complete) to use trained distributions
             # This allows the model to predict realistic processing times based on training data
             prev_activity=prev_activity,
-            prev_lifecycle="complete",
+            prev_lifecycle=prev_lifecycle,
             curr_activity=activity,
-            curr_lifecycle="complete",
+            curr_lifecycle=lifecycle,
             context=context,
         )
         processing_time = timedelta(seconds=processing_seconds)
@@ -956,6 +979,7 @@ class DESEngine:
             event_type=EventType.ACTIVITY_COMPLETE,
             case_id=case_id,
             activity=activity,
+            lifecycle=lifecycle,
             resource=resource,
             payload=case.get_payload(),
         )
@@ -1070,7 +1094,7 @@ class DESEngine:
                         )
 
                         self._schedule_activity_with_resource(
-                            work.case_id, work.activity, current_time,
+                            work.case_id, work.activity, work.lifecycle, current_time,
                             work.case_state, resource
                         )
                         dispatched_this_round += 1
