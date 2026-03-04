@@ -30,6 +30,8 @@ class SimulationConfig:
     next_activity_temperature: float = 1.0
     # PT-only lifecycle logging mode (ignored unless next_activity_class is process_transformer)
     pt_lifecycle_mode: Literal["native", "gt_activity_gated"] = "native"
+    # Max PT duration cap in seconds (prevents outlier durations from cascading queue buildup)
+    pt_max_duration_seconds: Optional[float] = None
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
