@@ -383,6 +383,17 @@ class DESEngine:
         # Pre-generated arrival timestamps (optional)
         self._arrival_timestamps = arrival_timestamps
 
+        # Processing time predictor is required (must be ProcessingTimePredictionClass)
+        # NOTE: This MUST be assigned before _create_next_activity_predictor, because
+        # the Process Transformer path overrides self._processing_time with its own
+        # PTTimeAdapter. If we assign after, the override gets clobbered.
+        if processing_time_predictor is None:
+            raise ValueError(
+                "processing_time_predictor is required. "
+                "Use ProcessingTimePredictionClass from processing_time_prediction"
+            )
+        self._processing_time = processing_time_predictor
+
         # Next activity predictor: use provided instance, or create from type
         if next_activity_predictor is not None:
             self._next_activity = next_activity_predictor
@@ -413,14 +424,6 @@ class DESEngine:
                 "Process Transformer next activity predictor."
             )
         self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
-
-        # Processing time predictor is required (must be ProcessingTimePredictionClass)
-        if processing_time_predictor is None:
-            raise ValueError(
-                "processing_time_predictor is required. "
-                "Use ProcessingTimePredictionClass from processing_time_prediction"
-            )
-        self._processing_time = processing_time_predictor
 
         # Case attribute predictor is required (must be AttributeSimulationEngine)
         if case_attribute_predictor is None:
@@ -543,8 +546,11 @@ class DESEngine:
             # This is a bit of a hack: The engine calls this method to get the *Activity* predictor.
             # But we also need to set the *Time* predictor.
             # Since we have reference to 'self', we can override it!
-            time_adapter = PTTimeAdapter(unified)
+            max_dur = config.get('pt_max_duration_seconds')
+            time_adapter = PTTimeAdapter(unified, max_duration_seconds=max_dur)
             self._processing_time = time_adapter
+            if max_dur:
+                logger.info(f"ProcessTransformerV2: Duration cap set to {max_dur/3600:.0f}h ({max_dur/86400:.0f} days)")
             logger.info("ProcessTransformerV2: Also registered as ProcessingTimePredictor.")
             
             return activity_adapter
