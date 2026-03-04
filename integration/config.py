@@ -24,9 +24,10 @@ class SimulationConfig:
     # Next activity prediction
     # "basic" = auto-load (engine will try to find model), "advanced" = explicit model path
     next_activity_mode: Literal["basic", "advanced"] = "basic"
-    next_activity_model_path: Optional[str] = "next_activity_prediction/models/next_activity_lstm"
+    next_activity_model_path: Optional[str] = "models/next_activity_lstm"
     next_activity_model_type: Literal["embedding", "onehot", "auto"] = "auto"
     next_activity_temperature: float = 1.0
+    next_activity_class: Optional[str] = None  # "lstm" or "process_transformer"
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
@@ -64,12 +65,14 @@ class SimulationConfig:
     def all_advanced(
         cls,
         event_log_path: str,
-        processing_time_model_path: str = "models/processing_time_model",
+        processing_time_model_path: str = "models/processing_time_model_lstm",
+        processing_time_method: Literal["distribution", "ml", "probabilistic_ml"] = "probabilistic_ml",
         num_cases: int = 100,
     ) -> "SimulationConfig":
         """Create configuration with all advanced predictors."""
         return cls(
             processing_time_mode="advanced",
+            processing_time_method=processing_time_method,
             processing_time_model_path=processing_time_model_path,
             next_activity_mode="advanced",
             case_arrival_mode="advanced",

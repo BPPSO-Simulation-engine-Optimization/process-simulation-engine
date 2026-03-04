@@ -32,3 +32,4 @@ pm4py
 ordinor
 holidays
 openpyxl
+ortools==9.10.4067

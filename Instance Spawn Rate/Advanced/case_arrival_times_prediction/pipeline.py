@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
 from .config import SimulationConfig
-from .preprocessing import DailyArrivalBuilder, DailySequence
+from .preprocessing import DailyArrivalBuilder, DailySequence, DailyArrivalsResult
 from .global_segmentation import GlobalSegmentClusterer
 from .weekday_clustering import WeekdayClusterer
-from .intraday import IntradayBinner
+from .intraday import IntradayBinner, IntradayBounds
 from .kde import InterarrivalKDETrainer
 from .mapping import WeekdayClusterMapper
 from .simulation import ArrivalGenerator
@@ -26,6 +26,8 @@ class FitArtifacts:
     day_labels_train: object  # np.ndarray
     weekday_cluster_map: dict
     kde_models: dict
+    test_start_time: Optional[pd.Timestamp] = None
+    intraday_bounds: IntradayBounds = None  # Paper: DetermineBounds(D)
 
 
 class CaseInterarrivalPipeline:
@@ -48,22 +50,69 @@ class CaseInterarrivalPipeline:
         )
         self._weekday = WeekdayClusterer()
         self._binner = IntradayBinner()
-        self._kde = InterarrivalKDETrainer(kernel=config.kernel, min_samples=config.min_samples_kde)
+        self._kde = InterarrivalKDETrainer(
+            kernel=config.kernel,
+            min_samples=config.min_samples_kde,
+            bandwidth_k_values=config.bandwidth_k_values,
+            bandwidth_val_ratio=config.bandwidth_val_ratio,
+        )
         self._mapper = WeekdayClusterMapper()
         self._generator = ArrivalGenerator(L=config.L, verbose=config.verbose, random_state=config.random_state)
 
         self.artifacts: Optional[FitArtifacts] = None
 
+    def _split_daily_sequence_by_cases(
+        self, daily_result: DailyArrivalsResult
+    ) -> Tuple[DailySequence, DailySequence, List[pd.Timestamp], List[pd.Timestamp], pd.Timestamp]:
+        first_events = daily_result.first_events.sort_values("time:timestamp", kind="mergesort").reset_index(drop=True)
+        n_cases = len(first_events)
+        if n_cases < 2:
+            raise ValueError("Zu wenige Cases fuer einen Train/Test-Split (mindestens 2 erforderlich).")
+
+        split_idx = int(n_cases * self.cfg.train_ratio)
+        split_idx = min(max(split_idx, 1), n_cases - 1)
+
+        first_events = first_events.copy()
+        first_events["is_train"] = False
+        first_events.loc[: split_idx - 1, "is_train"] = True
+        first_events["date"] = pd.to_datetime(first_events["time:timestamp"]).dt.floor("D")
+
+        grouped_train = first_events[first_events["is_train"]].groupby("date")["time:timestamp"].apply(list)
+        grouped_test = first_events[~first_events["is_train"]].groupby("date")["time:timestamp"].apply(list)
+        test_start_time = pd.to_datetime(first_events.loc[split_idx, "time:timestamp"])
+
+        D_train_all: DailySequence = []
+        D_test_all: DailySequence = []
+        dates_all: List[pd.Timestamp] = [pd.to_datetime(d) for d in daily_result.dates]
+
+        for d in dates_all:
+            if d in grouped_train.index:
+                D_train_all.append(sorted(pd.to_datetime(grouped_train.loc[d]).tolist()))
+            else:
+                D_train_all.append([])
+
+            if d in grouped_test.index:
+                D_test_all.append(sorted(pd.to_datetime(grouped_test.loc[d]).tolist()))
+            else:
+                D_test_all.append([])
+
+        train_non_empty = [i for i, day in enumerate(D_train_all) if len(day) > 0]
+        test_non_empty = [i for i, day in enumerate(D_test_all) if len(day) > 0]
+        if not train_non_empty or not test_non_empty:
+            raise ValueError("Train/Test-Split nach Cases ergab eine leere Seite.")
+
+        i_train_last = train_non_empty[-1]
+        i_test_first = test_non_empty[0]
+
+        D_train = D_train_all[: i_train_last + 1]
+        dates_train = dates_all[: i_train_last + 1]
+        D_test = D_test_all[i_test_first:]
+        dates_test = dates_all[i_test_first:]
+        return D_train, D_test, dates_train, dates_test, test_start_time
+
     def fit(self, df: pd.DataFrame) -> FitArtifacts:
         daily = self._builder.build(df)
-        D = daily.D
-        dates = daily.dates
-
-        split = int(len(D) * self.cfg.train_ratio)
-        D_train = D[:split]
-        D_test = D[split:]
-        dates_train = dates[:split]
-        dates_test = dates[split:]
+        D_train, D_test, dates_train, dates_test, test_start_time = self._split_daily_sequence_by_cases(daily)
 
         seg_res = self._global.cluster(
             D_train,
@@ -73,7 +122,7 @@ class CaseInterarrivalPipeline:
         )
 
         weekday_clusters = self._weekday.cluster(seg_res.G, dates_train)
-        intraday_binned = self._binner.bin(weekday_clusters, L=self.cfg.L)
+        intraday_binned, intraday_bounds = self._binner.bin(weekday_clusters, L=self.cfg.L)
         kde_res = self._kde.fit(intraday_binned, L=self.cfg.L)
         weekday_cluster_map = self._mapper.build(weekday_clusters)
 
@@ -85,6 +134,8 @@ class CaseInterarrivalPipeline:
             day_labels_train=seg_res.day_labels,
             weekday_cluster_map=weekday_cluster_map,
             kde_models=kde_res.models,
+            test_start_time=test_start_time,
+            intraday_bounds=intraday_bounds,
         )
         return self.artifacts
 
@@ -96,7 +147,9 @@ class CaseInterarrivalPipeline:
             N_hat = len(self.artifacts.D_test)
 
         if start_date is None:
-            if len(self.artifacts.dates_test) > 0:
+            if self.artifacts.test_start_time is not None:
+                start_date = self.artifacts.test_start_time
+            elif len(self.artifacts.dates_test) > 0:
                 start_date = self.artifacts.dates_test[0]
             else:
                 start_date = None
@@ -108,6 +161,7 @@ class CaseInterarrivalPipeline:
             weekday_cluster_map=self.artifacts.weekday_cluster_map,
             kde_models=self.artifacts.kde_models,
             start_date=start_date,
+            bounds=self.artifacts.intraday_bounds,
         )
         return sim_res.D_sim
 

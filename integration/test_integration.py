@@ -97,7 +97,7 @@ def save_ground_truth_subset(df: pd.DataFrame, num_cases: int, output_dir: str):
     return reduced_df
 
 
-def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str, resource_selection_mode: ResourceSelectionMode = ResourceSelectionMode.RANDOM):
+def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str, resource_selection_mode: ResourceSelectionMode = ResourceSelectionMode.RANDOM, optimization_batch_size: int = 5, prediction_batch_size: int = 0, start_date_override: datetime = None):
     """Run the simulation with given configuration."""
     print("\n" + "=" * 60)
     print("SIMULATION CONFIGURATION")
@@ -107,10 +107,15 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Number of cases: {config.num_cases}")
     print(f"  Resource selection mode: {resource_selection_mode.value}")
+    if resource_selection_mode == ResourceSelectionMode.OPTIMIZATION:
+        print(f"  Optimization batch size: {optimization_batch_size}")
+        print(f"  Prediction batch size: {prediction_batch_size or 'unlimited'}")
     print("=" * 60 + "\n")
 
-    # Get start date from event log
-    if 'time:timestamp' in df.columns:
+    # Get start date: CLI override > event log > fallback
+    if start_date_override is not None:
+        start_date = start_date_override
+    elif 'time:timestamp' in df.columns:
         start_date = pd.to_datetime(df['time:timestamp']).min().to_pydatetime()
     else:
         start_date = datetime(2016, 1, 4, 8, 0)
@@ -145,7 +150,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 
     # Determine appropriate predictor type argument
     pred_type = None
-    if config.next_activity_class == "process_transformer":
+    if getattr(config, 'next_activity_class', None) == "process_transformer":
         pred_type = NextActivityPredictorType.PROCESS_TRANSFORMER
 
     engine = DESEngine(
@@ -158,6 +163,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
         resource_selection_mode=resource_selection_mode,
+        optimization_batch_size=optimization_batch_size,
+        prediction_batch_size=prediction_batch_size,
     )
 
     # Run simulation
@@ -174,11 +181,12 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  No eligible: {engine.stats['no_eligible_failures']}")
     print("=" * 60)
 
-    # Export results
+    # Export results – filename reflects the resource selection mode
     os.makedirs(output_dir, exist_ok=True)
+    mode_suffix = "optimized" if resource_selection_mode == ResourceSelectionMode.OPTIMIZATION else "random"
 
-    csv_path = os.path.join(output_dir, "simulated_log.csv")
-    xes_path = os.path.join(output_dir, "simulated_log.xes")
+    csv_path = os.path.join(output_dir, f"simulated_log_{mode_suffix}.csv")
+    xes_path = os.path.join(output_dir, f"simulated_log_{mode_suffix}.xes")
 
     LogExporter.to_csv(events, csv_path)
     print(f"\nExported CSV to: {csv_path}")
@@ -238,7 +246,7 @@ def main():
     )
     parser.add_argument(
         "--event-log",
-        default="Dataset/BPI Challenge 2017.xes",
+        default="Dataset/BPI Challenge 2017.xes.gz",
         help="Path to event log file"
     )
     parser.add_argument(
@@ -262,6 +270,27 @@ def main():
         choices=["random", "optimization"],
         default="random",
         help="Resource selection mode: 'random' (default) or 'optimization' (uses resource_optimization module)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5,
+        help="Batch size for activity collection in optimization mode (default: 5)"
+    )
+    parser.add_argument(
+        "--prediction-batch-size",
+        type=int,
+        default=0,
+        help="Max total processing-time predictions per optimization run. "
+             "Available resources are predicted first, then unavailable ones fill the budget. "
+             "0 = unlimited (default: 0)"
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Simulation start date (format: YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'). "
+             "If not set, uses earliest timestamp from the event log."
     )
 
     args = parser.parse_args()
@@ -325,8 +354,15 @@ def main():
     # Parse resource selection mode
     resource_selection_mode = ResourceSelectionMode.RANDOM if args.resource_selection_mode == "random" else ResourceSelectionMode.OPTIMIZATION
 
+    # Parse optional start date override
+    start_date_override = None
+    if args.start_date:
+        from dateutil.parser import parse as parse_date
+        start_date_override = parse_date(args.start_date)
+        print(f"Using custom start date: {start_date_override}")
+
     # Run simulation
-    events = run_simulation(config, df, allocator, args.output_dir, resource_selection_mode=resource_selection_mode)
+    events = run_simulation(config, df, allocator, args.output_dir, resource_selection_mode=resource_selection_mode, optimization_batch_size=args.batch_size, prediction_batch_size=args.prediction_batch_size, start_date_override=start_date_override)
 
     print("\n" + "=" * 60)
     print("INTEGRATION TEST COMPLETE")

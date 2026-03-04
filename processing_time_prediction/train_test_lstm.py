@@ -1,10 +1,15 @@
+import os
 import pandas as pd
 import pm4py
-from ProcessingTimeTrainer import ProcessingTimeTrainer
-from ProcessingTimePredictionClass import ProcessingTimePredictionClass
+from .ProcessingTimeTrainer import ProcessingTimeTrainer
+from .ProcessingTimePredictionClass import ProcessingTimePredictionClass
 
 print("Loading event log...")
-log = pm4py.read_xes("Dataset/BPI Challenge 2017.xes")
+# Try compressed file first, then uncompressed
+log_path = "Dataset/BPI Challenge 2017.xes.gz"
+if not os.path.exists(log_path):
+    log_path = "Dataset/BPI Challenge 2017.xes"
+log = pm4py.read_xes(log_path)
 df = pm4py.convert_to_dataframe(log)
 print(f"Loaded {len(df)} events")
 

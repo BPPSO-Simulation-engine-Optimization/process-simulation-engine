@@ -883,6 +883,12 @@ class ProcessingTimeTrainer:
         print("Model training completed!")
         print("="*80)
 
+    def train_XG_
+
+
+
+
+
     def train(self, cache_path: Optional[str] = None, force_recompute: bool = False):
         """
         Train/fit the model based on the specified method.

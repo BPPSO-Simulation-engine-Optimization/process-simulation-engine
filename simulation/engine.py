@@ -29,6 +29,7 @@ This creates realistic resource contention and waiting times.
 import uuid
 import random
 import logging
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -48,12 +49,15 @@ logger = logging.getLogger(__name__)
 # Import resource optimization (lazy import to avoid circular dependencies)
 try:
     from resources.resource_optimization.resource_optimization import (
-        choose_resource,
-        SelectionConfig
+        SelectionConfig,
+        handle_batch_scheduling_optimization
     )
-except ImportError:
-    choose_resource = None
+except ImportError as e:
+    import traceback
+    print(f"WARNING: Could not import resource_optimization: {e}")
+    traceback.print_exc()
     SelectionConfig = None
+    handle_batch_scheduling_optimization = None
 
 
 class NextActivityPredictorType(Enum):
@@ -119,6 +123,11 @@ class ResourcePool:
 
         # allocation_activity -> list of WaitingWork (heap ordered by arrival time)
         self._waiting_queues: Dict[str, List[WaitingWork]] = defaultdict(list)
+
+        # resource_id -> list of (task_id, WaitingWork) planned by PMSP optimization
+        # Filled by the optimizer, consumed when the resource becomes free.
+        # Ordered by shortest processing time first.
+        self._resource_worklist: Dict[str, List[WaitingWork]] = defaultdict(list)
 
         # Reference to availability model for working hours checks
         self._availability = availability_model
@@ -208,6 +217,127 @@ class ResourcePool:
     def get_waiting_summary(self) -> Dict[str, int]:
         """Get summary of waiting work per activity."""
         return {act: len(q) for act, q in self._waiting_queues.items() if q}
+
+    def get_all_waiting_work_with_ids(self) -> Tuple[List['WaitingWork'], Dict[str, 'WaitingWork']]:
+        """
+        Collect all waiting work across all activity queues.
+
+        Returns:
+            Tuple of:
+              - flat list of all WaitingWork objects
+              - dict mapping task_id ("{case_id}_{activity}") to WaitingWork
+        """
+        all_work: List[WaitingWork] = []
+        task_id_to_work: Dict[str, WaitingWork] = {}
+        for activity, queue in self._waiting_queues.items():
+            for ww in queue:
+                task_id = f"{ww.case_id}_{ww.activity}"
+                all_work.append(ww)
+                task_id_to_work[task_id] = ww
+        return all_work, task_id_to_work
+
+    # ── Resource Worklist (filled by PMSP optimizer) ──────────────────
+    # Methoden zum Worklisz zugriff. Ausschlielich genutzt durch den Resource Optmizer
+
+    def set_resource_worklist(
+        self,
+        assignment: Dict[str, Optional[str]],
+        task_id_to_work: Dict[str, 'WaitingWork'],
+        costs_per_task_resource: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> None:
+        """
+        Populate resource worklists from a PMSP assignment.
+
+        Args:
+            assignment: task_id -> resource_id (or None for dummy).
+            task_id_to_work: task_id -> WaitingWork object.
+            costs_per_task_resource: task_id -> {resource_id: cost_ms} from PMSP.
+
+        Tasks assigned to None (dummy) stay in the waiting queue.
+        Tasks assigned to a resource are moved to that resource's worklist,
+        sorted by **Shortest Processing Time First** (SPT).
+        """
+        # Clear old worklists
+        self._resource_worklist.clear()
+
+        # Collect (task_id, work, resource_id) tuples
+        for task_id, resource_id in assignment.items():
+            if resource_id is None:
+                continue
+            work = task_id_to_work.get(task_id)
+            if work is None:
+                continue
+            self._remove_from_waiting_queue(work)
+            self._resource_worklist[resource_id].append((task_id, work))
+
+        # Sort each worklist: shortest predicted processing time first
+        for resource_id, entries in self._resource_worklist.items():
+            entries.sort(key=lambda e: (
+                costs_per_task_resource.get(e[0], {}).get(resource_id, float('inf'))
+                if costs_per_task_resource else 0,
+                e[1].arrival_time,  # tie-breaker: earlier arrival first
+            ))
+            # Unwrap: keep only WaitingWork objects (drop task_id)
+            self._resource_worklist[resource_id] = [work for _, work in entries]
+
+    def _remove_from_waiting_queue(self, work: 'WaitingWork') -> None:
+        """Remove a specific WaitingWork from the waiting queue."""
+        activity = work.allocation_activity
+        if activity in self._waiting_queues:
+            queue = self._waiting_queues[activity]
+            try:
+                queue.remove(work)
+                heapq.heapify(queue)  # Re-heapify after removal
+            except ValueError:
+                pass  # Already removed
+
+    def get_next_from_worklist(self, resource_id: str) -> Optional['WaitingWork']:
+        """
+        Pop the next task from a resource's worklist (shortest processing time first).
+
+        Returns None if the worklist is empty.
+        """
+        worklist = self._resource_worklist.get(resource_id)
+        if worklist:
+            return worklist.pop(0)
+        return None
+
+    def has_worklist(self, resource_id: str) -> bool:
+        """Check if a resource has planned work on its worklist."""
+        return bool(self._resource_worklist.get(resource_id))
+
+    def peek_worklist(self, resource_id: str) -> Optional['WaitingWork']:
+        """Peek at the next task on a resource's worklist without removing it."""
+        worklist = self._resource_worklist.get(resource_id)
+        if worklist:
+            return worklist[0]
+        return None
+
+    def clear_worklist(self, resource_id: str) -> List['WaitingWork']:
+        """
+        Clear a resource's worklist and return the removed items.
+
+        Use this when a resource becomes unavailable – the tasks should go
+        back into the waiting queue.
+        """
+        items = list(self._resource_worklist.pop(resource_id, []))
+        return items
+
+    def clear_all_worklists(self) -> List['WaitingWork']:
+        """Clear all worklists, returning all removed items."""
+        all_items = []
+        for items in self._resource_worklist.values():
+            all_items.extend(items)
+        self._resource_worklist.clear()
+        return all_items
+
+    def return_to_waiting_queue(self, work: 'WaitingWork') -> None:
+        """Return a WaitingWork item back into the waiting queue."""
+        heapq.heappush(self._waiting_queues[work.allocation_activity], work)
+
+    def get_worklist_summary(self) -> Dict[str, int]:
+        """Get summary of worklist lengths per resource."""
+        return {res: len(wl) for res, wl in self._resource_worklist.items() if wl}
 
 
 # Protocol definitions for pluggable predictors
@@ -314,6 +444,8 @@ class DESEngine:
         start_time: datetime = None,
         max_activities_per_case: int = 500,
         resource_selection_mode: ResourceSelectionMode = ResourceSelectionMode.RANDOM,
+        optimization_batch_size: int = 5,
+        prediction_batch_size: int = 0,
     ):
         """
         Initialize the DES Engine.
@@ -332,6 +464,11 @@ class DESEngine:
             max_activities_per_case: Safety limit to prevent infinite loops.
             resource_selection_mode: Mode for resource selection (RANDOM or OPTIMIZATION).
                 Defaults to RANDOM for backward compatibility.
+            optimization_batch_size: Number of activities to collect before allocation in OPTIMIZATION mode.
+                Defaults to 5.
+            prediction_batch_size: Max total processing-time predictions per optimization run.
+                Available resources are predicted first; remaining budget goes to unavailable ones.
+                0 means unlimited (all authorized resources are predicted).
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -340,8 +477,7 @@ class DESEngine:
 
         # Pre-generated arrival timestamps (optional)
         self._arrival_timestamps = arrival_timestamps
-
-        # Next activity predictor: use provided instance, or create from type
+        
         if next_activity_predictor is not None:
             self._next_activity = next_activity_predictor
         elif next_activity_predictor_type is not None:
@@ -382,6 +518,21 @@ class DESEngine:
 
         # Resource selection mode
         self.resource_selection_mode = resource_selection_mode
+
+        # Batch size for optimization mode (activities are collected in waiting queues)
+        self._optimization_batch_size: int = optimization_batch_size  # Number of activities to collect before allocation
+        
+        # Optimization config for batch scheduling
+        if SelectionConfig is not None:
+            self.optimization_config = SelectionConfig(
+                mode="k_batching",
+                k_batch_size=optimization_batch_size,
+                prediction_batch_size=prediction_batch_size,
+                dummy_delta=4.0,
+                rng_seed=None
+            )
+        else:
+            self.optimization_config = None
 
         # Output: collected events for export
         self.completed_events: List[Dict] = []
@@ -531,10 +682,24 @@ class DESEngine:
                       f"{self.resource_pool.get_total_waiting_count()} waiting", flush=True)
                 last_progress_print = event_count
 
-        # Drain phase: process remaining waiting work by advancing time
+        # Process any remaining waiting work in optimization mode
+        if self.resource_selection_mode == ResourceSelectionMode.OPTIMIZATION:
+            total_waiting = self.resource_pool.get_total_waiting_count()
+            if total_waiting > 0:
+                logger.info(f"Processing {total_waiting} remaining waiting activities at end of simulation...")
+                self._run_pmsp_and_apply(self.clock.now)
+        
+        # Drain phase: process remaining waiting work by advancing time.
+        # Temporarily switch to RANDOM mode so that activities scheduled during
+        # drain don't re-enter the optimization batch logic (which would create
+        # an infinite DUMMY cycle: drain dispatches → next activity → optimization
+        # mode → DUMMY → stuck again).
         if self.resource_pool.has_waiting_work():
             logger.info("Starting drain phase for waiting work...")
+            saved_mode = self.resource_selection_mode
+            self.resource_selection_mode = ResourceSelectionMode.RANDOM
             self._drain_waiting_queues(max_time=max_time)
+            self.resource_selection_mode = saved_mode
 
         # Check for stuck cases
         pending_count = self.resource_pool.get_total_waiting_count()
@@ -719,8 +884,113 @@ class DESEngine:
         """
         Process waiting queue when a resource becomes free.
 
-        Tries to dispatch waiting work to the freed resource if it's eligible.
+        In optimization mode:
+        1. First check if the resource has a worklist (pre-planned tasks from PMSP).
+           If yes, dispatch the next task from the worklist.
+        2. If no worklist, trigger a new batch optimization if enough tasks are waiting.
+
+        In non-optimization mode:
+        - Dispatch the first eligible waiting task to the freed resource.
         """
+        if self.resource_selection_mode == ResourceSelectionMode.OPTIMIZATION:
+            print("================================================")
+            print("====================Resource now available: ", freed_resource, "===========")
+            print("Time: ", current_time)
+            print("================================================")
+            # ── Step 1: Check resource worklist (filled by PMSP optimizer) ──
+            if self.resource_pool.has_worklist(freed_resource):
+                wl = self.resource_pool._resource_worklist.get(freed_resource, [])
+                task_names = [f"{w.case_id}:{w.allocation_activity}" for w in wl]
+                print(f"Resource {freed_resource} has worklist ({len(wl)} tasks): {task_names}")
+                # Autorisierung ist bereits durch den Optimizer sichergestellt
+                # (sonst hätte die Ressource das Assignment nicht erhalten).
+                # Aber: Die Schicht kann zwischenzeitlich geendet haben.
+                if not self.allocator.availability.is_available(freed_resource, current_time):
+                    print("Resource not available")
+                    # Arbeitszeit vorbei → geplante Tasks zurück in die Waiting Queue
+                    returned_tasks = self.resource_pool.clear_worklist(freed_resource)
+                    for work in returned_tasks:
+                        self.resource_pool.return_to_waiting_queue(work)
+                    print("Worklist summary after Resource not available: ", self.resource_pool.get_worklist_summary())
+                    logger.debug(
+                        f"Resource {freed_resource} no longer available, returned {len(returned_tasks)} "
+                        f"worklist tasks to waiting queue"
+                    )
+                    return
+
+
+                # Pretty-print worklist & waiting queue status ## DELETE ME AFTER DEBUGGING
+                wl_summary = self.resource_pool.get_worklist_summary()
+                wl_total = sum(wl_summary.values())
+                print(f"\n╔══════════════════════════════════════════════════╗")
+                print(f"║  Resource Worklists  ({wl_total} tasks remaining)        ║")
+                print(f"╠══════════════════════════════════════════════════╣")
+                for res_id, count in sorted(wl_summary.items()):
+                    tasks = self.resource_pool._resource_worklist.get(res_id, [])
+                    task_names = [f"{w.case_id}:{w.allocation_activity}" for w in tasks]
+                    print(f"║  {res_id:<20s} │ {count} task(s)")
+                    for tn in task_names:
+                        print(f"║    └─ {tn}")
+                if not wl_summary:
+                    print(f"║  (leer)")
+                print(f"╚══════════════════════════════════════════════════╝")
+                wq = self.resource_pool._waiting_queues
+                total_wq = sum(len(q) for q in wq.values())
+                non_empty = {act: len(q) for act, q in wq.items() if q}
+                print(f"\n┌── Waiting Queue ({total_wq} tasks in {len(non_empty)} activities) ──")
+                for act, count in sorted(non_empty.items()):
+                    bar = "█" * min(count, 10) + "░" * max(0, 5 - count)
+                    print(f"│  {act:<35s}  {bar}  {count}")
+                if not non_empty:
+                    print(f"│  (leer)")
+                print(f"└{'─' * 50}")
+
+
+                # Dispatch the next planned task from the worklist
+                waiting_work = self.resource_pool.get_next_from_worklist(freed_resource)
+                if waiting_work:
+                    wait_seconds = (current_time - waiting_work.arrival_time).total_seconds()
+                    self.stats['wait_time_total_seconds'] += wait_seconds
+
+                    print("====Assigning freed available Resource=====")
+                    print("Dispatching from worklist: ", waiting_work.activity, " for case ", waiting_work.case_id, " to ", freed_resource, " (waited ", wait_seconds, "s)")
+
+                    self._schedule_activity_with_resource(
+                        waiting_work.case_id,
+                        waiting_work.activity,
+                        current_time,
+                        waiting_work.case_state,
+                        freed_resource,
+                    )
+                    return
+
+            else:
+                print("Resource has no worklist")
+
+            # ── Step 2: No worklist → trigger new batch optimization if enough tasks ──
+            total_waiting = self.resource_pool.get_total_waiting_count()
+            if total_waiting >= self._optimization_batch_size:
+                print("====Running PMSP and applying in process_waiting_queue=====")
+                self._run_pmsp_and_apply(current_time)
+
+            # ── Step 3: Fallback to FIFO dispatch ──
+            # If the freed resource is still free (not assigned by PMSP) and there
+            # are waiting tasks, fall through to regular FIFO dispatch below.
+            # This prevents cases from being permanently stuck when:
+            #   - Not enough tasks to trigger a batch (< optimization_batch_size)
+            #   - PMSP assigned DUMMY to all/some tasks
+            #   - Resource has no worklist entry from PMSP
+            if self.resource_pool.is_busy(freed_resource, current_time):
+                return  # Resource was assigned work by PMSP, nothing more to do
+            if not self.resource_pool.has_waiting_work():
+                return  # No waiting work at all
+            logger.debug(
+                f"[Optimization fallback] Resource {freed_resource} still free after PMSP, "
+                f"falling back to FIFO dispatch"
+            )
+            # Fall through to non-optimization FIFO dispatch below...
+        
+        # FIFO dispatch: process normally (also used as fallback from optimization mode)
         # Check which activities have waiting work
         waiting_activities = self.resource_pool.get_all_waiting_activities()
         if not waiting_activities:
@@ -766,6 +1036,131 @@ class DESEngine:
                 # Resource is now busy again, stop looking
                 return
     
+    def _run_pmsp_and_apply(self, current_time: datetime) -> None:
+        """
+        Run the PMSP optimizer on all waiting tasks and apply the assignment
+        to the resource worklists.
+        
+        Steps:
+        1. Collect all waiting tasks and build task_id -> WaitingWork mapping
+        2. Call handle_batch_scheduling_optimization to get the assignment
+        3. Apply the assignment via resource_pool.set_resource_worklist
+        4. Immediately dispatch tasks to resources that are currently free
+        """
+        all_work, task_id_to_work = self.resource_pool.get_all_waiting_work_with_ids()
+        # Pretty-print PMSP input ## DELETE ME AFTER DEBUGGING
+        print(f"\n=== PMSP Input: {len(all_work)} waiting tasks ===")
+        for tid, ww in task_id_to_work.items():
+            print(f"  {tid:<40s} | activity: {ww.activity:<30s} | arrived: {ww.arrival_time:%H:%M:%S}")
+        print("=" * 50)
+        
+        if not all_work:
+            return
+        
+        # Run PMSP optimizer
+        assignment, debug_info = handle_batch_scheduling_optimization(
+            cfg=self.optimization_config,
+            activity="",  # Not used in batch mode
+            timestamp=current_time,
+            case=None,  # Not used in batch mode
+            waiting_tasks=all_work,
+            processing_time_predictor=self._processing_time,
+            allocator=self.allocator,
+            resource_pool=self.resource_pool,
+        )
+        
+        if assignment is None:
+            logger.debug(f"PMSP optimization returned no assignment: {debug_info}")
+            return
+        
+        # Apply the assignment to resource worklists (sorted by SPT)
+        costs_per_task_resource = debug_info.get("costs_per_task_resource")
+        self.resource_pool.set_resource_worklist(assignment, task_id_to_work, costs_per_task_resource)
+
+        # Pretty-print worklist assignment ## DELETE ME AFTER DEBUGGING
+        wl_summary = self.resource_pool.get_worklist_summary()
+        print(f"\n╔══════════════════════════════════════════════════╗")
+        print(f"║  Resource Worklists after PMSP  ({sum(wl_summary.values())} tasks total)  ║")
+        print(f"╠══════════════════════════════════════════════════╣")
+        for res_id, count in sorted(wl_summary.items()):
+            tasks = self.resource_pool._resource_worklist.get(res_id, [])
+            task_names = [f"{w.case_id}:{w.allocation_activity}" for w in tasks]
+            print(f"║  {res_id:<20s} │ {count} task(s)")
+            for tn in task_names:
+                print(f"║    └─ {tn}")
+        if not wl_summary:
+            print(f"║  (keine Zuweisungen)")
+        print(f"╚══════════════════════════════════════════════════╝")
+        # Pretty-print waiting queue summary ## DELETE ME AFTER DEBUGGING
+        wq = self.resource_pool._waiting_queues
+        total_wq = sum(len(q) for q in wq.values())
+        non_empty = {act: len(q) for act, q in wq.items() if q}
+        print(f"\n┌── Waiting Queue ({total_wq} tasks in {len(non_empty)} activities) ──")
+        for act, count in sorted(non_empty.items()):
+            bar = "█" * min(count, 10) + "░" * max(0, 5 - count)
+            print(f"│  {act:<35s}  {bar}  {count}")
+        if not non_empty:
+            print(f"│  (leer)")
+        print(f"└{'─' * 50}")
+        
+        logger.info(
+            f"PMSP assignment applied: {len(assignment)} tasks, "
+            f"worklists: {self.resource_pool.get_worklist_summary()}, "
+            f"solver: {debug_info.get('solver', '?')}"
+        )
+        
+        # Immediately dispatch tasks to resources that are currently free
+        for resource_id in list(self.resource_pool.get_worklist_summary().keys()):
+            if not self.resource_pool.is_busy(resource_id, current_time):
+                if self.allocator.availability.is_available(resource_id, current_time):
+                    work = self.resource_pool.get_next_from_worklist(resource_id)
+                    if work:
+                        wait_seconds = (current_time - work.arrival_time).total_seconds()
+                        self.stats['wait_time_total_seconds'] += wait_seconds
+                        logger.debug(
+                            f"Immediate dispatch from PMSP: {work.activity} for case "
+                            f"{work.case_id} to {resource_id} (waited {wait_seconds:.0f}s)"
+                        )
+                        print("Dispatching from PMSP: ", work.activity, " for case ", work.case_id, " to ", resource_id, " (waited ", wait_seconds, "s)")
+                        self._schedule_activity_with_resource(
+                            work.case_id, work.activity, current_time,
+                            work.case_state, resource_id,
+                        )
+
+        # ── DUMMY fallback: dispatch tasks that PMSP assigned to DUMMY ──
+        # PMSP may assign DUMMY when no resource is available in the current
+        # timeslot, or when postponing seems cheaper. But free resources might
+        # still be able to handle these tasks. Try FIFO dispatch to prevent
+        # tasks from being permanently stuck.
+        remaining_waiting = self.resource_pool.get_total_waiting_count()
+        if remaining_waiting > 0:
+            dummy_dispatched = 0
+            for activity in list(self.resource_pool.get_all_waiting_activities()):
+                while self.resource_pool.has_waiting_work(activity):
+                    work = self.resource_pool.peek_waiting_work(activity)
+                    if not work:
+                        break
+                    resource, reason = self._try_allocate_resource_with_reason(
+                        activity, current_time, work.case_state
+                    )
+                    if resource:
+                        work = self.resource_pool.get_waiting_work(activity)
+                        wait_seconds = (current_time - work.arrival_time).total_seconds()
+                        self.stats['wait_time_total_seconds'] += wait_seconds
+                        logger.info(
+                            f"[DUMMY fallback] Dispatching {work.activity} for case "
+                            f"{work.case_id} to {resource} (waited {wait_seconds:.0f}s)"
+                        )
+                        self._schedule_activity_with_resource(
+                            work.case_id, work.activity, current_time,
+                            work.case_state, resource,
+                        )
+                        dummy_dispatched += 1
+                    else:
+                        break  # No resource for this activity right now
+            if dummy_dispatched > 0:
+                logger.info(f"[DUMMY fallback] Dispatched {dummy_dispatched} DUMMY'd tasks to free resources")
+
     def _on_case_end(self, event: SimulationEvent) -> None:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1
@@ -780,6 +1175,50 @@ class DESEngine:
             self._schedule_activity_without_resource(case_id, activity, current_time, case)
             return
 
+        # In optimization mode, collect activities before allocation
+        if self.resource_selection_mode == ResourceSelectionMode.OPTIMIZATION:
+            print("================================================")
+            print("====================NEW Activity Arrived=============")
+            print("================================================")
+            # Add to waiting queue (but don't process immediately)
+            allocation_activity = self._normalize_activity_for_resources(activity)
+            self.stats['waiting_events'] += 1
+            waiting_work = WaitingWork(
+                case_id=case_id,
+                activity=activity,
+                allocation_activity=allocation_activity,
+                arrival_time=current_time,
+                case_state=case,
+            )
+            self.resource_pool.add_to_waiting_queue(waiting_work)
+
+            # Pretty-print waiting queues ## DELETE ME AFTER DEBUGGING
+            print("\n=== Resource Pool Waiting Queues ===")
+            for act, queue in self.resource_pool._waiting_queues.items():
+                if queue:
+                    print(f"  Activity '{act}' ({len(queue)} waiting):")
+                    for i, ww in enumerate(queue, 1):
+                        print(f"    {i}. Case {ww.case_id} | arrived {ww.arrival_time:%H:%M:%S}")
+            total = sum(len(q) for q in self.resource_pool._waiting_queues.values())
+            print(f"  Total waiting: {total}")
+            print("=" * 36)
+            
+            # Check total waiting work count across all activities
+            total_waiting = self.resource_pool.get_total_waiting_count()
+            logger.debug(
+                f"Collected activity {activity} for case {case_id} in optimization batch "
+                f"(total waiting: {total_waiting}/{self._optimization_batch_size})"
+            )
+            
+            # Process batch if we've collected enough activities
+            if total_waiting >= self._optimization_batch_size:
+                print("1. Running PMSP and applying assignment")
+                # Activities gets scheduled in run_pmsp_and_apply
+                self._run_pmsp_and_apply(current_time)
+
+            return
+
+        # Non-optimization mode: immediate allocation
         allocation_activity = self._normalize_activity_for_resources(activity)
 
         # Try to allocate a resource (with dynamic busy checking)
@@ -814,6 +1253,7 @@ class DESEngine:
         self._schedule_activity_with_resource(
             case_id, activity, current_time, case, resource
         )
+
 
     def _activity_requires_resource(self, activity: Optional[str]) -> bool:
         """Return True if this activity needs an org resource assignment."""
@@ -926,42 +1366,9 @@ class DESEngine:
             # Everyone qualified is busy
             return None, 'all_busy'
 
-        # Hier soll von dem random modeabwichen werden. Es soll ein Optimierungsverfahren eingeführt werden. Erstelle einen modus, der von dem random mode abweicht, den ich dann implemntiern werden
-        if self.resource_selection_mode == ResourceSelectionMode.RANDOM:
-            # Select randomly from truly available resources
-            import random
-            return random.choice(truly_available), None
-        elif self.resource_selection_mode == ResourceSelectionMode.OPTIMIZATION:
-            print("Optimization mode selected! It begins here!")
-            # Select resource using optimization strategy from resource_optimization
-            if choose_resource is None or SelectionConfig is None:
-                # Fallback to random if optimization module not available
-                logger.warning("Resource optimization module not available. Falling back to random selection.")
-                import random
-                return random.choice(truly_available), None
-            
-            # Create selection config based on optimization mode
-            # TODO: Make this configurable via engine parameters
-            cfg = SelectionConfig(
-                dummy_delta=1.0,
-                rng_seed=None
-            )
-            
-            # Use choose_resource from resource_optimization
-            selected_resource, debug_info = choose_resource(
-                cfg=cfg,
-                activity=activity,
-                timestamp=timestamp,
-                case=case,
-                available_resources=truly_available,
-                eligible_resources=eligible_resources,
-                processing_time_predictor=self._processing_time
-            )
-            
-            # Log debug info if needed (optional)
-            # logger.debug(f"Resource selection: {debug_info}")
-            
-            return selected_resource, None
+        # Select randomly from truly available resources
+        import random
+        return random.choice(truly_available), None
 
     def _schedule_activity_with_resource(self, case_id: str, activity: str,
                                           current_time: datetime, case: CaseState,

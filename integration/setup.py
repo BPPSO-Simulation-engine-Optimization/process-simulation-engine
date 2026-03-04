@@ -74,8 +74,7 @@ def setup_simulation(
     # Skip if using ProcessTransformer (it handles both next activity and processing time)
     use_transformer = (
         config.next_activity_mode == "advanced" and 
-        hasattr(config, 'next_activity_class') and 
-        config.next_activity_class == "process_transformer"
+        getattr(config, 'next_activity_class', None) == "process_transformer"
     )
     if use_transformer:
         logger.info("Skipping ProcessingTimePredictionClass setup - ProcessTransformer will handle processing time prediction")
@@ -157,7 +156,7 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
 
     model_type = getattr(config, 'next_activity_model_type', 'auto')
 
-    if config.next_activity_class == "process_transformer":
+    if getattr(config, 'next_activity_class', None) == "process_transformer":
         # Return None to allow DESEngine to load it via next_activity_predictor_type
         # (or we could load it here, but engine has the logic)
         logger.info("Process Transformer selected: delegating loading to DESEngine")

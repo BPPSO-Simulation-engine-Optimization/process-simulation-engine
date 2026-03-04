@@ -5,7 +5,7 @@ import numpy as np
 
 class SegmentForecaster:
     """
-    Entspricht deiner estimate_segments_per_day(N_hat, day_labels).
+    Global Clusters
     """
     def estimate(self, N_hat: int, day_labels: np.ndarray) -> np.ndarray:
         day_labels = np.asarray(day_labels, dtype=int)
