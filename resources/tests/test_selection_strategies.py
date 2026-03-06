@@ -114,65 +114,73 @@ class TestRoundRobinStrategy(unittest.TestCase):
 
 
 class TestShortestQueueStrategy(unittest.TestCase):
-    """Tests for R-SHQ: Shortest Queue Allocation."""
+    """Tests for R-SHQ: Shortest Queue Allocation.
 
-    def test_prefers_least_assigned(self):
+    R-SHQ uses instantaneous queue depth (current assignments).  Since the
+    Tier 3 busy-state filter guarantees all candidates are idle, select()
+    always produces a multi-way tie broken by R-RMA (random).
+    """
+
+    def test_prefers_least_loaded(self):
+        """Resource with fewer current assignments is preferred."""
         strategy = ShortestQueueStrategy()
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R2", "A")
-        # R3 has 0 assignments -> should be selected
+        # R3 has 0 current assignments -> should be selected
         result = strategy.select(["R1", "R2", "R3"], "A")
         self.assertEqual(result, "R3")
 
-    def test_tiebreaker_is_random(self):
+    def test_release_reduces_load(self):
+        """notify_release decrements current assignments."""
+        strategy = ShortestQueueStrategy()
+        strategy.notify_assignment("R1", "A")
+        strategy.notify_assignment("R1", "B")
+        self.assertEqual(strategy._current_assignments["R1"], 2)
+        strategy.notify_release("R1")
+        self.assertEqual(strategy._current_assignments["R1"], 1)
+        strategy.notify_release("R1")
+        self.assertEqual(strategy._current_assignments["R1"], 0)
+
+    def test_after_release_resource_is_selectable(self):
+        """After release, a resource returns to 0 depth and ties with others."""
+        strategy = ShortestQueueStrategy()
+        strategy.notify_assignment("R1", "A")
+        strategy.notify_release("R1")
+        # Both at 0 — should see both selected over many trials
+        results = set()
+        for _ in range(50):
+            results.add(strategy.select(["R1", "R2"], "A"))
+        self.assertEqual(results, {"R1", "R2"})
+
+    def test_tier3_guarantees_random_tiebreak(self):
+        """When all candidates are idle (Tier 3), select is random."""
         random.seed(42)
         strategy = ShortestQueueStrategy()
         available = ["R1", "R2", "R3"]
-        # All have 0 assignments — tied, should see randomness
+        # All at 0 current assignments — tied, should see randomness
         results = set()
         for _ in range(100):
             results.add(strategy.select(available, "A"))
         self.assertGreater(len(results), 1)
-
-    def test_balances_load_perfectly(self):
-        random.seed(42)
-        strategy = ShortestQueueStrategy()
-        available = ["R1", "R2", "R3"]
-        for _ in range(9):
-            selected = strategy.select(available, "A")
-            strategy.notify_assignment(selected, "A")
-        # Each should have exactly 3 assignments
-        for r in available:
-            self.assertEqual(strategy._assignment_counts[r], 3)
-
-    def test_tracks_across_activities(self):
-        strategy = ShortestQueueStrategy()
-        strategy.notify_assignment("R1", "A")
-        strategy.notify_assignment("R1", "B")
-        # R1 has 2 total, R2 has 0
-        result = strategy.select(["R1", "R2"], "A")
-        self.assertEqual(result, "R2")
 
     def test_single_resource(self):
         strategy = ShortestQueueStrategy()
         result = strategy.select(["R1"], "A")
         self.assertEqual(result, "R1")
 
-    def test_reset_clears_counts(self):
+    def test_reset_clears_state(self):
         strategy = ShortestQueueStrategy()
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R1", "A")
         strategy.reset()
-        self.assertEqual(strategy._assignment_counts["R1"], 0)
+        self.assertEqual(len(strategy._current_assignments), 0)
 
-    def test_notify_then_select(self):
-        """After notify, the assigned resource should be deprioritized."""
+    def test_release_does_not_go_negative(self):
+        """Releasing without prior assignment stays at 0."""
         strategy = ShortestQueueStrategy()
-        strategy.notify_assignment("R1", "A")
-        # R2 now preferred over R1
-        result = strategy.select(["R1", "R2"], "A")
-        self.assertEqual(result, "R2")
+        strategy.notify_release("R1")
+        self.assertEqual(strategy._current_assignments["R1"], 0)
 
 
 class TestCreateStrategy(unittest.TestCase):

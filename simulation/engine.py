@@ -771,6 +771,7 @@ class DESEngine:
         # Release the resource that completed this activity
         if event.resource:
             self.resource_pool.release(event.resource)
+            self._resource_strategy.notify_release(event.resource)
             # Try to dispatch waiting work now that this resource is free
             self._process_waiting_queue(event.resource, event.timestamp)
 
