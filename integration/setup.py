@@ -79,6 +79,28 @@ def setup_simulation(
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
+def _resolve_lifecycle_dual_path(model_path: Path) -> Optional[Path]:
+    """Resolve lifecycle_dual model path. If local path missing, try HuggingFace."""
+    model_file = model_path / "model.keras"
+    checkpoint_file = model_path / "checkpoints" / "best_model.keras"
+    if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
+        return model_path
+    path_str = str(model_path)
+    if "start_complete" in path_str:
+        repo_id = "Nixion/next-activity-lifecycle-dual-start-complete-baseline"
+    else:
+        repo_id = "Nixion/next-activity-lifecycle-dual-full-baseline"
+    try:
+        from huggingface_hub import hf_hub_download
+        model_path_hf = hf_hub_download(repo_id=repo_id, filename="model.keras")
+        hf_hub_download(repo_id=repo_id, filename="metadata.json")
+        logger.info("Lifecycle dual model not found locally. Loaded from HuggingFace: %s", repo_id)
+        return Path(model_path_hf).parent
+    except Exception as e:
+        logger.debug("HuggingFace fallback failed for %s: %s", repo_id, e)
+        return None
+
+
 def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
     """
     Try to load a next activity predictor from the given path.
@@ -90,12 +112,6 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
     Returns:
         Predictor instance if successful, None otherwise
     """
-    model_file = model_path / "model.keras"
-    checkpoint_file = model_path / "checkpoints" / "best_model.keras"
-
-    if not model_path.exists() or (not model_file.exists() and not checkpoint_file.exists()):
-        return None
-
     # Determine which predictor to try based on model_type
     # If "auto", try both in order
     predictors_to_try = []
@@ -113,6 +129,18 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
         ]
 
     for pred_type, module_name, class_name in predictors_to_try:
+        path_to_use = model_path
+        if pred_type == "lifecycle_dual":
+            resolved = _resolve_lifecycle_dual_path(model_path)
+            if resolved is None:
+                continue
+            path_to_use = resolved
+
+        model_file = path_to_use / "model.keras"
+        checkpoint_file = path_to_use / "checkpoints" / "best_model.keras"
+        if not path_to_use.exists() or (not model_file.exists() and not checkpoint_file.exists()):
+            continue
+
         try:
             module = __import__(module_name, fromlist=[class_name])
             PredictorClass = getattr(module, class_name)
@@ -121,14 +149,14 @@ def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
                 predictor = PredictorClass(model_path=str(checkpoint_file))
                 logger.info(f"✓ {pred_type.capitalize()} model loaded from checkpoint: {checkpoint_file}")
             else:
-                predictor = PredictorClass(model_path=str(model_path))
-                logger.info(f"✓ {pred_type.capitalize()} model loaded from: {model_path}")
+                predictor = PredictorClass(model_path=str(path_to_use))
+                logger.info(f"✓ {pred_type.capitalize()} model loaded from: {path_to_use}")
 
             return predictor
         except ImportError:
             continue
         except Exception as e:
-            logger.debug(f"Could not load {pred_type} predictor from {model_path}: {e}")
+            logger.debug(f"Could not load {pred_type} predictor from {path_to_use}: {e}")
             continue
 
     return None
