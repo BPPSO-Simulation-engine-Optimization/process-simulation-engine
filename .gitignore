@@ -42,6 +42,9 @@ integration/output/
 .DS_Store
 .env
 .claude
+CLAUDE.md
+AGENTS.md
+tasks/
 .vscode/
 .idea/
 
