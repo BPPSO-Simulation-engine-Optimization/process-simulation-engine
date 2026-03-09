@@ -282,6 +282,11 @@ class GlobalSegmentClusterer:
         # FALLBACK: No valid segmentation found at any z → treat entire
         # timeline as a single cluster.
         # =====================================================================
+        # Beispiel: Wenn N=100 Tage und keine Segmentierung gefunden wurde:
+        #   G = [D]  # Liste mit einem Cluster, der alle 100 Tage enthält
+        #   seg_labels = [1]  # Ein einziges Segment mit Label 1
+        #   day_labels = [1, 1, 1, ..., 1]  # Alle 100 Tage haben Label 1
+        #   cp_days = []  # Keine Change Points
         if best_result is None:
             if self.verbose:
                 print("Fallback on single Cluster!")
@@ -293,20 +298,39 @@ class GlobalSegmentClusterer:
         # =====================================================================
         # POST-PROCESSING: Build the final output structures
         # =====================================================================
+        # Beispiel: Angenommen wir haben 4 Segmente gefunden:
+        #   S = [seg0, seg1, seg2, seg3]  # 4 Segmente (jeweils Liste von Tagen)
+        #   seg_labels = [1, 2, 1, 2]  # Segment 0,2 → Cluster 1; Segment 1,3 → Cluster 2
+        #   segment_day_ranges = [(0, 30), (30, 60), (60, 80), (80, 100)]  # Tag-Bereiche
+        #   cp_days = [30, 60, 80]  # Change Points an Tag 30, 60, 80
         S, seg_labels, segment_day_ranges, cp_days = best_result
 
         # --- Map segment cluster labels to 0-based contiguous IDs ---
+        # Beispiel: seg_labels = [1, 2, 1, 2] → unique_seg_labels = [1, 2]
+        #   cluster_id_map = {1: 0, 2: 1}  # Label 1 → Cluster 0, Label 2 → Cluster 1
+        #   J = 2  # Zwei Cluster
         unique_seg_labels = sorted(np.unique(seg_labels))
         cluster_id_map = {lab: i for i, lab in enumerate(unique_seg_labels)}  # 0..J-1
         J = len(unique_seg_labels)
 
         # --- G[j] collects all segments that belong to cluster j ---
+        # Beispiel: Mit seg_labels = [1, 2, 1, 2] und cluster_id_map = {1: 0, 2: 1}
+        #   G[0] = [seg0, seg2]  # Cluster 0 enthält Segment 0 und 2
+        #   G[1] = [seg1, seg3]  # Cluster 1 enthält Segment 1 und 3
         G: List[list] = [[] for _ in range(J)]
         for seg_idx, seg in enumerate(S):
             cid = cluster_id_map[seg_labels[seg_idx]]
             G[cid].append(seg)
 
         # --- day_labels: assign each original day its cluster ID (1-based) ---
+        # Beispiel: Mit segment_day_ranges = [(0, 30), (30, 60), (60, 80), (80, 100)]
+        #   und seg_labels = [1, 2, 1, 2] → cluster_id_map = {1: 0, 2: 1}
+        #   Tag 0-29:   cid = cluster_id_map[1] + 1 = 0 + 1 = 1
+        #   Tag 30-59:  cid = cluster_id_map[2] + 1 = 1 + 1 = 2
+        #   Tag 60-79:  cid = cluster_id_map[1] + 1 = 0 + 1 = 1
+        #   Tag 80-99:  cid = cluster_id_map[2] + 1 = 1 + 1 = 2
+        #   day_labels = [1,1,...,1, 2,2,...,2, 1,1,...,1, 2,2,...,2]
+        #                (30x)      (30x)      (20x)      (20x)
         day_labels = np.zeros(N, dtype=int)
         for seg_idx, (start, end) in enumerate(segment_day_ranges):
             cid = cluster_id_map[seg_labels[seg_idx]] + 1  # 1-based for output
