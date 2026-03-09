@@ -97,7 +97,7 @@ def save_ground_truth_subset(df: pd.DataFrame, num_cases: int, output_dir: str):
     return reduced_df
 
 
-def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str):
+def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str, enable_profiling: bool = False):
     """Run the simulation with given configuration."""
     print("\n" + "=" * 60)
     print("SIMULATION CONFIGURATION")
@@ -150,6 +150,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
+        enable_profiling=enable_profiling,
     )
 
     # Run simulation
@@ -248,6 +249,11 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiling of simulation components"
+    )
 
     args = parser.parse_args()
 
@@ -308,7 +314,7 @@ def main():
     save_ground_truth_subset(df, num_cases, args.output_dir)
 
     # Run simulation
-    events = run_simulation(config, df, allocator, args.output_dir)
+    events = run_simulation(config, df, allocator, args.output_dir, enable_profiling=args.profile)
 
     print("\n" + "=" * 60)
     print("INTEGRATION TEST COMPLETE")
