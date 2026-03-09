@@ -22,10 +22,9 @@ class SimulationConfig:
     processing_time_model_path: Optional[str] = "models/processing_time_model"
 
     # Next activity prediction
-    # "basic" = auto-load (engine will try to find model), "advanced" = explicit model path
-    next_activity_mode: Literal["basic", "advanced"] = "basic"
-    next_activity_model_path: Optional[str] = "next_activity_prediction/models/next_activity_lstm"
-    next_activity_model_type: Literal["embedding", "onehot", "lifecycle_dual", "auto"] = "auto"
+    next_activity_class: str = "lstm"  # "lstm", "process_transformer", "lifecycle_dual"
+    next_activity_model_path: Optional[str] = None
+    next_activity_lifecycle_variant: Optional[str] = None  # "start_complete" or "full_lifecycle"
     next_activity_temperature: float = 1.0
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
@@ -54,26 +53,3 @@ class SimulationConfig:
     num_cases: int = 100
     random_seed: int = 42
     verbose: bool = False
-
-    @classmethod
-    def all_basic(cls) -> "SimulationConfig":
-        """Create configuration with all basic/stub predictors."""
-        return cls()
-
-    @classmethod
-    def all_advanced(
-        cls,
-        event_log_path: str,
-        processing_time_model_path: str = "models/processing_time_model",
-        num_cases: int = 100,
-    ) -> "SimulationConfig":
-        """Create configuration with all advanced predictors."""
-        return cls(
-            processing_time_mode="advanced",
-            processing_time_model_path=processing_time_model_path,
-            next_activity_mode="advanced",
-            case_arrival_mode="advanced",
-            case_attribute_mode="advanced",
-            event_log_path=event_log_path,
-            num_cases=num_cases,
-        )
