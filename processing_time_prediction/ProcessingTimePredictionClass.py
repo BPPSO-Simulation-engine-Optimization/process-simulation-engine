@@ -424,10 +424,7 @@ class ProcessingTimePredictionClass:
 
                 raw_prediction = float(prediction)
                 prediction = max(0.0, raw_prediction)
-                
-                # Clamp to max 1 day to debug "years long" simulation
-                MAX_DURATION = 86400.0
-                prediction = min(prediction, MAX_DURATION)
+
 
                 return prediction
                 
