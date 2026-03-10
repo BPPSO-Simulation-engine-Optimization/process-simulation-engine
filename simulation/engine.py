@@ -846,6 +846,9 @@ class DESEngine:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1
         self.case_manager.remove_case(event.case_id)
+        # Clean up predictor state for this case (prevents memory leak)
+        if hasattr(self._next_activity, 'reset_case'):
+            self._next_activity.reset_case(event.case_id)
     
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
@@ -1058,8 +1061,13 @@ class DESEngine:
         processing_time = timedelta(seconds=processing_seconds)
         completion_time = current_time + processing_time
 
-        # Mark resource as busy until completion
-        self.resource_pool.mark_busy(resource, completion_time, case_id, activity)
+        # Resource is only busy for actual work duration, not the full inter-event time
+        if hasattr(self._processing_time, 'predict_resource_hold_time'):
+            resource_hold_seconds = self._processing_time.predict_resource_hold_time(activity, resource)
+            resource_release_time = current_time + min(processing_time, timedelta(seconds=resource_hold_seconds))
+        else:
+            resource_release_time = completion_time
+        self.resource_pool.mark_busy(resource, resource_release_time, case_id, activity)
 
         # Schedule completion event
         event = SimulationEvent(

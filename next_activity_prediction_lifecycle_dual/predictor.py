@@ -108,9 +108,9 @@ class DualLifecycleNextActivityPredictor:
         X_activity = np.array([self._pad(act_idx)], dtype=np.int32)
         X_lifecycle = np.array([self._pad(life_idx)], dtype=np.int32)
 
-        pred_activity_probs, pred_lifecycle_probs = self.model.predict([X_activity, X_lifecycle], verbose=0)
-        probs = pred_activity_probs[0]
-        lifecycle_probs = pred_lifecycle_probs[0]
+        output = self.model([X_activity, X_lifecycle], training=False)
+        probs = output[0][0].numpy()
+        lifecycle_probs = output[1][0].numpy()
 
         top_k = min(3, len(probs))
         top_indices = np.argsort(probs)[-top_k:][::-1]
