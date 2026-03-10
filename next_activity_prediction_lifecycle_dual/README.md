@@ -109,3 +109,75 @@ Use:
 - If your log has no `lifecycle:transition` column, lifecycle is set to `unknown`.
 - The module appends explicit end tokens for both activity and lifecycle to model case completion.
 - TensorFlow/Keras, pandas, numpy, scikit-learn, and pm4py are expected from project requirements.
+
+---
+
+## Upload to Hugging Face (Platform-Independent)
+
+Use this helper script:
+
+`next_activity_prediction_lifecycle_dual/upload_to_huggingface.py`
+
+It is OS-agnostic because it runs with plain Python and `huggingface_hub`.
+
+### 1) Ensure trained model artifacts exist
+
+You need at least:
+- `model.keras`
+- `metadata.json`
+
+Optional but recommended:
+- `metrics.json`
+- `history.json`
+- `comparison_summary.json` in `next_activity_prediction_lifecycle_dual/models`
+
+### 2) Set your HF token
+
+Windows PowerShell:
+
+```powershell
+$env:HF_TOKEN="hf_xxx"
+```
+
+macOS/Linux (bash/zsh):
+
+```bash
+export HF_TOKEN="hf_xxx"
+```
+
+### 3) Upload best model automatically
+
+This picks the top model from:
+`next_activity_prediction_lifecycle_dual/models/comparison_summary.json`
+
+```bash
+python -m next_activity_prediction_lifecycle_dual.upload_to_huggingface --repo-id "YOUR_USERNAME/next_activity_prediction_lifecycle_dual"
+```
+
+### 4) Upload a specific trained variant
+
+Example:
+
+```bash
+python -m next_activity_prediction_lifecycle_dual.upload_to_huggingface \
+  --repo-id "YOUR_USERNAME/next_activity_prediction_lifecycle_dual" \
+  --model-dir "next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced"
+```
+
+### 5) Optional flags
+
+- private repository:
+
+```bash
+python -m next_activity_prediction_lifecycle_dual.upload_to_huggingface --repo-id "YOUR_USERNAME/next_activity_prediction_lifecycle_dual" --private
+```
+
+- pass token explicitly:
+
+```bash
+python -m next_activity_prediction_lifecycle_dual.upload_to_huggingface --repo-id "YOUR_USERNAME/next_activity_prediction_lifecycle_dual" --token "hf_xxx"
+```
+
+After upload, your model is available at:
+
+`https://huggingface.co/YOUR_USERNAME/next_activity_prediction_lifecycle_dual`

@@ -37,11 +37,15 @@ Dataset/
 
 # Outputs
 integration/output/
+sim_run_log.txt
 
 # IDE & System
 .DS_Store
 .env
 .claude
+CLAUDE.md
+AGENTS.md
+tasks/
 .vscode/
 .idea/
 

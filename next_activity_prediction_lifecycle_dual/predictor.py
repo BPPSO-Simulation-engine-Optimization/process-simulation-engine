@@ -116,7 +116,7 @@ class DualLifecycleNextActivityPredictor:
         X_activity = np.array([self._pad(act_idx)], dtype=np.int32)
         X_lifecycle = np.array([self._pad(life_idx)], dtype=np.int32)
 
-        pred_activity_probs, pred_lifecycle_probs = self.model.predict([X_activity, X_lifecycle], verbose=0)
+        pred_activity_probs, pred_lifecycle_probs = self.model.predict_on_batch([X_activity, X_lifecycle])
         probs = pred_activity_probs[0]
         lifecycle_probs = pred_lifecycle_probs[0]
 

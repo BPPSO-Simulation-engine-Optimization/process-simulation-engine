@@ -9,9 +9,9 @@ This script runs a full simulation using:
 + It saves the respective subset of the GT EL in case num-cases is specified
 
 Usage:
-    python -m integration.test_integration --mode basic
-    python -m integration.test_integration --mode advanced --num-cases 31000
-    python -m integration.test_integration --mode mixed --arrivals advanced --attributes basic
+    python -m integration.test_integration --num-cases 1000 --event-log eventlog/eventlog.xes.gz
+    python -m integration.test_integration --arrivals advanced --processing advanced --num-cases 100
+    python -m integration.test_integration --processing advanced --processing-model-path models/processing_time_model
 """
 
 import argparse
@@ -97,7 +97,7 @@ def save_ground_truth_subset(df: pd.DataFrame, num_cases: int, output_dir: str):
     return reduced_df
 
 
-def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str):
+def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str, enable_profiling: bool = False):
     """Run the simulation with given configuration."""
     print("\n" + "=" * 60)
     print("SIMULATION CONFIGURATION")
@@ -150,6 +150,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
+        enable_profiling=enable_profiling,
     )
 
     # Run simulation
@@ -193,28 +194,27 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 def main():
     parser = argparse.ArgumentParser(description="Run integration test for simulation engine")
     parser.add_argument(
-        "--mode",
-        choices=["basic", "advanced", "mixed"],
-        default="basic",
-        help="Simulation mode (basic=all stubs, advanced=all ML, mixed=custom)"
-    )
-    parser.add_argument(
         "--arrivals",
         choices=["basic", "advanced"],
-        default=None,
-        help="Case arrival mode (for mixed mode)"
+        default="basic",
+        help="Case arrival mode (default: basic)"
     )
     parser.add_argument(
         "--processing",
         choices=["basic", "advanced"],
-        default=None,
-        help="Processing time mode (for mixed mode)"
+        default="basic",
+        help="Processing time mode (default: basic)"
     )
     parser.add_argument(
         "--attributes",
         choices=["basic", "advanced"],
+        default="basic",
+        help="Case attribute mode (default: basic)"
+    )
+    parser.add_argument(
+        "--processing-model-path",
         default=None,
-        help="Case attribute mode (for mixed mode)"
+        help="Path to processing time model (base path without suffixes)"
     )
     parser.add_argument(
         "--next-activity",
@@ -249,6 +249,11 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiling of simulation components"
+    )
 
     args = parser.parse_args()
 
@@ -275,65 +280,31 @@ def main():
             mask = df['lifecycle:transition'].astype(str).str.lower().isin(['start', 'complete'])
             df = df[mask].copy()
 
-    # Create configuration
-    if args.mode == "basic":
-        config = SimulationConfig.all_basic()
-    elif args.mode == "advanced":
-        config = SimulationConfig.all_advanced(
-            event_log_path=args.event_log,
-            num_cases=num_cases,
-        )
-    else:  # mixed
-        config = SimulationConfig(
-            processing_time_mode=args.processing or "basic",
-            case_arrival_mode=args.arrivals or "basic",
-            case_attribute_mode=args.attributes or "basic",
-            event_log_path=args.event_log,
-            num_cases=num_cases,
-            verbose=args.verbose,
-        )
+    # Create configuration from individual flags
+    config = SimulationConfig(
+        processing_time_mode=args.processing,
+        case_arrival_mode=args.arrivals,
+        case_attribute_mode=args.attributes,
+        event_log_path=args.event_log,
+        num_cases=num_cases,
+        verbose=args.verbose,
+    )
 
+    if args.processing_model_path:
+        config.processing_time_model_path = args.processing_model_path
 
-    
-    # Set the implementation class
-    config.next_activity_class = args.next_activity
+    # Map CLI next-activity choice to config fields
     config.next_activity_temperature = args.temperature
-    if args.next_activity == "lifecycle_dual_full_baseline":
-        candidate_model_paths = [
-            "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
-            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
-        ]
-        selected_model_path = None
-        for candidate in candidate_model_paths:
-            if Path(candidate).exists():
-                selected_model_path = candidate
-                break
-        if selected_model_path is None:
-            selected_model_path = candidate_model_paths[0]
-
-        config.next_activity_class = "lstm"
-        config.next_activity_mode = "advanced"
-        config.next_activity_model_type = "lifecycle_dual"
-        config.next_activity_model_path = selected_model_path
-    elif args.next_activity == "lifecycle_dual_start_complete_baseline":
-        candidate_model_paths = [
-            "next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
-            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
-        ]
-        selected_model_path = None
-        for candidate in candidate_model_paths:
-            if Path(candidate).exists():
-                selected_model_path = candidate
-                break
-        if selected_model_path is None:
-            selected_model_path = candidate_model_paths[0]
-
-        config.next_activity_class = "lstm"
-        config.next_activity_mode = "advanced"
-        config.next_activity_model_type = "lifecycle_dual"
-        config.next_activity_model_path = selected_model_path
-
-    config.num_cases = num_cases
+    if args.next_activity == "lifecycle_dual_start_complete_baseline":
+        config.next_activity_class = "lifecycle_dual"
+        config.next_activity_lifecycle_variant = "start_complete"
+        config.next_activity_model_path = "next_activity_prediction_lifecycle_dual/models/start_complete/baseline"
+    elif args.next_activity == "lifecycle_dual_full_baseline":
+        config.next_activity_class = "lifecycle_dual"
+        config.next_activity_lifecycle_variant = "full_lifecycle"
+        config.next_activity_model_path = "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"
+    else:
+        config.next_activity_class = args.next_activity  # "lstm" or "process_transformer"
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)
@@ -343,7 +314,7 @@ def main():
     save_ground_truth_subset(df, num_cases, args.output_dir)
 
     # Run simulation
-    events = run_simulation(config, df, allocator, args.output_dir)
+    events = run_simulation(config, df, allocator, args.output_dir, enable_profiling=args.profile)
 
     print("\n" + "=" * 60)
     print("INTEGRATION TEST COMPLETE")
