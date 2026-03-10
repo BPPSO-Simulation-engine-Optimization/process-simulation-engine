@@ -99,6 +99,7 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
         return _load_lifecycle_dual(
             model_path=config.next_activity_model_path,
             variant=config.next_activity_lifecycle_variant or "start_complete",
+            hf_repo_override=config.next_activity_hf_repo,
         )
 
     # "lstm" or unknown — return None to let engine auto-load
@@ -106,7 +107,7 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     return None
 
 
-def _load_lifecycle_dual(model_path: Optional[str], variant: str) -> Optional[Any]:
+def _load_lifecycle_dual(model_path: Optional[str], variant: str, hf_repo_override: Optional[str] = None) -> Optional[Any]:
     """Load lifecycle dual predictor from local path, falling back to HuggingFace."""
     from next_activity_prediction_lifecycle_dual import DualLifecycleNextActivityPredictor
 
@@ -118,8 +119,8 @@ def _load_lifecycle_dual(model_path: Optional[str], variant: str) -> Optional[An
             logger.info("Loaded DualLifecycleNextActivityPredictor from %s", load_path)
             return predictor
 
-    # Fallback to HuggingFace
-    hf_repo = _LIFECYCLE_DUAL_HF_REPOS.get(variant)
+    # Fallback to HuggingFace — explicit override takes priority over variant default
+    hf_repo = hf_repo_override or _LIFECYCLE_DUAL_HF_REPOS.get(variant)
     if not hf_repo:
         logger.warning("Unknown lifecycle_dual variant: %s", variant)
         return None

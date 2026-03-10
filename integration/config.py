@@ -25,6 +25,7 @@ class SimulationConfig:
     next_activity_class: str = "lstm"  # "lstm", "process_transformer", "lifecycle_dual"
     next_activity_model_path: Optional[str] = None
     next_activity_lifecycle_variant: Optional[str] = None  # "start_complete" or "full_lifecycle"
+    next_activity_hf_repo: Optional[str] = None  # Override HuggingFace repo for lifecycle_dual download
     next_activity_temperature: float = 1.0
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
