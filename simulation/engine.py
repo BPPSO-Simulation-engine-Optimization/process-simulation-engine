@@ -26,11 +26,13 @@ Resource Allocation Model:
 This creates realistic resource contention and waiting times.
 """
 
+import time
 import uuid
 import random
 import logging
 import threading
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -78,6 +80,71 @@ class WaitingWork:
     def __lt__(self, other):
         """For heap ordering - earlier arrival time = higher priority."""
         return self.arrival_time < other.arrival_time
+
+
+class SimulationProfiler:
+    """Lightweight profiler using time.perf_counter() for wall-clock measurement."""
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._totals: Dict[str, float] = defaultdict(float)
+        self._counts: Dict[str, int] = defaultdict(int)
+        self._wall_start: float = 0.0
+
+    def start_wall_clock(self):
+        if self.enabled:
+            self._wall_start = time.perf_counter()
+
+    @contextmanager
+    def measure(self, component: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        yield
+        elapsed = time.perf_counter() - t0
+        self._totals[component] += elapsed
+        self._counts[component] += 1
+
+    def print_report(self):
+        if not self.enabled:
+            return
+        wall_total = time.perf_counter() - self._wall_start
+
+        # Separate event-level from component-level measurements
+        event_items = {k: v for k, v in self._totals.items() if k.startswith("event.")}
+        component_items = {k: v for k, v in self._totals.items() if not k.startswith("event.")}
+
+        print(f"\n{'='*80}")
+        print("PERFORMANCE PROFILE")
+        print(f"{'='*80}")
+        print(f"Total wall-clock time: {wall_total:.2f}s\n")
+
+        # Event-level breakdown
+        print("Event type breakdown:")
+        print(f"{'Event type':<45} {'Total (s)':>10} {'Calls':>7} {'Avg (ms)':>10} {'% Wall':>8}")
+        print("-" * 80)
+        for comp in sorted(event_items, key=event_items.get, reverse=True):
+            total = self._totals[comp]
+            count = self._counts[comp]
+            avg_ms = (total / count * 1000) if count else 0
+            pct = (total / wall_total * 100) if wall_total else 0
+            print(f"{comp:<45} {total:>10.3f} {count:>7} {avg_ms:>10.3f} {pct:>7.1f}%")
+        event_accounted = sum(event_items.values())
+        event_unaccounted = wall_total - event_accounted
+        print(f"{'(unaccounted / overhead)':<45} {event_unaccounted:>10.3f} {'':>7} {'':>10} {(event_unaccounted/wall_total*100) if wall_total else 0:>7.1f}%")
+
+        # Component-level breakdown
+        print(f"\nComponent breakdown (within event handlers):")
+        print(f"{'Component':<45} {'Total (s)':>10} {'Calls':>7} {'Avg (ms)':>10} {'% Wall':>8}")
+        print("-" * 80)
+        for comp in sorted(component_items, key=component_items.get, reverse=True):
+            total = self._totals[comp]
+            count = self._counts[comp]
+            avg_ms = (total / count * 1000) if count else 0
+            pct = (total / wall_total * 100) if wall_total else 0
+            print(f"{comp:<45} {total:>10.3f} {count:>7} {avg_ms:>10.3f} {pct:>7.1f}%")
+        print(f"{'='*80}\n")
 
 
 class ResourcePool:
@@ -346,6 +413,7 @@ class DESEngine:
         processing_time_estimator=None,
         drl_policy=None,
         pt_lifecycle_mode: str = "native",
+        enable_profiling: bool = False,
     ):
         """
         Initialize the DES Engine.
@@ -374,6 +442,7 @@ class DESEngine:
                 "native": keep predictor lifecycle output.
                 "gt_activity_gated": emit synthetic "start" for GT start-capable
                 activities and force completion logs to "complete".
+            enable_profiling: If True, measure wall-clock time per component.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -464,6 +533,9 @@ class DESEngine:
             'waiting_events': 0,  # Cases that had to wait for resources
             'wait_time_total_seconds': 0,  # Total time spent waiting
         }
+
+        # Profiler
+        self.profiler = SimulationProfiler(enabled=enable_profiling)
 
     @staticmethod
     def _detect_process_transformer_predictor(
@@ -590,7 +662,10 @@ class DESEngine:
 
         # Schedule initial case arrivals
         self._schedule_case_arrivals(num_cases)
-        
+
+        # Start profiler wall clock
+        self.profiler.start_wall_clock()
+
         # Main simulation loop
         print(f"\n{'='*60}", flush=True)
         print(f"Starting simulation loop with {len(self.queue)} scheduled events...", flush=True)
@@ -644,6 +719,8 @@ class DESEngine:
             f"{self.stats['no_eligible_failures']} no eligible"
             + (f", {pending_count} stuck" if pending_count > 0 else "")
         )
+
+        self.profiler.print_report()
 
         return self.completed_events
     
@@ -706,7 +783,8 @@ class DESEngine:
 
         handler = handlers.get(event.event_type)
         if handler:
-            handler(event)
+            with self.profiler.measure(f"event.{event.event_type.name}"):
+                handler(event)
         else:
             logger.warning(f"Unknown event type: {event.event_type}")
 
@@ -734,7 +812,8 @@ class DESEngine:
             print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {event.timestamp.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
         # Get case attributes from AttributeSimulationEngine
-        attr_case = self._case_attribute.start_new_case()
+        with self.profiler.measure("case_attribute.start_new_case"):
+            attr_case = self._case_attribute.start_new_case()
         loan_goal = attr_case.loan_goal
         app_type = attr_case.application_type
         amount = attr_case.requested_amount
@@ -751,7 +830,8 @@ class DESEngine:
         case._attr_engine_case = attr_case
 
         # Predict first activity
-        activity, lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
+        with self.profiler.measure("next_activity.predict"):
+            activity, lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
 
         if is_end:
             # Edge case: case ends immediately
@@ -759,8 +839,9 @@ class DESEngine:
             return
 
         # Allocate resource and schedule activity
-        self._schedule_activity(event.case_id, activity, lifecycle, event.timestamp, case)
-    
+        with self.profiler.measure("schedule_activity"):
+            self._schedule_activity(event.case_id, activity, lifecycle, event.timestamp, case)
+
     def _on_activity_complete(self, event: SimulationEvent) -> None:
         """Handle activity completion: log event, release resource, process waiting queue."""
         case = self.case_manager.get_case(event.case_id)
@@ -773,13 +854,15 @@ class DESEngine:
             self.resource_pool.release(event.resource)
             self._resource_strategy.notify_release(event.resource)
             # Try to dispatch waiting work now that this resource is free
-            self._process_waiting_queue(event.resource, event.timestamp)
+            with self.profiler.measure("process_waiting_queue"):
+                self._process_waiting_queue(event.resource, event.timestamp)
 
         # Generate offer-dependent attributes when O_Create Offer completes
         if event.activity == "O_Create Offer" and case._attr_engine_case is not None:
             # Populate offer attributes directly on the stored case reference
             # (uses explicit CaseState, not internal _active_case pointer)
-            self._case_attribute.populate_offer_attributes(case._attr_engine_case)
+            with self.profiler.measure("case_attribute.populate_offer"):
+                self._case_attribute.populate_offer_attributes(case._attr_engine_case)
             attr = case._attr_engine_case
             # Use pd.notna() for proper NaN handling (np.nan is NOT None)
             case.credit_score = float(attr.credit_score) if pd.notna(attr.credit_score) else None
@@ -819,12 +902,14 @@ class DESEngine:
         self.completed_events.append(log_record)
 
         # Predict next activity
-        next_activity, next_lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
+        with self.profiler.measure("next_activity.predict"):
+            next_activity, next_lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
 
         if is_end:
             self._schedule_case_end(event.case_id, event.timestamp)
         else:
-            self._schedule_activity(event.case_id, next_activity, next_lifecycle, event.timestamp, case)
+            with self.profiler.measure("schedule_activity"):
+                self._schedule_activity(event.case_id, next_activity, next_lifecycle, event.timestamp, case)
 
     def _process_waiting_queue(self, freed_resource: str, current_time: datetime) -> None:
         """
@@ -1192,6 +1277,9 @@ class DESEngine:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1
         self.case_manager.remove_case(event.case_id)
+        # Clean up predictor state for this case (prevents memory leak)
+        if hasattr(self._next_activity, 'reset_case'):
+            self._next_activity.reset_case(event.case_id)
     
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
@@ -1205,7 +1293,8 @@ class DESEngine:
         allocation_activity = self._normalize_activity_for_resources(activity)
 
         # Try to allocate a resource (with dynamic busy checking)
-        resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
+        with self.profiler.measure("resource_allocation"):
+            resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
 
         if resource is None:
             # No resource available - add to waiting queue
@@ -1306,27 +1395,28 @@ class DESEngine:
         # For control-flow artifacts, treat duration as instantaneous.
         processing_seconds = 0.0
         try:
-            processing_seconds = float(self._processing_time.predict(
-                prev_activity=prev_activity,
-                prev_lifecycle=prev_lifecycle,
-                curr_activity=activity,
-                curr_lifecycle=lifecycle,
-                context={
-                    'case_id': case_id,
-                    'hour': current_time.hour,
-                    'weekday': current_time.weekday(),
-                    'month': current_time.month,
-                    'day_of_year': current_time.timetuple().tm_yday,
-                    'case:LoanGoal': case.case_type,
-                    'case:ApplicationType': case.application_type,
-                    'event_position_in_case': len(case.activity_history) + 1,
-                    'case_duration_so_far': (current_time - case.start_time).total_seconds() if case.start_time else 0.0,
-                    'resource_1': case.current_resource or 'unknown',
-                    'resource_2': 'none',
-                    'Accepted': case.accepted,
-                    'Selected': case.selected,
-                },
-            ))
+            with self.profiler.measure("processing_time.predict"):
+                processing_seconds = float(self._processing_time.predict(
+                    prev_activity=prev_activity,
+                    prev_lifecycle=prev_lifecycle,
+                    curr_activity=activity,
+                    curr_lifecycle=lifecycle,
+                    context={
+                        'case_id': case_id,
+                        'hour': current_time.hour,
+                        'weekday': current_time.weekday(),
+                        'month': current_time.month,
+                        'day_of_year': current_time.timetuple().tm_yday,
+                        'case:LoanGoal': case.case_type,
+                        'case:ApplicationType': case.application_type,
+                        'event_position_in_case': len(case.activity_history) + 1,
+                        'case_duration_so_far': (current_time - case.start_time).total_seconds() if case.start_time else 0.0,
+                        'resource_1': case.current_resource or 'unknown',
+                        'resource_2': 'none',
+                        'Accepted': case.accepted,
+                        'Selected': case.selected,
+                    },
+                ))
         except Exception:
             processing_seconds = 0.0
 
@@ -1421,20 +1511,26 @@ class DESEngine:
             'case_id': case_id,
         }
 
-        processing_seconds = self._processing_time.predict(
-            # Request inter-event time (complete → complete) to use trained distributions
-            # This allows the model to predict realistic processing times based on training data
-            prev_activity=prev_activity,
-            prev_lifecycle=prev_lifecycle,
-            curr_activity=activity,
-            curr_lifecycle=lifecycle,
-            context=context,
-        )
+        with self.profiler.measure("processing_time.predict"):
+            processing_seconds = self._processing_time.predict(
+                # Request inter-event time (complete → complete) to use trained distributions
+                # This allows the model to predict realistic processing times based on training data
+                prev_activity=prev_activity,
+                prev_lifecycle=prev_lifecycle,
+                curr_activity=activity,
+                curr_lifecycle=lifecycle,
+                context=context,
+            )
         processing_time = timedelta(seconds=processing_seconds)
         completion_time = current_time + processing_time
 
-        # Mark resource as busy until completion
-        self.resource_pool.mark_busy(resource, completion_time, case_id, activity)
+        # Resource is only busy for actual work duration, not the full inter-event time
+        if hasattr(self._processing_time, 'predict_resource_hold_time'):
+            resource_hold_seconds = self._processing_time.predict_resource_hold_time(activity, resource)
+            resource_release_time = current_time + min(processing_time, timedelta(seconds=resource_hold_seconds))
+        else:
+            resource_release_time = completion_time
+        self.resource_pool.mark_busy(resource, resource_release_time, case_id, activity)
         self._append_synthetic_start_record(case_id, activity, resource, current_time, case)
 
         # Schedule completion event
