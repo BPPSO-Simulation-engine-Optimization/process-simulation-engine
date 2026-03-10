@@ -56,8 +56,12 @@ class ProcessingTimePredictionClass:
         self.y_mean: Optional[float] = None
         self.y_std: Optional[float] = None
 
+        # Resource hold time model
+        self.resource_hold_data = None
+
         base_path = model_path or "models/processing_time_model"
         self.load_model(base_path)
+        self._load_resource_hold_model(base_path)
 
     def _prepare_features(self, df_features: pd.DataFrame) -> pd.DataFrame:
         """
@@ -215,6 +219,56 @@ class ProcessingTimePredictionClass:
             self.y_std = metadata.get('y_std', 1.0)
             
             print(f"Probabilistic ML model loaded from {filepath}_*.joblib and {model_path}")
+
+    def _load_resource_hold_model(self, base_path: str):
+        """Load resource hold time model if available."""
+        hold_path = f"{base_path}_resource_hold.joblib"
+        if os.path.exists(hold_path):
+            self.resource_hold_data = joblib.load(hold_path)
+            n_dist = len(self.resource_hold_data.get('distributions', {}))
+            n_act = len(self.resource_hold_data.get('activity_distributions', {}))
+            print(f"Resource hold time model loaded: {n_dist} (activity,resource) + {n_act} activity-level distributions")
+        else:
+            self.resource_hold_data = None
+
+    def predict_resource_hold_time(self, activity: str, resource: str) -> float:
+        """
+        Predict how long a resource is actually busy (work burst duration).
+
+        For W_ activities: sample from fitted lognormal distribution.
+        For A_/O_ activities: return fixed 60s (system state changes).
+        Fallback hierarchy: (activity, resource) → activity → global.
+
+        Returns duration in seconds.
+        """
+        # A_/O_ activities are system state changes, not sustained resource work
+        if not activity.startswith("W_"): # todo sanity check
+            return 60.0
+
+        if self.resource_hold_data is None:
+            return 300.0  # 5 min default if no model loaded
+
+        distributions = self.resource_hold_data.get('distributions', {})
+        activity_distributions = self.resource_hold_data.get('activity_distributions', {})
+        global_mu = self.resource_hold_data.get('global_mu', np.log(300))
+        global_sigma = self.resource_hold_data.get('global_sigma', 1.0)
+
+        # Try (activity, resource) first
+        key = (activity, resource)
+        if key in distributions:
+            params = distributions[key]
+            sample = float(stats.lognorm(s=params['sigma'], scale=np.exp(params['mu'])).rvs(size=1)[0])
+            return max(1.0, sample)
+
+        # Activity-level fallback
+        if activity in activity_distributions:
+            params = activity_distributions[activity]
+            sample = float(stats.lognorm(s=params['sigma'], scale=np.exp(params['mu'])).rvs(size=1)[0])
+            return max(1.0, sample)
+
+        # Global fallback
+        sample = float(stats.lognorm(s=global_sigma, scale=np.exp(global_mu)).rvs(size=1)[0])
+        return max(1.0, sample)
 
     def _optimize_prediction_pipeline(self):
         """Build optimized feature extraction plan for ML predictions."""
