@@ -806,10 +806,15 @@ class DESEngine:
     def _on_case_arrival(self, event: SimulationEvent) -> None:
         """Handle case arrival: create case state, schedule first activity."""
         self.stats['cases_started'] += 1
-        
+
+        # Delay arrival to next business hour if outside working hours
+        arrival_time = event.timestamp
+        if not self._is_business_hours(arrival_time):
+            arrival_time = self._get_next_business_hour(arrival_time)
+
         # Print arrival info for visibility
         if self.stats['cases_started'] <= 5 or self.stats['cases_started'] % 100 == 0:
-            print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {event.timestamp.strftime('%Y-%m-%d %H:%M')}", flush=True)
+            print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {arrival_time.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
         # Get case attributes from AttributeSimulationEngine
         with self.profiler.measure("case_attribute.start_new_case"):
@@ -824,7 +829,7 @@ class DESEngine:
             case_type=loan_goal,
             application_type=app_type,
             requested_amount=amount,
-            start_time=event.timestamp,
+            start_time=arrival_time,
         )
         # Store reference to attr engine case for later offer attribute generation
         case._attr_engine_case = attr_case
@@ -835,12 +840,12 @@ class DESEngine:
 
         if is_end:
             # Edge case: case ends immediately
-            self._schedule_case_end(event.case_id, event.timestamp)
+            self._schedule_case_end(event.case_id, arrival_time)
             return
 
         # Allocate resource and schedule activity
         with self.profiler.measure("schedule_activity"):
-            self._schedule_activity(event.case_id, activity, lifecycle, event.timestamp, case)
+            self._schedule_activity(event.case_id, activity, lifecycle, arrival_time, case)
 
     def _on_activity_complete(self, event: SimulationEvent) -> None:
         """Handle activity completion: log event, release resource, process waiting queue."""
@@ -1421,6 +1426,7 @@ class DESEngine:
             processing_seconds = 0.0
 
         completion_time = current_time + timedelta(seconds=processing_seconds)
+
         self._append_synthetic_start_record(case_id, activity, None, current_time, case)
 
         event = SimulationEvent(
@@ -1553,6 +1559,16 @@ class DESEngine:
             case_id=case_id,
         )
         self.queue.schedule(event)
+
+    def _is_business_hours(self, timestamp: datetime) -> bool:
+        """Check if timestamp falls within business hours (Mon-Fri, 8-17, no holidays)."""
+        avail = self.allocator.availability
+        start_hour = getattr(avail, 'workday_start_hour', 8)
+        end_hour = getattr(avail, 'workday_end_hour', 17)
+        weekday = timestamp.weekday()
+        hour = timestamp.hour
+        is_holiday = timestamp.date() in avail.nl_holidays
+        return weekday < 5 and start_hour <= hour < end_hour and not is_holiday
 
     def _get_next_business_hour(self, current_time: datetime) -> datetime:
         """
