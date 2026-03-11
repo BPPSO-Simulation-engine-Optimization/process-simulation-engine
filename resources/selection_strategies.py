@@ -89,41 +89,35 @@ class ShortestQueueStrategy(ResourceSelectionStrategy):
     """
     R-SHQ: Shortest Queue Allocation (Pattern 17).
 
-    Per Russell et al. (2004), R-SHQ selects the resource with the fewest
-    work items **currently allocated** (instantaneous queue depth).  The
-    Tier 3 busy-state filter guarantees all candidates are idle, so their
-    instantaneous depth is trivially zero — producing a universal tie that
-    is broken by R-RMA (random selection).
+    Adapted for push-model DES: since the 3-tier filtering pipeline
+    (permissions → availability → busy state) guarantees all candidates
+    are idle, instantaneous queue depth is always zero.  Instead, this
+    strategy tracks **cumulative** assignments per resource and selects
+    the least-loaded resource, with R-RMA tiebreaker.
 
-    Using cumulative assignment counts as a proxy (whether global or
-    per-activity) creates pathological load concentration at scale: it
-    steers work toward resources whose natural availability is low for a
-    given activity, increasing queue build-up and cascading wait times.
+    This provides meaningful load balancing: resources who have received
+    fewer assignments overall are preferred.  The concern about steering
+    work toward low-availability resources is mitigated by Tier 2
+    (availability model), which already excludes off-duty resources.
     """
 
     def __init__(self):
-        # Tracks current (not cumulative) assignments per resource.
-        # After Tier 3 filtering all candidates have 0 current items,
-        # so select() always degenerates to random tiebreaker.
-        self._current_assignments: Dict[str, int] = defaultdict(int)
+        self._cumulative_assignments: Dict[str, int] = defaultdict(int)
 
     def select(self, available_resources: List[str], activity: str) -> str:
-        # All candidates passed Tier 3 (not busy) → current depth is 0.
-        # Fall through to random tiebreaker, matching the paper's intent.
-        min_count = min(self._current_assignments.get(r, 0) for r in available_resources)
-        candidates = [r for r in available_resources if self._current_assignments.get(r, 0) == min_count]
+        min_count = min(self._cumulative_assignments.get(r, 0) for r in available_resources)
+        candidates = [r for r in available_resources
+                      if self._cumulative_assignments.get(r, 0) == min_count]
         return random.choice(candidates)
 
     def notify_assignment(self, resource: str, activity: str) -> None:
-        self._current_assignments[resource] += 1
+        self._cumulative_assignments[resource] += 1
 
     def notify_release(self, resource: str) -> None:
-        """Called when a resource completes work and is released."""
-        if self._current_assignments[resource] > 0:
-            self._current_assignments[resource] -= 1
+        pass  # Cumulative — no decrement
 
     def reset(self) -> None:
-        self._current_assignments.clear()
+        self._cumulative_assignments.clear()
 
 
 # ---------------------------------------------------------------------------

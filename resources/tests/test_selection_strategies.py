@@ -114,51 +114,47 @@ class TestRoundRobinStrategy(unittest.TestCase):
 
 
 class TestShortestQueueStrategy(unittest.TestCase):
-    """Tests for R-SHQ: Shortest Queue Allocation.
+    """Tests for R-SHQ: Shortest Queue / Least Loaded Allocation.
 
-    R-SHQ uses instantaneous queue depth (current assignments).  Since the
-    Tier 3 busy-state filter guarantees all candidates are idle, select()
-    always produces a multi-way tie broken by R-RMA (random).
+    R-SHQ tracks cumulative assignments per resource and selects the
+    least-loaded resource, with R-RMA tiebreaker.  notify_release is
+    a no-op (cumulative, not instantaneous).
     """
 
     def test_prefers_least_loaded(self):
-        """Resource with fewer current assignments is preferred."""
+        """Resource with fewer cumulative assignments is preferred."""
         strategy = ShortestQueueStrategy()
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R2", "A")
-        # R3 has 0 current assignments -> should be selected
+        # R3 has 0 cumulative assignments -> should be selected
         result = strategy.select(["R1", "R2", "R3"], "A")
         self.assertEqual(result, "R3")
 
-    def test_release_reduces_load(self):
-        """notify_release decrements current assignments."""
+    def test_release_is_noop(self):
+        """notify_release does not decrement cumulative assignments."""
         strategy = ShortestQueueStrategy()
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R1", "B")
-        self.assertEqual(strategy._current_assignments["R1"], 2)
+        self.assertEqual(strategy._cumulative_assignments["R1"], 2)
         strategy.notify_release("R1")
-        self.assertEqual(strategy._current_assignments["R1"], 1)
-        strategy.notify_release("R1")
-        self.assertEqual(strategy._current_assignments["R1"], 0)
+        self.assertEqual(strategy._cumulative_assignments["R1"], 2)
 
-    def test_after_release_resource_is_selectable(self):
-        """After release, a resource returns to 0 depth and ties with others."""
+    def test_cumulative_tracks_total_load(self):
+        """After assignment + release, cumulative count persists."""
         strategy = ShortestQueueStrategy()
         strategy.notify_assignment("R1", "A")
         strategy.notify_release("R1")
-        # Both at 0 — should see both selected over many trials
-        results = set()
-        for _ in range(50):
-            results.add(strategy.select(["R1", "R2"], "A"))
-        self.assertEqual(results, {"R1", "R2"})
+        # R1 has 1 cumulative, R2 has 0 -> R2 preferred
+        result = strategy.select(["R1", "R2"], "A")
+        self.assertEqual(result, "R2")
 
-    def test_tier3_guarantees_random_tiebreak(self):
-        """When all candidates are idle (Tier 3), select is random."""
+    def test_tied_candidates_random_tiebreak(self):
+        """When all candidates have equal cumulative counts, select is random."""
         random.seed(42)
         strategy = ShortestQueueStrategy()
         available = ["R1", "R2", "R3"]
-        # All at 0 current assignments — tied, should see randomness
+        # All at 0 cumulative assignments — tied, should see randomness
         results = set()
         for _ in range(100):
             results.add(strategy.select(available, "A"))
@@ -174,13 +170,13 @@ class TestShortestQueueStrategy(unittest.TestCase):
         strategy.notify_assignment("R1", "A")
         strategy.notify_assignment("R1", "A")
         strategy.reset()
-        self.assertEqual(len(strategy._current_assignments), 0)
+        self.assertEqual(len(strategy._cumulative_assignments), 0)
 
-    def test_release_does_not_go_negative(self):
-        """Releasing without prior assignment stays at 0."""
+    def test_release_on_unknown_resource_is_noop(self):
+        """Releasing without prior assignment is a no-op."""
         strategy = ShortestQueueStrategy()
-        strategy.notify_release("R1")
-        self.assertEqual(strategy._current_assignments["R1"], 0)
+        strategy.notify_release("R1")  # Should not raise
+        self.assertEqual(strategy._cumulative_assignments.get("R1", 0), 0)
 
 
 class TestCreateStrategy(unittest.TestCase):
