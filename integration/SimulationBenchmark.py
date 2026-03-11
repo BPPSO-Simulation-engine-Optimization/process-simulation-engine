@@ -25,6 +25,7 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
+    warnings.warn("scikit-learn not available. Advanced metrics will not be computed.")
 
 warnings.filterwarnings('ignore')
 

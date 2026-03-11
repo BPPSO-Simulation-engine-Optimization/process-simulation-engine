@@ -308,14 +308,19 @@ def _setup_processing_time(config: SimulationConfig) -> Any:
         ProcessingTimePredictionClass
     )
 
-    logger.info("Setting up processing time predictor (ProcessingTimePredictionClass)...")
+    logger.info("Setting up processing time predictor...")
 
-    predictor = ProcessingTimePredictionClass(
-        method=config.processing_time_method,
-        model_path=config.processing_time_model_path,
-    )
-    logger.info(f"Loaded processing time model: {config.processing_time_method}")
-    return predictor
+    try:
+        predictor = ProcessingTimePredictionClass(
+            method=config.processing_time_method,
+            model_path=config.processing_time_model_path,
+        )
+        logger.info(f"Loaded processing time model: {config.processing_time_method}")
+        return predictor
+    except FileNotFoundError as e:
+        logger.warning(f"Processing time model missing: {e}")
+        logger.info("Falling back to basic (stub) processing time predictor...")
+        return _StubProcessingTimePredictor()
 
 
 def _setup_case_attributes(

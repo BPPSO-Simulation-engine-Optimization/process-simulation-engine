@@ -30,6 +30,8 @@ import time
 import uuid
 import random
 import logging
+import threading
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -44,6 +46,7 @@ from .events import SimulationEvent, EventType
 from .event_queue import EventQueue
 from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
+from resources.selection_strategies import ResourceSelectionStrategy, RandomStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +259,40 @@ class ResourcePool:
         """Get summary of waiting work per activity."""
         return {act: len(q) for act, q in self._waiting_queues.items() if q}
 
+    def get_all_waiting_tasks(self) -> List[WaitingWork]:
+        """
+        Return a flat list of all waiting work across all queues.
+
+        Non-destructive: items remain in their queues.
+        """
+        result = []
+        for q in self._waiting_queues.values():
+            result.extend(q)
+        return result
+
+    def remove_task_by_id(
+        self, allocation_activity: str, case_id: str
+    ) -> Optional[WaitingWork]:
+        """
+        Remove a specific task from its waiting queue by case_id.
+
+        O(n) scan + heapify.  Only called on worker-idle events so
+        performance is fine for queue sizes in the hundreds.
+
+        Returns:
+            The removed WaitingWork, or None if not found.
+        """
+        q = self._waiting_queues.get(allocation_activity)
+        if not q:
+            return None
+
+        for idx, work in enumerate(q):
+            if work.case_id == case_id:
+                q.pop(idx)
+                heapq.heapify(q)
+                return work
+        return None
+
 
 # Protocol definitions for pluggable predictors
 class NextActivityPredictor(Protocol):
@@ -348,6 +385,16 @@ class DESEngine:
     2. ACTIVITY_COMPLETE -> log event, predict next -> schedule next or CASE_END
     3. CASE_END -> cleanup
     """
+
+    PT_LIFECYCLE_MODES = {"native", "gt_activity_gated"}
+    PT_GT_START_ACTIVITIES = {
+        "W_Assess potential fraud",
+        "W_Call after offers",
+        "W_Call incomplete files",
+        "W_Complete application",
+        "W_Handle leads",
+        "W_Validate application",
+    }
     
     def __init__(
         self,
@@ -361,6 +408,11 @@ class DESEngine:
         case_attribute_predictor: CaseAttributePredictor = None,
         start_time: datetime = None,
         max_activities_per_case: int = 500,
+        resource_selection_strategy: ResourceSelectionStrategy = None,
+        batch_allocation_policy=None,
+        processing_time_estimator=None,
+        drl_policy=None,
+        pt_lifecycle_mode: str = "native",
         enable_profiling: bool = False,
     ):
         """
@@ -378,6 +430,18 @@ class DESEngine:
             case_attribute_predictor: Predicts case attributes (required).
             start_time: Simulation start time.
             max_activities_per_case: Safety limit to prevent infinite loops.
+            resource_selection_strategy: Heuristic for selecting among available resources.
+                Defaults to RandomStrategy (R-RMA).
+            batch_allocation_policy: Optional BatchAllocationPolicy (e.g. OneBatchOnePolicy).
+                When set, _process_waiting_queue uses holistic MILP instead of greedy.
+            processing_time_estimator: Optional ProcessingTimeEstimator for batch policy
+                p_{ij} lookups.  Required when batch_allocation_policy is set.
+            drl_policy: Optional DRL allocation policy (DRLAllocationPolicy or
+                InteractiveBatchPolicy).  When set, overrides both batch and greedy.
+            pt_lifecycle_mode: PT-only lifecycle logging mode.
+                "native": keep predictor lifecycle output.
+                "gt_activity_gated": emit synthetic "start" for GT start-capable
+                activities and force completion logs to "complete".
             enable_profiling: If True, measure wall-clock time per component.
         """
         self.queue = EventQueue()
@@ -387,6 +451,17 @@ class DESEngine:
 
         # Pre-generated arrival timestamps (optional)
         self._arrival_timestamps = arrival_timestamps
+
+        # Processing time predictor is required (must be ProcessingTimePredictionClass)
+        # NOTE: This MUST be assigned before _create_next_activity_predictor, because
+        # the Process Transformer path overrides self._processing_time with its own
+        # PTTimeAdapter. If we assign after, the override gets clobbered.
+        if processing_time_predictor is None:
+            raise ValueError(
+                "processing_time_predictor is required. "
+                "Use ProcessingTimePredictionClass from processing_time_prediction"
+            )
+        self._processing_time = processing_time_predictor
 
         # Next activity predictor: use provided instance, or create from type
         if next_activity_predictor is not None:
@@ -401,15 +476,23 @@ class DESEngine:
                 "Either next_activity_predictor or next_activity_predictor_type is required. "
                 "Use a valid NextActivityPredictorType or pass a predictor instance."
             )
-        self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
-        # Processing time predictor is required (must be ProcessingTimePredictionClass)
-        if processing_time_predictor is None:
+        self._is_process_transformer_predictor = self._detect_process_transformer_predictor(
+            predictor=self._next_activity,
+            predictor_type=next_activity_predictor_type,
+        )
+        self._pt_lifecycle_mode = str(pt_lifecycle_mode or "native")
+        if self._pt_lifecycle_mode not in self.PT_LIFECYCLE_MODES:
             raise ValueError(
-                "processing_time_predictor is required. "
-                "Use ProcessingTimePredictionClass from processing_time_prediction"
+                f"Unknown pt_lifecycle_mode: {self._pt_lifecycle_mode}. "
+                f"Expected one of: {sorted(self.PT_LIFECYCLE_MODES)}"
             )
-        self._processing_time = processing_time_predictor
+        if self._pt_lifecycle_mode == "gt_activity_gated" and not self._is_process_transformer_predictor:
+            raise ValueError(
+                "pt_lifecycle_mode='gt_activity_gated' is only valid with the "
+                "Process Transformer next activity predictor."
+            )
+        self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
         # Case attribute predictor is required (must be AttributeSimulationEngine)
         if case_attribute_predictor is None:
@@ -427,6 +510,16 @@ class DESEngine:
             availability_model=resource_allocator.availability if resource_allocator else None
         )
 
+        # Resource selection heuristic (R-RMA, R-RRA, or R-SHQ)
+        self._resource_strategy = resource_selection_strategy or RandomStrategy()
+
+        # Batch allocation policy (optional, overrides greedy waiting-queue logic)
+        self._batch_policy = batch_allocation_policy
+        self._pt_estimator = processing_time_estimator
+
+        # DRL allocation policy (optional, overrides both batch and greedy)
+        self._drl_policy = drl_policy
+
         # Output: collected events for export
         self.completed_events: List[Dict] = []
 
@@ -443,6 +536,24 @@ class DESEngine:
 
         # Profiler
         self.profiler = SimulationProfiler(enabled=enable_profiling)
+
+    @staticmethod
+    def _detect_process_transformer_predictor(
+        predictor,
+        predictor_type: Optional[NextActivityPredictorType],
+    ) -> bool:
+        """Best-effort detection of Process Transformer predictor wiring."""
+        if predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
+            return True
+        if predictor is None:
+            return False
+
+        cls = predictor.__class__
+        module_name = getattr(cls, "__module__", "")
+        class_name = getattr(cls, "__name__", "")
+        if "process_transformer_v2" in module_name:
+            return True
+        return class_name in {"PTActivityAdapter", "ProcessTransformerV2Predictor"}
     
     def _create_next_activity_predictor(
         self, 
@@ -507,8 +618,11 @@ class DESEngine:
             # This is a bit of a hack: The engine calls this method to get the *Activity* predictor.
             # But we also need to set the *Time* predictor.
             # Since we have reference to 'self', we can override it!
-            time_adapter = PTTimeAdapter(unified)
+            max_dur = config.get('pt_max_duration_seconds')
+            time_adapter = PTTimeAdapter(unified, max_duration_seconds=max_dur)
             self._processing_time = time_adapter
+            if max_dur:
+                logger.info(f"ProcessTransformerV2: Duration cap set to {max_dur/3600:.0f}h ({max_dur/86400:.0f} days)")
             logger.info("ProcessTransformerV2: Also registered as ProcessingTimePredictor.")
             
             return activity_adapter
@@ -738,6 +852,7 @@ class DESEngine:
         # Release the resource that completed this activity
         if event.resource:
             self.resource_pool.release(event.resource)
+            self._resource_strategy.notify_release(event.resource)
             # Try to dispatch waiting work now that this resource is free
             with self.profiler.measure("process_waiting_queue"):
                 self._process_waiting_queue(event.resource, event.timestamp)
@@ -758,8 +873,12 @@ class DESEngine:
             case.selected = attr.selected
             case.accepted = attr.accepted
 
+        completion_lifecycle = event.lifecycle
+        if self._pt_lifecycle_mode == "gt_activity_gated" and self._is_process_transformer_predictor:
+            completion_lifecycle = "complete"
+
         # Record activity in case history
-        case.add_activity(event.activity, event.resource, event.lifecycle)
+        case.add_activity(event.activity, event.resource, completion_lifecycle)
 
         # Safety guard: if a case keeps looping, stop it instead of hanging the run
         if self._max_activities_per_case and len(case.activity_history) >= self._max_activities_per_case:
@@ -768,6 +887,7 @@ class DESEngine:
                 f"ending to avoid infinite loop (last={case.activity_history[-1]})."
             )
             log_record = event.to_log_record()
+            log_record['lifecycle:transition'] = completion_lifecycle
             log_record.update(case.get_payload())
             self.completed_events.append(log_record)
             self._schedule_case_end(event.case_id, event.timestamp)
@@ -777,6 +897,7 @@ class DESEngine:
 
         # Log the event for export
         log_record = event.to_log_record()
+        log_record['lifecycle:transition'] = completion_lifecycle
         log_record.update(case.get_payload())
         self.completed_events.append(log_record)
 
@@ -796,6 +917,16 @@ class DESEngine:
 
         Tries to dispatch waiting work to the freed resource if it's eligible.
         """
+        # DRL policy overrides both batch and greedy
+        if self._drl_policy is not None:
+            self._process_waiting_queue_drl(freed_resource, current_time)
+            return
+
+        # Batch allocation policy overrides greedy logic
+        if self._batch_policy is not None:
+            self._process_waiting_queue_batch(freed_resource, current_time)
+            return
+
         # Check which activities have waiting work
         waiting_activities = self.resource_pool.get_all_waiting_activities()
         if not waiting_activities:
@@ -830,6 +961,9 @@ class DESEngine:
                     f"to {freed_resource} (waited {wait_seconds:.0f}s)"
                 )
 
+                # Track assignment for strategy (keeps SHQ counts accurate)
+                self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
                 # Schedule the activity with the freed resource
                 self._schedule_activity_with_resource(
                     waiting_work.case_id,
@@ -841,7 +975,304 @@ class DESEngine:
                 )
                 # Resource is now busy again, stop looking
                 return
-    
+
+    def _process_waiting_queue_batch(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        Batch-mode waiting-queue processing (1-Batch-1 / MSA).
+
+        Collects all waiting tasks, builds the eligible worker set, and
+        delegates to the configured BatchAllocationPolicy.  Only the
+        assignment for *freed_resource* is committed.
+        """
+        from resources.batch_policies import TaskInfo, WorkerInfo
+
+        # 1. Collect all waiting tasks
+        all_waiting = self.resource_pool.get_all_waiting_tasks()
+        if not all_waiting:
+            return
+
+        # 2. Build TaskInfo list
+        tasks: list[TaskInfo] = []
+        for w in all_waiting:
+            hours_waited = (current_time - w.arrival_time).total_seconds() / 3600.0
+            tasks.append(TaskInfo(
+                task_id=f"{w.case_id}::{w.allocation_activity}",
+                case_id=w.case_id,
+                activity=w.activity,
+                allocation_activity=w.allocation_activity,
+                hours_waited=max(0.0, hours_waited),
+            ))
+
+        # 3. Build eligible_map: allocation_activity -> set of eligible worker IDs
+        #    Cache per activity since many tasks share the same activity
+        eligible_map: dict[str, set[str]] = {}
+        unique_activities = {t.allocation_activity for t in tasks}
+
+        for act in unique_activities:
+            # Tier 1: permissions
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    act, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(act)
+
+            # Tier 2: availability (working hours)
+            available = {
+                r for r in eligible
+                if self.allocator.availability.is_available(r, current_time)
+            }
+            eligible_map[act] = available
+
+        # 3b. Scope to freed worker's competitive neighborhood
+        neighbor_tasks = {t.allocation_activity for t in tasks
+                         if freed_resource in eligible_map.get(t.allocation_activity, set())}
+        neighbor_workers: set[str] = set()
+        for act in neighbor_tasks:
+            neighbor_workers.update(eligible_map[act])
+        for act, workers_set in eligible_map.items():
+            if neighbor_workers & workers_set:
+                neighbor_tasks.add(act)
+        tasks = [t for t in tasks if t.allocation_activity in neighbor_tasks]
+        eligible_map = {act: ws for act, ws in eligible_map.items() if act in neighbor_tasks}
+
+        # 3c. Neighborhood too large — skip MILP entirely, dispatch greedily
+        if len(tasks) > 50:
+            sorted_tasks = sorted(tasks, key=lambda t: t.hours_waited, reverse=True)
+            for t in sorted_tasks:
+                if freed_resource in eligible_map.get(t.allocation_activity, set()):
+                    parts = t.task_id.split("::", 1)
+                    if len(parts) != 2:
+                        break
+                    case_id, allocation_activity = parts
+                    removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+                    if removed is None:
+                        break
+                    wait_seconds = (current_time - removed.arrival_time).total_seconds()
+                    self.stats['wait_time_total_seconds'] += wait_seconds
+                    logger.debug(
+                        "Neighborhood too large (%d tasks), greedy dispatch %s for case %s to %s (waited %.0fs)",
+                        len(tasks), removed.activity, removed.case_id, freed_resource, wait_seconds,
+                    )
+                    self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+                    self._batch_policy._diag_greedy_neighborhood_too_large += 1
+                    self._schedule_activity_with_resource(
+                        removed.case_id, removed.activity, removed.lifecycle, current_time,
+                        removed.case_state, freed_resource,
+                    )
+                    return
+            # No eligible task found for freed worker in this large neighborhood
+            return
+
+        # 4. Build WorkerInfo list: union of all eligible workers (including busy)
+        all_eligible_ids: set[str] = set()
+        for s in eligible_map.values():
+            all_eligible_ids.update(s)
+
+        workers: list[WorkerInfo] = []
+        for wid in all_eligible_ids:
+            busy_until = self.resource_pool.get_busy_until(wid)
+            if busy_until is not None:
+                remaining = max(0.0, (busy_until - current_time).total_seconds())
+            else:
+                remaining = 0.0
+            workers.append(WorkerInfo(worker_id=wid, remaining_busy_seconds=remaining))
+
+        # 5. Call batch policy
+        decision = self._batch_policy.decide(
+            freed_resource=freed_resource,
+            current_time_s=current_time.timestamp(),
+            tasks=tasks,
+            workers=workers,
+            eligible_map=eligible_map,
+            processing_time_fn=self._pt_estimator.estimate,
+        )
+
+        if decision is None:
+            logger.debug(
+                "Batch policy returned no assignment for %s at %s",
+                freed_resource, current_time,
+            )
+            return
+
+        # 6. Parse task_id -> (case_id, allocation_activity)
+        parts = decision.task_id.split("::", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid task_id from batch policy: %s", decision.task_id)
+            return
+        case_id, allocation_activity = parts
+
+        # Remove the task from its waiting queue
+        removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+        if removed is None:
+            logger.warning(
+                "Batch policy assigned task %s but it was not found in queue",
+                decision.task_id,
+            )
+            return
+
+        # Calculate wait time for stats
+        wait_seconds = (current_time - removed.arrival_time).total_seconds()
+        self.stats['wait_time_total_seconds'] += wait_seconds
+
+        logger.debug(
+            "Batch dispatching %s for case %s to %s (waited %.0fs)",
+            removed.activity, removed.case_id, freed_resource, wait_seconds,
+        )
+
+        # Track assignment for strategy (keeps SHQ counts accurate)
+        self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
+        # Schedule the activity with the freed resource
+        self._schedule_activity_with_resource(
+            removed.case_id,
+            removed.activity,
+            removed.lifecycle,
+            current_time,
+            removed.case_state,
+            freed_resource,
+        )
+
+    def _process_waiting_queue_drl(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        DRL-mode waiting-queue processing.
+
+        Builds TaskInfo list and eligible_map (no neighborhood scoping),
+        applies auto-postpone filter, then delegates to the DRL policy.
+        """
+        from resources.batch_policies import TaskInfo
+
+        # 1. Collect all waiting tasks
+        all_waiting = self.resource_pool.get_all_waiting_tasks()
+        if not all_waiting:
+            return
+
+        # 2. Build TaskInfo list
+        tasks: list[TaskInfo] = []
+        for w in all_waiting:
+            hours_waited = (current_time - w.arrival_time).total_seconds() / 3600.0
+            tasks.append(TaskInfo(
+                task_id=f"{w.case_id}::{w.allocation_activity}",
+                case_id=w.case_id,
+                activity=w.activity,
+                allocation_activity=w.allocation_activity,
+                hours_waited=max(0.0, hours_waited),
+            ))
+
+        # 3. Build eligible_map (no neighborhood scoping for DRL)
+        eligible_map: dict[str, set[str]] = {}
+        unique_activities = {t.allocation_activity for t in tasks}
+
+        for act in unique_activities:
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    act, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(act)
+
+            available = {
+                r for r in eligible
+                if self.allocator.availability.is_available(r, current_time)
+            }
+            eligible_map[act] = available
+
+        # 4. Auto-postpone: skip decide() if freed resource can't serve any waiting activity
+        any_feasible = any(
+            freed_resource in eligible_map.get(t.allocation_activity, set())
+            for t in tasks
+        )
+        if not any_feasible:
+            return
+
+        # 5. Provide engine state to policy (for observation building)
+        if hasattr(self._drl_policy, 'set_engine_state'):
+            self._drl_policy.set_engine_state(self.resource_pool, self.case_manager)
+
+        # 6. Build pool snapshot for training bridge (InteractiveBatchPolicy)
+        pool_snapshot = self._build_pool_snapshot()
+        waiting_activities = {t.allocation_activity for t in tasks if self.resource_pool.has_waiting_work(t.allocation_activity)}
+
+        # 7. Call policy
+        decision = self._drl_policy.decide(
+            freed_resource=freed_resource,
+            current_time_s=current_time.timestamp(),
+            tasks=tasks,
+            workers=[],  # Not used by DRL policy
+            eligible_map=eligible_map,
+            processing_time_fn=lambda w, a: 0.0,  # Not used by DRL policy
+            current_time_dt=current_time,
+            waiting_activities=waiting_activities,
+            pool_snapshot=pool_snapshot,
+            active_case_count=self.case_manager.active_count(),
+        )
+
+        if decision is None:
+            return
+
+        # 8. Parse task_id and dispatch
+        parts = decision.task_id.split("::", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid task_id from DRL policy: %s", decision.task_id)
+            return
+        case_id, allocation_activity = parts
+
+        removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+        if removed is None:
+            logger.warning(
+                "DRL policy assigned task %s but it was not found in queue",
+                decision.task_id,
+            )
+            return
+
+        wait_seconds = (current_time - removed.arrival_time).total_seconds()
+        self.stats['wait_time_total_seconds'] += wait_seconds
+
+        logger.debug(
+            "DRL dispatching %s for case %s to %s (waited %.0fs)",
+            removed.activity, removed.case_id, freed_resource, wait_seconds,
+        )
+
+        self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
+        self._schedule_activity_with_resource(
+            removed.case_id,
+            removed.activity,
+            removed.lifecycle,
+            current_time,
+            removed.case_state,
+            freed_resource,
+        )
+
+    def _build_pool_snapshot(self) -> dict:
+        """Serialize resource pool state into plain dicts for thread-safe access."""
+        busy = {}
+        for res_id, (busy_until, case_id, activity) in self.resource_pool._busy_resources.items():
+            busy[res_id] = {
+                "busy_until": busy_until,
+                "case_id": case_id,
+                "activity": activity,
+            }
+
+        waiting = {}
+        for act, queue_items in self.resource_pool._waiting_queues.items():
+            if queue_items:
+                waiting[act] = [
+                    {
+                        "case_id": w.case_id,
+                        "activity": w.activity,
+                        "allocation_activity": w.allocation_activity,
+                        "arrival_time": w.arrival_time,
+                    }
+                    for w in queue_items
+                ]
+
+        return {"busy_resources": busy, "waiting_queues": waiting}
+
     def _on_case_end(self, event: SimulationEvent) -> None:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1
@@ -905,18 +1336,48 @@ class DESEngine:
 
     def _normalize_activity_for_resources(self, activity: str) -> str:
         """Normalize activity labels to match the resource permission model."""
-        # Do not normalize control-flow artifacts (already treated as resource-free)
-        if not activity or activity.startswith('DP ') or activity.startswith('PG '):
+        return self._normalize_activity_label(activity)
+
+    def _normalize_activity_label(self, activity: Optional[str]) -> Optional[str]:
+        """Normalize labels by removing loop suffixes (e.g. 'X 2' -> 'X')."""
+        if not activity:
+            return activity
+        if activity.startswith('DP ') or activity.startswith('PG '):
             return activity
 
-        # Many parts of this project generate duplicate labels to avoid loops
-        # (e.g., "W_Complete application 1", "A_Cancelled 2").
-        # The permission model is typically trained on the base label.
-        parts = activity.rsplit(' ', 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            base = parts[0].strip()
-            return base or activity
-        return activity
+        normalized = re.sub(r"\s+\d+$", "", activity).strip()
+        return normalized or activity
+
+    def _should_emit_pt_gt_start(self, activity: Optional[str]) -> bool:
+        """Return True if this activity gets a synthetic start in PT GT-gated mode."""
+        if self._pt_lifecycle_mode != "gt_activity_gated":
+            return False
+        if not self._is_process_transformer_predictor:
+            return False
+        normalized = self._normalize_activity_label(activity)
+        return normalized in self.PT_GT_START_ACTIVITIES
+
+    def _append_synthetic_start_record(
+        self,
+        case_id: str,
+        activity: str,
+        resource: Optional[str],
+        timestamp: datetime,
+        case: CaseState,
+    ) -> None:
+        """Append synthetic 'start' event directly to export records."""
+        if not self._should_emit_pt_gt_start(activity):
+            return
+
+        log_record = {
+            'case:concept:name': case_id,
+            'concept:name': activity,
+            'org:resource': resource,
+            'time:timestamp': timestamp,
+            'lifecycle:transition': 'start',
+        }
+        log_record.update(case.get_payload())
+        self.completed_events.append(log_record)
 
     def _schedule_activity_without_resource(
         self,
@@ -960,6 +1421,7 @@ class DESEngine:
             processing_seconds = 0.0
 
         completion_time = current_time + timedelta(seconds=processing_seconds)
+        self._append_synthetic_start_record(case_id, activity, None, current_time, case)
 
         event = SimulationEvent(
             timestamp=completion_time,
@@ -1011,9 +1473,10 @@ class DESEngine:
             # Everyone qualified is busy
             return None, 'all_busy'
 
-        # Select randomly from truly available resources
-        import random
-        return random.choice(truly_available), None
+        # Apply resource selection heuristic (R-RMA / R-RRA / R-SHQ)
+        selected = self._resource_strategy.select(truly_available, activity)
+        self._resource_strategy.notify_assignment(selected, activity)
+        return selected, None
 
     def _schedule_activity_with_resource(self, case_id: str, activity: str, lifecycle: str,
                                           current_time: datetime, case: CaseState,
@@ -1068,6 +1531,7 @@ class DESEngine:
         else:
             resource_release_time = completion_time
         self.resource_pool.mark_busy(resource, resource_release_time, case_id, activity)
+        self._append_synthetic_start_record(case_id, activity, resource, current_time, case)
 
         # Schedule completion event
         event = SimulationEvent(
@@ -1238,6 +1702,49 @@ class DESEngine:
         final_waiting = self.resource_pool.get_total_waiting_count()
         drained = initial_waiting - final_waiting
         logger.info(f"Drain phase complete: {drained} cases dispatched, {final_waiting} remaining")
+
+
+# ---------------------------------------------------------------------------
+# Training DES Engine — subclass for DRL training
+# ---------------------------------------------------------------------------
+
+class TrainingDESEngine(DESEngine):
+    """
+    DESEngine subclass that captures per-case cycle times for reward computation.
+
+    Used during DRL training: the Gym env reads completed case cycle times
+    via pop_completed_cases() after each decision step.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._completed_cycle_times: list[float] = []
+        self._lock = threading.Lock()
+
+    def _on_case_end(self, event: SimulationEvent) -> None:
+        """Override: capture cycle time before cleanup."""
+        case = self.case_manager.get_case(event.case_id)
+        if case and case.start_time:
+            ct_hours = (event.timestamp - case.start_time).total_seconds() / 3600.0
+            with self._lock:
+                self._completed_cycle_times.append(ct_hours)
+        super()._on_case_end(event)
+
+    def pop_completed_cases(self) -> list[float]:
+        """Return and clear accumulated cycle times (thread-safe)."""
+        with self._lock:
+            times = self._completed_cycle_times[:]
+            self._completed_cycle_times.clear()
+        return times
+
+    def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
+        """Override: signal episode end to DRL bridge after run completes."""
+        try:
+            result = super().run(num_cases=num_cases, max_time=max_time)
+        finally:
+            if self._drl_policy is not None and hasattr(self._drl_policy, 'signal_episode_end'):
+                self._drl_policy.signal_episode_end()
+        return result
 
 
 # Stub predictors for testing/fallback

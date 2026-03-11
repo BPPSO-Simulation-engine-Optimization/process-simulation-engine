@@ -27,6 +27,10 @@ class SimulationConfig:
     next_activity_lifecycle_variant: Optional[str] = None  # "start_complete" or "full_lifecycle"
     next_activity_hf_repo: Optional[str] = None  # Override HuggingFace repo for lifecycle_dual download
     next_activity_temperature: float = 1.0
+    # PT-only lifecycle logging mode (ignored unless next_activity_class is process_transformer)
+    pt_lifecycle_mode: Literal["native", "gt_activity_gated"] = "native"
+    # Max PT duration cap in seconds (prevents outlier durations from cascading queue buildup)
+    pt_max_duration_seconds: Optional[float] = None
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
@@ -48,6 +52,18 @@ class SimulationConfig:
     case_attribute_offer_activity: str = "O_Create Offer"
     case_attribute_monthly_artifact_path: Optional[str] = None
     case_attribute_retrain: bool = False  # If True, retrain from df instead of using cached artifacts
+
+    # Resource selection strategy (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)
+    resource_selection_strategy: Literal["random", "round_robin", "shortest_queue"] = "random"
+
+    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy, "drl" uses trained PPO
+    resource_allocation_mode: Literal["greedy", "batch", "drl"] = "greedy"
+    # Batch policy (only when resource_allocation_mode="batch")
+    batch_policy: Literal["1_batch_1"] = "1_batch_1"
+    # DRL policy settings (only when resource_allocation_mode="drl")
+    drl_model_path: Optional[str] = "models/drl_allocation/drl_allocation_model"
+    drl_deterministic: bool = True
+    drl_reward_tau: float = 100.0
 
     # Global settings
     event_log_path: Optional[str] = None

@@ -31,6 +31,7 @@ from integration.config import SimulationConfig
 from integration.setup import setup_simulation
 from simulation.engine import DESEngine, NextActivityPredictorType
 from simulation.log_exporter import LogExporter
+from resources.selection_strategies import create_strategy
 
 
 def load_event_log(path: str) -> pd.DataFrame:
@@ -105,6 +106,15 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Processing time mode: {config.processing_time_mode}")
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
+    print(f"  Resource selection: {config.resource_selection_strategy}")
+    print(f"  Resource allocation mode: {config.resource_allocation_mode}")
+    if config.next_activity_class == "process_transformer":
+        print(f"  PT lifecycle mode: {config.pt_lifecycle_mode}")
+        print(f"  PT max duration: {config.pt_max_duration_seconds / 3600:.0f}h ({config.pt_max_duration_seconds / 86400:.0f} days)")
+    if config.resource_allocation_mode == "batch":
+        print(f"  Batch policy: {config.batch_policy}")
+    elif config.resource_allocation_mode == "drl":
+        print(f"  DRL model: {config.drl_model_path}")
     print(f"  Number of cases: {config.num_cases}")
     print("=" * 60 + "\n")
 
@@ -141,15 +151,64 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     if config.next_activity_class == "process_transformer":
         pred_type = NextActivityPredictorType.PROCESS_TRANSFORMER
 
+    # Create resource selection strategy
+    resource_strategy = create_strategy(config.resource_selection_strategy)
+
+    # Create batch allocation policy (if requested)
+    batch_policy = None
+    pt_estimator = None
+    if config.resource_allocation_mode == "batch":
+        from resources.batch_policies import create_batch_policy
+        from resources.processing_time_estimator import ProcessingTimeEstimator
+
+        batch_policy = create_batch_policy(config.batch_policy)
+        pt_estimator = ProcessingTimeEstimator(df=df)
+        print(f"Created batch policy: {config.batch_policy}")
+
+    # Create DRL allocation policy (if requested)
+    drl_policy = None
+    if config.resource_allocation_mode == "drl":
+        import pickle
+        from resources.drl_state import DRLStateBuilder
+        from resources.drl_policy import DRLAllocationPolicy
+
+        model_path = config.drl_model_path
+        config_path = os.path.join(os.path.dirname(model_path), "state_builder_config.pkl")
+
+        with open(config_path, "rb") as f:
+            sb_config = pickle.load(f)
+
+        state_builder = DRLStateBuilder(
+            activity_list=sb_config["activity_list"],
+            role_groups=sb_config["role_groups"],
+            resource_to_role=sb_config["resource_to_role"],
+            activity_to_roles=sb_config["activity_to_roles"],
+        )
+
+        drl_policy = DRLAllocationPolicy(
+            model_path=model_path,
+            state_builder=state_builder,
+            deterministic=config.drl_deterministic,
+        )
+        print(f"Created DRL policy from: {model_path}")
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
         next_activity_predictor=next_act_pred,  # May be None for auto-load or if delegated
         next_activity_predictor_type=pred_type,  # Explicit type trigger if predictor is None
-        next_activity_config={'temperature': config.next_activity_temperature},
+        next_activity_config={
+            'temperature': config.next_activity_temperature,
+            'pt_max_duration_seconds': config.pt_max_duration_seconds,
+        },
+        pt_lifecycle_mode=config.pt_lifecycle_mode,
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
+        resource_selection_strategy=resource_strategy,
+        batch_allocation_policy=batch_policy,
+        processing_time_estimator=pt_estimator,
+        drl_policy=drl_policy,
         enable_profiling=enable_profiling,
     )
 
@@ -166,6 +225,9 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Outside hours: {engine.stats['outside_hours_count']}")
     print(f"  No eligible: {engine.stats['no_eligible_failures']}")
     print("=" * 60)
+
+    if batch_policy is not None and hasattr(batch_policy, 'print_diagnostics_summary'):
+        batch_policy.print_diagnostics_summary()
 
     # Export results
     os.makedirs(output_dir, exist_ok=True)
@@ -229,6 +291,18 @@ def main():
         help="Sampling temperature for next activity prediction (process_transformer only)"
     )
     parser.add_argument(
+        "--pt-lifecycle-mode",
+        choices=["native", "gt_activity_gated"],
+        default="native",
+        help="PT-only lifecycle logging mode: native predictor output, or GT activity-gated synthetic starts"
+    )
+    parser.add_argument(
+        "--pt-max-duration-days",
+        type=float,
+        default=30.0,
+        help="Max PT duration cap in days (prevents outlier durations from cascading queue buildup, default: 30)"
+    )
+    parser.add_argument(
         "--event-log",
         default="Dataset/BPI Challenge 2017.xes",
         help="Path to event log file"
@@ -250,12 +324,36 @@ def main():
         help="Enable verbose logging"
     )
     parser.add_argument(
+        "--resource-strategy",
+        choices=["random", "round_robin", "shortest_queue"],
+        default="random",
+        help="Resource selection heuristic (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)"
+    )
+    parser.add_argument(
+        "--resource-allocation-mode",
+        choices=["greedy", "batch", "drl"],
+        default="greedy",
+        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1, drl=trained PPO)"
+    )
+    parser.add_argument(
+        "--drl-model-path",
+        default="models/drl_allocation/drl_allocation_model",
+        help="Path to trained DRL model (for --resource-allocation-mode drl)"
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable performance profiling of simulation components"
     )
 
     args = parser.parse_args()
+
+    if args.pt_lifecycle_mode == "gt_activity_gated" and args.next_activity != "process_transformer":
+        raise ValueError(
+            "--pt-lifecycle-mode=gt_activity_gated is only valid with "
+            "--next-activity process_transformer. "
+            "Use --pt-lifecycle-mode native for non-PT predictors."
+        )
 
     # Setup logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -295,6 +393,8 @@ def main():
 
     # Map CLI next-activity choice to config fields
     config.next_activity_temperature = args.temperature
+    config.pt_lifecycle_mode = args.pt_lifecycle_mode
+    config.pt_max_duration_seconds = args.pt_max_duration_days * 24 * 3600
     if args.next_activity == "lifecycle_dual_start_complete_baseline":
         config.next_activity_class = "lifecycle_dual"
         config.next_activity_lifecycle_variant = "start_complete"
@@ -305,6 +405,12 @@ def main():
         config.next_activity_model_path = "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"
     else:
         config.next_activity_class = args.next_activity  # "lstm" or "process_transformer"
+
+    config.num_cases = num_cases
+    config.resource_selection_strategy = args.resource_strategy
+    config.resource_allocation_mode = args.resource_allocation_mode
+    if hasattr(args, 'drl_model_path') and args.drl_model_path:
+        config.drl_model_path = args.drl_model_path
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)
