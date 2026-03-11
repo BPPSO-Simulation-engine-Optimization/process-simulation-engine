@@ -1530,6 +1530,14 @@ class DESEngine:
         processing_time = timedelta(seconds=processing_seconds)
         completion_time = current_time + processing_time
 
+        # NOTE: Completion clamping to resource working hours was tried and reverted.
+        # Per-resource clamping created a ~3500-event spike at 7 AM (first available hour)
+        # and inflated TPT by ~100h (548→648h vs GT 526h). The processing time predictor
+        # already embeds overnight gaps in its inter-event predictions, so clamping
+        # double-counts the delay. See commit history on fix/event_distribution branch.
+        # Future work: "pause clock" approach that subtracts off-hours from predicted
+        # duration rather than shifting completion forward.
+
         # Resource is only busy for actual work duration, not the full inter-event time
         if hasattr(self._processing_time, 'predict_resource_hold_time'):
             resource_hold_seconds = self._processing_time.predict_resource_hold_time(activity, resource)
