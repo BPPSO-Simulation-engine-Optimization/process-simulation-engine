@@ -272,18 +272,42 @@ def _generate_basic_arrivals(
     start_date: datetime,
     seed: int = 42,
 ) -> List[datetime]:
-    """Generate basic random arrival timestamps."""
+    """Generate basic random arrival timestamps during business hours only (Mon-Fri 8-17)."""
     rng = random.Random(seed)
     timestamps = []
     current_time = start_date
+
+    # Snap start to business hours if needed
+    current_time = _snap_to_business_hours(current_time)
 
     for _ in range(num_cases):
         # Random 1-30 minutes between cases
         minutes = rng.randint(1, 30)
         current_time = current_time + timedelta(minutes=minutes)
+        # Ensure arrival falls within business hours
+        current_time = _snap_to_business_hours(current_time)
         timestamps.append(current_time)
 
     return timestamps
+
+
+def _snap_to_business_hours(dt: datetime, start_hour: int = 8, end_hour: int = 17) -> datetime:
+    """Snap a datetime to the next business hour if it falls outside Mon-Fri 8-17."""
+    weekday = dt.weekday()
+    hour = dt.hour
+
+    if weekday < 5 and start_hour <= hour < end_hour:
+        return dt  # Already in business hours
+
+    # Before start on a weekday
+    if weekday < 5 and hour < start_hour:
+        return dt.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+
+    # After end or weekend — advance to next working day
+    next_dt = (dt + timedelta(days=1)).replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    while next_dt.weekday() >= 5:
+        next_dt += timedelta(days=1)
+    return next_dt
 
 
 class _StubProcessingTimePredictor:
