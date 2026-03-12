@@ -5,7 +5,7 @@ Provides a dataclass to configure basic vs advanced mode for each prediction com
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 
 @dataclass
@@ -48,6 +48,11 @@ class SimulationConfig:
     case_attribute_offer_activity: str = "O_Create Offer"
     case_attribute_monthly_artifact_path: Optional[str] = None
     case_attribute_retrain: bool = False  # If True, retrain from df instead of using cached artifacts
+
+    # Resource allocation: resources to forbid (never allocated)
+    exclude_resources: Optional[List[str]] = field(
+        default_factory=lambda: ["User_111", "User_139"]
+    )
 
     # Global settings
     event_log_path: Optional[str] = None

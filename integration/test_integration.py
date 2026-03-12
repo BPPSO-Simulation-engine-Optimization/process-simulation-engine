@@ -48,12 +48,24 @@ def load_event_log(path: str) -> pd.DataFrame:
     return df
 
 
-def create_resource_allocator(log_path: str):
+def create_resource_allocator(log_path: str, config: SimulationConfig):
     """Create resource allocator from event log."""
     try:
         from resources import ResourceAllocator
-        allocator = ResourceAllocator(log_path=log_path)
-        print("Loaded ResourceAllocator from event log")
+        from resources.resource_permissions.resource_permissions import BasicResourcePermissions
+
+        exclude = getattr(config, "exclude_resources", None) or []
+        if exclude:
+            perms = BasicResourcePermissions(log_path=log_path, exclude_resources=exclude)
+            allocator = ResourceAllocator(
+                log_path=log_path,
+                permission_method="basic",
+                permissions_model=perms,
+            )
+            print(f"Loaded ResourceAllocator (excluded {len(exclude)} resources: {exclude[0]}..{exclude[-1]})")
+        else:
+            allocator = ResourceAllocator(log_path=log_path)
+            print("Loaded ResourceAllocator from event log")
         return allocator
     except Exception as e:
         raise Exception(f"Could not load ResourceAllocator: {e}")
@@ -106,6 +118,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Number of cases: {config.num_cases}")
+    excl = getattr(config, "exclude_resources", None) or []
+    print(f"  Excluded resources: {len(excl)} (User_111, User_139)" if excl else "  Excluded resources: none")
     print("=" * 60 + "\n")
 
     # Get start date from event log
@@ -249,6 +263,11 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--no-exclude-resources",
+        action="store_true",
+        help="Do not exclude resources User_111, User_139 (default: excluded)"
+    )
 
     args = parser.parse_args()
 
@@ -334,9 +353,11 @@ def main():
         config.next_activity_model_path = selected_model_path
 
     config.num_cases = num_cases
+    if args.no_exclude_resources:
+        config.exclude_resources = []
 
     # Create resource allocator
-    allocator = create_resource_allocator(args.event_log)
+    allocator = create_resource_allocator(args.event_log, config)
 
     # Save ground truth subset for comparison
     print(f"\nSaving ground truth subset ({num_cases} cases) for comparison...")
