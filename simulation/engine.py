@@ -26,6 +26,7 @@ Resource Allocation Model:
 This creates realistic resource contention and waiting times.
 """
 
+import os
 import time
 import uuid
 import random
@@ -36,11 +37,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import List, Dict, Optional, Protocol, Set
+from typing import List, Dict, Optional, Protocol, Set, Tuple
 from collections import defaultdict
 import heapq
 
+import numpy as np
 import pandas as pd
+import scipy.stats
 
 from .events import SimulationEvent, EventType
 from .event_queue import EventQueue
@@ -407,7 +410,7 @@ class DESEngine:
         case_arrival_predictor: CaseArrivalPredictor = None,
         case_attribute_predictor: CaseAttributePredictor = None,
         start_time: datetime = None,
-        max_activities_per_case: int = 500,
+        max_activities_per_case: int = 100,
         resource_selection_strategy: ResourceSelectionStrategy = None,
         batch_allocation_policy=None,
         processing_time_estimator=None,
@@ -536,6 +539,42 @@ class DESEngine:
 
         # Profiler
         self.profiler = SimulationProfiler(enabled=enable_profiling)
+
+        # Per-transition P99 duration caps and activity whitelist
+        self._transition_p99_caps, self._valid_activities = self._load_transition_caps()
+
+        # Per-activity repetition limit (GT max is ~10-12 for W_ activities)
+        self._max_activity_repeats = 15
+
+    @staticmethod
+    def _load_transition_caps() -> Tuple[Dict[tuple, float], Set[str]]:
+        """Load per-transition P99 caps from the distribution model.
+
+        Returns (transition_key → P99_seconds, set_of_valid_activities).
+        If the model file is missing, returns empty structures (no caps applied).
+        """
+        model_path = os.path.join("models", "processing_time_model_complete_only_distributions.joblib")
+        if not os.path.exists(model_path):
+            logger.warning("Distribution model not found at %s — P99 caps disabled", model_path)
+            return {}, set()
+
+        import joblib
+        dist_params = joblib.load(model_path)
+
+        caps: Dict[tuple, float] = {}
+        activities: Set[str] = set()
+        for key, params in dist_params.items():
+            mu, sigma = float(params["mu"]), float(params["sigma"])
+            p99 = float(scipy.stats.lognorm(s=sigma, scale=np.exp(mu)).ppf(0.99))
+            caps[key] = p99
+            activities.add(key[0])
+            activities.add(key[2])
+
+        logger.info(
+            "Loaded P99 caps for %d transitions, %d valid activities",
+            len(caps), len(activities),
+        )
+        return caps, activities
 
     @staticmethod
     def _detect_process_transformer_predictor(
@@ -909,6 +948,16 @@ class DESEngine:
         # Predict next activity
         with self.profiler.measure("next_activity.predict"):
             next_activity, next_lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
+
+        # Guard: cap per-activity repetitions to prevent runaway loops
+        if not is_end:
+            activity_count = case.activity_history.count(next_activity)
+            if activity_count >= self._max_activity_repeats:
+                logger.warning(
+                    "Case %s: %s repeated %d times, forcing end",
+                    event.case_id, next_activity, activity_count,
+                )
+                is_end = True
 
         if is_end:
             self._schedule_case_end(event.case_id, event.timestamp)
@@ -1527,6 +1576,24 @@ class DESEngine:
                 curr_lifecycle=lifecycle,
                 context=context,
             )
+
+        # Apply per-transition P99 cap from GT distributions
+        if self._transition_p99_caps:
+            transition_key = (prev_activity, prev_lifecycle, activity, lifecycle)
+            cap = self._transition_p99_caps.get(transition_key)
+            if cap is None:
+                # Fallback: match by activity pair, ignoring lifecycle
+                for key, val in self._transition_p99_caps.items():
+                    if key[0] == prev_activity and key[2] == activity:
+                        cap = val
+                        break
+            if cap is not None and processing_seconds > cap:
+                logger.debug(
+                    "P99 cap: %s→%s capped %.1fs → %.1fs",
+                    prev_activity, activity, processing_seconds, cap,
+                )
+                processing_seconds = cap
+
         processing_time = timedelta(seconds=processing_seconds)
         completion_time = current_time + processing_time
 
