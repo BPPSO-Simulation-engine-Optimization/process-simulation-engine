@@ -119,7 +119,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Number of cases: {config.num_cases}")
     excl = getattr(config, "exclude_resources", None) or []
-    print(f"  Excluded resources: {len(excl)} (User_111, User_139)" if excl else "  Excluded resources: none")
+    print(f"  Excluded resources: {len(excl)} {excl}" if excl else "  Excluded resources: none")
     print("=" * 60 + "\n")
 
     # Get start date from event log
@@ -232,9 +232,13 @@ def main():
     )
     parser.add_argument(
         "--next-activity",
-        choices=["lstm", "process_transformer", "lifecycle_dual_full_baseline", "lifecycle_dual_start_complete_baseline"],
-        default="lstm",
-        help="Next activity predictor implementation"
+        choices=[
+            "lstm", "process_transformer",
+            "lifecycle_dual_full_baseline", "lifecycle_dual_full_balanced",
+            "lifecycle_dual_start_complete_baseline",
+        ],
+        default="lifecycle_dual_start_complete_baseline",
+        help="Next activity predictor (default: dual start_complete NAP)"
     )
     parser.add_argument(
         "--temperature",
@@ -255,8 +259,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        default="integration/output",
-        help="Output directory for simulated log"
+        default=None,
+        help="Output directory for simulated log (default: integration/output or integration/output/<predictor> for dual predictors)"
     )
     parser.add_argument(
         "--verbose",
@@ -266,10 +270,22 @@ def main():
     parser.add_argument(
         "--no-exclude-resources",
         action="store_true",
-        help="Do not exclude resources User_111, User_139 (default: excluded)"
+        help="Do not exclude resources (default: all allowed; use config to exclude)"
+    )
+    parser.add_argument(
+        "--exclude-resources",
+        type=str,
+        default=None,
+        help="Comma-separated resource names to exclude (e.g. User_102,User_144)"
     )
 
     args = parser.parse_args()
+
+    if args.output_dir is None:
+        if args.next_activity == "lifecycle_dual_full_balanced":
+            args.output_dir = "integration/output/full_lifecycle_balanced"
+        else:
+            args.output_dir = "integration/output"
 
     # Setup logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -334,6 +350,23 @@ def main():
         config.next_activity_mode = "advanced"
         config.next_activity_model_type = "lifecycle_dual"
         config.next_activity_model_path = selected_model_path
+    elif args.next_activity == "lifecycle_dual_full_balanced":
+        candidate_model_paths = [
+            "next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced",
+            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced",
+        ]
+        selected_model_path = None
+        for candidate in candidate_model_paths:
+            if Path(candidate).exists():
+                selected_model_path = candidate
+                break
+        if selected_model_path is None:
+            selected_model_path = candidate_model_paths[0]
+
+        config.next_activity_class = "lstm"
+        config.next_activity_mode = "advanced"
+        config.next_activity_model_type = "lifecycle_dual"
+        config.next_activity_model_path = selected_model_path
     elif args.next_activity == "lifecycle_dual_start_complete_baseline":
         candidate_model_paths = [
             "next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
@@ -355,6 +388,8 @@ def main():
     config.num_cases = num_cases
     if args.no_exclude_resources:
         config.exclude_resources = []
+    elif args.exclude_resources:
+        config.exclude_resources = [r.strip() for r in args.exclude_resources.split(",") if r.strip()]
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log, config)

@@ -49,10 +49,8 @@ class SimulationConfig:
     case_attribute_monthly_artifact_path: Optional[str] = None
     case_attribute_retrain: bool = False  # If True, retrain from df instead of using cached artifacts
 
-    # Resource allocation: resources to forbid (never allocated)
-    exclude_resources: Optional[List[str]] = field(
-        default_factory=lambda: ["User_111", "User_139"]
-    )
+    # Resource allocation: resources to forbid (never allocated); default: none
+    exclude_resources: Optional[List[str]] = field(default_factory=list)
 
     # Global settings
     event_log_path: Optional[str] = None
