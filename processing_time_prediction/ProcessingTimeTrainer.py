@@ -883,11 +883,108 @@ class ProcessingTimeTrainer:
         print("Model training completed!")
         print("="*80)
 
-    def train_XG_
+    def extract_resource_hold_times(self) -> Dict:
+        """
+        Extract actual work burst durations from the full event log.
 
+        A work burst is a start→suspend, resume→suspend, or resume→complete segment —
+        the period a resource is actively working before putting the work item down.
+        For activities with only start→complete (no suspend/resume), the start→complete
+        duration is used as the work burst.
 
+        Returns a dict mapping (activity, resource) → {'mu': float, 'sigma': float, 'count': int}
+        with lognormal distribution parameters, plus activity-level and global fallbacks.
+        """
+        df = self.data_log_df.copy()
+        if "time:timestamp" in df.columns:
+            df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], errors="coerce")
+        df = df.dropna(subset=["time:timestamp"])
+        df = df.sort_values(["case:concept:name", "time:timestamp"])
 
+        # Collect work burst durations
+        bursts = []  # list of (activity, resource, duration_seconds)
 
+        for case_id, case_data in df.groupby("case:concept:name"):
+            case_data = case_data.reset_index(drop=True)
+            # Track open work segments per activity within a case
+            # A work segment starts at 'start' or 'resume' and ends at 'suspend' or 'complete'
+            open_segments = {}  # activity -> (start_time, resource)
+
+            for _, event in case_data.iterrows():
+                activity = str(event["concept:name"])
+                lifecycle = str(event.get("lifecycle:transition", "complete")).lower()
+                timestamp = event["time:timestamp"]
+                resource = str(event.get("org:resource", "unknown")) if not pd.isna(event.get("org:resource")) else "unknown"
+
+                if lifecycle in ("start", "resume"):
+                    open_segments[activity] = (timestamp, resource)
+                elif lifecycle in ("suspend", "complete"):
+                    if activity in open_segments:
+                        seg_start, seg_resource = open_segments.pop(activity)
+                        duration = (timestamp - seg_start).total_seconds()
+                        if 0 < duration < 86400:  # sanity: < 24h for a single burst
+                            bursts.append((activity, seg_resource, duration))
+
+        if not bursts:
+            print("WARNING: No work bursts found. Using default resource hold times.")
+            return {'distributions': {}, 'activity_distributions': {}, 'global_mu': np.log(60), 'global_sigma': 1.0}
+
+        burst_df = pd.DataFrame(bursts, columns=["activity", "resource", "duration"])
+        print(f"Extracted {len(burst_df)} work bursts from {burst_df['activity'].nunique()} activities")
+
+        # Fit lognormal per (activity, resource)
+        distributions = {}
+        for (act, res), group in burst_df.groupby(["activity", "resource"]):
+            durations = group["duration"].values
+            if len(durations) < 3:
+                continue
+            log_d = np.log(durations)
+            mu = float(np.mean(log_d))
+            sigma = max(float(np.std(log_d, ddof=1)), 1e-6)
+            distributions[(act, res)] = {
+                'mu': mu, 'sigma': sigma, 'count': len(durations),
+                'mean': float(np.mean(durations)), 'median': float(np.median(durations)),
+            }
+
+        # Activity-level fallback
+        activity_distributions = {}
+        for act, group in burst_df.groupby("activity"):
+            durations = group["duration"].values
+            if len(durations) < 3:
+                continue
+            log_d = np.log(durations)
+            mu = float(np.mean(log_d))
+            sigma = max(float(np.std(log_d, ddof=1)), 1e-6)
+            activity_distributions[act] = {
+                'mu': mu, 'sigma': sigma, 'count': len(durations),
+                'mean': float(np.mean(durations)), 'median': float(np.median(durations)),
+            }
+
+        # Global fallback
+        all_durations = burst_df["duration"].values
+        log_all = np.log(all_durations)
+        global_mu = float(np.mean(log_all))
+        global_sigma = max(float(np.std(log_all, ddof=1)), 1e-6)
+
+        print(f"Fitted {len(distributions)} (activity, resource) distributions")
+        print(f"Fitted {len(activity_distributions)} activity-level distributions")
+        for act, info in sorted(activity_distributions.items()):
+            print(f"  {act}: {info['count']} bursts, mean={info['mean']:.1f}s ({info['mean']/60:.1f}min), median={info['median']:.1f}s")
+        print(f"Global: mean={float(np.mean(all_durations)):.1f}s, median={float(np.median(all_durations)):.1f}s")
+
+        return {
+            'distributions': distributions,
+            'activity_distributions': activity_distributions,
+            'global_mu': global_mu,
+            'global_sigma': global_sigma,
+        }
+
+    def save_resource_hold_model(self, filepath: str):
+        """Extract and save resource hold time model to disk."""
+        hold_data = self.extract_resource_hold_times()
+        joblib.dump(hold_data, filepath)
+        print(f"Resource hold time model saved to {filepath}")
+        return hold_data
 
     def train(self, cache_path: Optional[str] = None, force_recompute: bool = False):
         """

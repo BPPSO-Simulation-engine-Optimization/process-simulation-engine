@@ -229,6 +229,17 @@ joblib>=1.3.0
 openpyxl>=3.1.0     # For Excel export
 ```
 
+### Process Transformer Lifecycle Mode (Optional)
+
+When running with `--next-activity process_transformer`, you can choose PT-specific lifecycle logging behavior:
+
+- `--pt-lifecycle-mode native` (default): preserve current behavior.
+- `--pt-lifecycle-mode gt_activity_gated`: synthesize `start` only for GT start-capable workflow activities and log completions as `complete`.
+
+Important:
+- This flag is PT-only by design.
+- Using `--pt-lifecycle-mode gt_activity_gated` with a non-PT predictor raises a fast `ValueError`.
+
 ---
 
 ## Project Structure

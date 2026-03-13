@@ -29,6 +29,7 @@ class SimulationEvent:
     event_type: EventType = field(compare=False)
     case_id: str = field(compare=False)
     activity: Optional[str] = field(default=None, compare=False)
+    lifecycle: str = field(default="complete", compare=False)
     resource: Optional[str] = field(default=None, compare=False)
     payload: dict = field(default_factory=dict, compare=False)
     
@@ -39,7 +40,7 @@ class SimulationEvent:
             'concept:name': self.activity,
             'org:resource': self.resource,
             'time:timestamp': self.timestamp,
-            'lifecycle:transition': 'complete',  # MVP: always complete
+            'lifecycle:transition': self.lifecycle,
         }
         # Merge payload (case attributes)
         record.update(self.payload)

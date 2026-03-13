@@ -33,14 +33,18 @@ class CaseState:
 
     # Runtime state
     activity_history: List[str] = field(default_factory=list)
+    lifecycle_history: List[str] = field(default_factory=list)
     current_activity: Optional[str] = None
+    current_lifecycle: Optional[str] = None
     current_resource: Optional[str] = None
     start_time: Optional[datetime] = None
     
-    def add_activity(self, activity: str, resource: str = None) -> None:
+    def add_activity(self, activity: str, resource: str = None, lifecycle: str = "complete") -> None:
         """Record a completed activity."""
         self.activity_history.append(activity)
+        self.lifecycle_history.append(lifecycle)
         self.current_activity = activity
+        self.current_lifecycle = lifecycle
         if resource:
             self.current_resource = resource
     
