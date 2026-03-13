@@ -35,7 +35,7 @@ def cadd_distance(arrivals_true, arrivals_sim) -> float:
     bins_sim = to_hour_bins(arrivals_sim)
 
     if len(bins_true) == 0 or len(bins_sim) == 0:
-        return 0.0
+        return float("inf")
 
     max_bin = max(bins_true.max(), bins_sim.max())
     n_bins = max_bin + 1
@@ -46,7 +46,7 @@ def cadd_distance(arrivals_true, arrivals_sim) -> float:
     total_true = counts_true.sum()
     total_sim = counts_sim.sum()
     if total_true == 0 or total_sim == 0:
-        return 0.0
+        return float("inf")
 
     p = counts_true / total_true
     q = counts_sim / total_sim

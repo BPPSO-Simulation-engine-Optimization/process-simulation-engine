@@ -415,6 +415,7 @@ class DESEngine:
         batch_allocation_policy=None,
         processing_time_estimator=None,
         drl_policy=None,
+        pmsp_config=None,
         pt_lifecycle_mode: str = "native",
         enable_profiling: bool = False,
     ):
@@ -441,6 +442,8 @@ class DESEngine:
                 p_{ij} lookups.  Required when batch_allocation_policy is set.
             drl_policy: Optional DRL allocation policy (DRLAllocationPolicy or
                 InteractiveBatchPolicy).  When set, overrides both batch and greedy.
+            pmsp_config: Optional SelectionConfig for PMSP-based resource optimization.
+                When set, _process_waiting_queue uses PMSP solver instead of greedy.
             pt_lifecycle_mode: PT-only lifecycle logging mode.
                 "native": keep predictor lifecycle output.
                 "gt_activity_gated": emit synthetic "start" for GT start-capable
@@ -522,6 +525,9 @@ class DESEngine:
 
         # DRL allocation policy (optional, overrides both batch and greedy)
         self._drl_policy = drl_policy
+
+        # PMSP resource optimization config (optional)
+        self._pmsp_config = pmsp_config
 
         # Output: collected events for export
         self.completed_events: List[Dict] = []
@@ -981,6 +987,11 @@ class DESEngine:
             self._process_waiting_queue_batch(freed_resource, current_time)
             return
 
+        # PMSP optimization overrides greedy logic
+        if self._pmsp_config is not None:
+            self._process_waiting_queue_pmsp(freed_resource, current_time)
+            return
+
         # Check which activities have waiting work
         waiting_activities = self.resource_pool.get_all_waiting_activities()
         if not waiting_activities:
@@ -1029,6 +1040,102 @@ class DESEngine:
                 )
                 # Resource is now busy again, stop looking
                 return
+
+    def _process_waiting_queue_pmsp(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        PMSP-mode waiting-queue processing.
+
+        Collects all waiting tasks, runs the PMSP optimizer, and dispatches
+        assignments to available resources.
+        """
+        from resources.resource_optimization.resource_optimization import (
+            handle_batch_scheduling_optimization,
+        )
+
+        waiting_tasks = self.resource_pool.get_all_waiting_tasks()
+        if not waiting_tasks:
+            return
+
+        assignment, debug = handle_batch_scheduling_optimization(
+            cfg=self._pmsp_config,
+            activity="",  # not used for batch mode
+            timestamp=current_time,
+            case=None,
+            waiting_tasks=waiting_tasks,
+            processing_time_predictor=self._processing_time,
+            allocator=self.allocator,
+            resource_pool=self.resource_pool,
+        )
+
+        if assignment is None:
+            return
+
+        # Apply assignments: dispatch tasks to assigned resources
+        for task_id, assigned_resource in assignment.items():
+            if assigned_resource is None:
+                # Dummy assignment — task stays in the queue (postponed)
+                continue
+
+            # Check if the assigned resource is actually free right now
+            if self.resource_pool.is_busy(assigned_resource, current_time):
+                continue
+
+            # Parse task_id back to case_id and allocation_activity
+            # task_id format: "{case_id}_{allocation_activity}"
+            parts = task_id.rsplit("_", 1)
+            if len(parts) != 2:
+                # Try splitting on the activity name from waiting tasks
+                matched_work = None
+                for wt in waiting_tasks:
+                    wt_id = f"{wt.case_id}_{wt.allocation_activity}"
+                    if wt_id == task_id:
+                        matched_work = wt
+                        break
+                if matched_work is None:
+                    logger.warning("PMSP: could not match task_id %s to waiting work", task_id)
+                    continue
+            else:
+                # Find the matching waiting work
+                matched_work = None
+                for wt in waiting_tasks:
+                    wt_id = f"{wt.case_id}_{wt.allocation_activity}"
+                    if wt_id == task_id:
+                        matched_work = wt
+                        break
+                if matched_work is None:
+                    logger.warning("PMSP: task_id %s not found in waiting tasks", task_id)
+                    continue
+
+            # Remove from the waiting queue
+            removed = self.resource_pool.remove_task_by_id(
+                matched_work.allocation_activity, matched_work.case_id
+            )
+            if removed is None:
+                continue
+
+            # Calculate wait time for stats
+            wait_seconds = (current_time - removed.arrival_time).total_seconds()
+            self.stats['wait_time_total_seconds'] += wait_seconds
+
+            logger.debug(
+                "PMSP dispatching %s for case %s to %s (waited %.0fs)",
+                removed.activity, removed.case_id, assigned_resource, wait_seconds,
+            )
+
+            # Track assignment for strategy
+            self._resource_strategy.notify_assignment(assigned_resource, removed.allocation_activity)
+
+            # Schedule the activity with the assigned resource
+            self._schedule_activity_with_resource(
+                removed.case_id,
+                removed.activity,
+                removed.lifecycle,
+                current_time,
+                removed.case_state,
+                assigned_resource,
+            )
 
     def _process_waiting_queue_batch(
         self, freed_resource: str, current_time: datetime

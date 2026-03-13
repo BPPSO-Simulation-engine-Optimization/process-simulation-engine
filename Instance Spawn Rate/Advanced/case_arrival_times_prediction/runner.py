@@ -38,6 +38,7 @@ except Exception:
 from .config import SimulationConfig
 from .pipeline import CaseInterarrivalPipeline
 from .preprocessing import DailySequence
+from .metrics import flatten_days
 
 
 def interarrival_stats_intraday_only(D_sim: DailySequence, unit: str = "seconds"):
@@ -113,15 +114,7 @@ def run(
         FileNotFoundError: Wenn retrain_model=False aber Modell-Datei nicht existiert
     """
     if config is None:
-        cfg = SimulationConfig(
-            train_ratio=0.8,
-            window_size=21,
-            kmax=5,
-            z_values=(0.9, 0.725, 0.55, 0.375, 0.2),
-            L=4,
-            random_state=42,
-            verbose=False
-        )
+        cfg = SimulationConfig(random_state=42, verbose=False)
     else:
         cfg = config
 
@@ -151,11 +144,9 @@ def run(
     print("Train arrivals:", sum(len(d) for d in art.D_train))
     print("Test arrivals:", sum(len(d) for d in art.D_test))
 
-    # Wenn n_days_to_simulate gesetzt ist, wird diese Anzahl an Tagen simuliert.
-    # Die tatsächliche Anzahl der Timestamps ergibt sich dann aus dem Modell.
-    case_timestamps = pipe.simulate_case_timestamps(N_hat=n_days_to_simulate, start_date=start_date)
-
+    # Ein Simulationslauf fuer konsistente Auswertung/Reporting.
     D_sim = pipe.simulate_days(N_hat=n_days_to_simulate, start_date=start_date)
+    case_timestamps = flatten_days(D_sim)
     stats = interarrival_stats_intraday_only(D_sim, unit="seconds")
     print("simulierte Interarrival-Statistiken (intraday only):")
     for k in ["mean","std","q05","q25","q50","q75","q95"]:

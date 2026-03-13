@@ -32,6 +32,7 @@ pm4py
 ordinor
 holidays
 openpyxl
+ortools==9.10.4067
 gymnasium>=0.29.0
 stable-baselines3>=2.2.0
 sb3-contrib>=2.2.0

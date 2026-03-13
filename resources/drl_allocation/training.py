@@ -104,11 +104,13 @@ def create_engine_factory(allocator, df, config, state_builder):
 
     resource_strategy = create_strategy(config.resource_selection_strategy)
 
-    # If setup_simulation returned None for next_activity (no model files found),
-    # let the engine auto-load using STUB type
+    # DRL training requires a real predictor — don't silently degrade to STUB
     pred_type = None
     if next_act_pred is None:
-        pred_type = NextActivityPredictorType.STUB
+        raise RuntimeError(
+            "Next activity predictor failed to load. DRL training requires a real predictor "
+            "(lifecycle_dual recommended). Check model files and --next-activity-class setting."
+        )
 
     def factory(bridge):
         engine = TrainingDESEngine(
@@ -167,6 +169,17 @@ def main():
         help="Evaluate every N training steps",
     )
     parser.add_argument(
+        "--next-activity-class",
+        default="lifecycle_dual",
+        help="Next activity predictor class: lifecycle_dual, process_transformer, lstm",
+    )
+    parser.add_argument(
+        "--processing-time-mode",
+        default="basic",
+        choices=["basic", "advanced"],
+        help="Processing time prediction mode (basic=random stub, advanced=ML model)",
+    )
+    parser.add_argument(
         "--output-dir",
         default="models/drl_allocation",
         help="Output directory for model and logs",
@@ -192,6 +205,8 @@ def main():
     print(f"  Cases/episode: {args.num_cases}")
     print(f"  Total timesteps: {args.total_timesteps:,}")
     print(f"  Reward tau: {args.reward_tau}")
+    print(f"  Next activity: {args.next_activity_class}")
+    print(f"  Processing time: {args.processing_time_mode}")
     print(f"  Output: {args.output_dir}")
     print("=" * 60)
 
@@ -210,11 +225,13 @@ def main():
 
     # Create config (basic mode for fast training)
     from integration.config import SimulationConfig
-    config = SimulationConfig.all_basic()
+    config = SimulationConfig()
     config.num_cases = args.num_cases
     config.event_log_path = args.event_log
-    # setup_simulation reads this dynamically-set attribute
-    config.next_activity_class = "lstm"
+    config.processing_time_mode = args.processing_time_mode
+    config.next_activity_class = args.next_activity_class
+    if args.next_activity_class == "lifecycle_dual":
+        config.next_activity_lifecycle_variant = "start_complete"
 
     # Create engine factory
     print("Setting up engine factory...")

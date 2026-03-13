@@ -115,6 +115,10 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         print(f"  Batch policy: {config.batch_policy}")
     elif config.resource_allocation_mode == "drl":
         print(f"  DRL model: {config.drl_model_path}")
+    elif config.resource_allocation_mode == "pmsp":
+        print(f"  PMSP delta: {config.pmsp_dummy_delta}")
+        print(f"  PMSP solver time limit: {config.pmsp_solver_time_limit_seconds}s")
+        print(f"  PMSP prediction batch size: {config.pmsp_prediction_batch_size}")
     print(f"  Number of cases: {config.num_cases}")
     print("=" * 60 + "\n")
 
@@ -192,6 +196,18 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         )
         print(f"Created DRL policy from: {model_path}")
 
+    # Create PMSP config (if requested)
+    pmsp_config = None
+    if config.resource_allocation_mode == "pmsp":
+        from resources.resource_optimization.resource_optimization import SelectionConfig
+        pmsp_config = SelectionConfig(
+            mode="pmsp",
+            dummy_delta=config.pmsp_dummy_delta,
+            pmsp_solver_time_limit_seconds=config.pmsp_solver_time_limit_seconds,
+            prediction_batch_size=config.pmsp_prediction_batch_size,
+        )
+        print(f"Created PMSP config (delta={config.pmsp_dummy_delta})")
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
@@ -209,6 +225,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         batch_allocation_policy=batch_policy,
         processing_time_estimator=pt_estimator,
         drl_policy=drl_policy,
+        pmsp_config=pmsp_config,
         enable_profiling=enable_profiling,
     )
 
@@ -331,9 +348,27 @@ def main():
     )
     parser.add_argument(
         "--resource-allocation-mode",
-        choices=["greedy", "batch", "drl"],
+        choices=["greedy", "batch", "drl", "pmsp"],
         default="greedy",
-        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1, drl=trained PPO)"
+        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1, drl=trained PPO, pmsp=PMSP optimizer)"
+    )
+    parser.add_argument(
+        "--pmsp-dummy-delta",
+        type=float,
+        default=1.0,
+        help="PMSP dummy cost multiplier delta (default: 1.0)"
+    )
+    parser.add_argument(
+        "--pmsp-solver-time-limit",
+        type=float,
+        default=2.0,
+        help="PMSP CP-SAT solver time limit in seconds (default: 2.0)"
+    )
+    parser.add_argument(
+        "--pmsp-prediction-batch-size",
+        type=int,
+        default=0,
+        help="PMSP max predictions per task (0=unlimited, default: 0)"
     )
     parser.add_argument(
         "--drl-model-path",
@@ -411,6 +446,10 @@ def main():
     config.resource_allocation_mode = args.resource_allocation_mode
     if hasattr(args, 'drl_model_path') and args.drl_model_path:
         config.drl_model_path = args.drl_model_path
+    if args.resource_allocation_mode == "pmsp":
+        config.pmsp_dummy_delta = args.pmsp_dummy_delta
+        config.pmsp_solver_time_limit_seconds = args.pmsp_solver_time_limit
+        config.pmsp_prediction_batch_size = args.pmsp_prediction_batch_size
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)

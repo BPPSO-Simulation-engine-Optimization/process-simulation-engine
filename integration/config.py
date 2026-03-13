@@ -56,14 +56,19 @@ class SimulationConfig:
     # Resource selection strategy (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)
     resource_selection_strategy: Literal["random", "round_robin", "shortest_queue"] = "random"
 
-    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy, "drl" uses trained PPO
-    resource_allocation_mode: Literal["greedy", "batch", "drl"] = "greedy"
+    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy,
+    # "drl" uses trained PPO, "pmsp" uses PMSP optimizer (CP-SAT + JV fallback)
+    resource_allocation_mode: Literal["greedy", "batch", "drl", "pmsp"] = "greedy"
     # Batch policy (only when resource_allocation_mode="batch")
     batch_policy: Literal["1_batch_1"] = "1_batch_1"
     # DRL policy settings (only when resource_allocation_mode="drl")
     drl_model_path: Optional[str] = "models/drl_allocation/drl_allocation_model"
     drl_deterministic: bool = True
     drl_reward_tau: float = 100.0
+    # PMSP settings (only when resource_allocation_mode="pmsp")
+    pmsp_dummy_delta: float = 1.0
+    pmsp_solver_time_limit_seconds: Optional[float] = 2.0
+    pmsp_prediction_batch_size: int = 0  # 0 = unlimited
 
     # Global settings
     event_log_path: Optional[str] = None
