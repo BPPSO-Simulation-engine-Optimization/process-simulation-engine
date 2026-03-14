@@ -237,8 +237,8 @@ def main():
             "lifecycle_dual_full_baseline", "lifecycle_dual_full_balanced",
             "lifecycle_dual_start_complete_baseline",
         ],
-        default="lifecycle_dual_start_complete_baseline",
-        help="Next activity predictor (default: dual start_complete NAP)"
+        default="lifecycle_dual_full_balanced",
+        help="Next activity predictor (default: dual full_lifecycle balanced NAP)"
     )
     parser.add_argument(
         "--temperature",

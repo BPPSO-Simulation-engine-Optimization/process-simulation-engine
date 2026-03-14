@@ -79,17 +79,26 @@ def setup_simulation(
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
+LIFECYCLE_DUAL_HF_REPOS = {
+    "balanced": "Nixion/next_activity_prediction_lifecycle_dual_full_lifecycle_balanced",
+    "start_complete": "Nixion/next-activity-lifecycle-dual-start-complete-baseline",
+    "baseline": "Nixion/next-activity-lifecycle-dual-full-baseline",
+}
+
+
 def _resolve_lifecycle_dual_path(model_path: Path) -> Optional[Path]:
-    """Resolve lifecycle_dual model path. If local path missing, try HuggingFace."""
+    """Resolve lifecycle_dual model path. If local path missing, try HuggingFace fallback."""
     model_file = model_path / "model.keras"
     checkpoint_file = model_path / "checkpoints" / "best_model.keras"
     if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
         return model_path
     path_str = str(model_path)
-    if "start_complete" in path_str:
-        repo_id = "Nixion/next-activity-lifecycle-dual-start-complete-baseline"
+    if "balanced" in path_str:
+        repo_id = LIFECYCLE_DUAL_HF_REPOS["balanced"]
+    elif "start_complete" in path_str:
+        repo_id = LIFECYCLE_DUAL_HF_REPOS["start_complete"]
     else:
-        repo_id = "Nixion/next-activity-lifecycle-dual-full-baseline"
+        repo_id = LIFECYCLE_DUAL_HF_REPOS["baseline"]
     try:
         from huggingface_hub import hf_hub_download
         model_path_hf = hf_hub_download(repo_id=repo_id, filename="model.keras")
@@ -196,8 +205,10 @@ def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
             logger.info("Falling back to engine auto-load")
             return None
 
-    # Basic mode - check both possible locations for auto-load
+    # Basic mode - full_lifecycle balanced is standard (HF fallback: Nixion/next_activity_prediction_lifecycle_dual_full_lifecycle_balanced)
     possible_paths = [
+        Path("next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced"),
+        Path("next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced"),
         Path("next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
         Path("next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
         Path("models/next_activity_lstm"),
