@@ -1058,16 +1058,17 @@ class DESEngine:
         if not waiting_tasks:
             return
 
-        assignment, debug = handle_batch_scheduling_optimization(
-            cfg=self._pmsp_config,
-            activity="",  # not used for batch mode
-            timestamp=current_time,
-            case=None,
-            waiting_tasks=waiting_tasks,
-            processing_time_predictor=self._processing_time,
-            allocator=self.allocator,
-            resource_pool=self.resource_pool,
-        )
+        with self.profiler.measure("pmsp.optimize"):
+            assignment, debug = handle_batch_scheduling_optimization(
+                cfg=self._pmsp_config,
+                activity="",  # not used for batch mode
+                timestamp=current_time,
+                case=None,
+                waiting_tasks=waiting_tasks,
+                processing_time_predictor=self._processing_time,
+                allocator=self.allocator,
+                resource_pool=self.resource_pool,
+            )
 
         if assignment is None:
             return
