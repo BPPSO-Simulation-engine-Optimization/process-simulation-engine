@@ -16,6 +16,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _strip_tz(dt: datetime) -> datetime:
+    """Remove tzinfo from a datetime to avoid naive/aware comparison errors."""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
 class DRLStateBuilder:
     """
     Builds observation vectors and action masks for the DRL allocation agent.
@@ -98,6 +103,9 @@ class DRLStateBuilder:
         Returns:
             Observation vector of shape (observation_size,), values in [0, 1].
         """
+        # Normalize timezone: strip tz info to avoid naive/aware comparison errors
+        current_time = _strip_tz(current_time)
+
         obs = np.zeros(self.observation_size, dtype=np.float32)
         K = self.num_roles
         A = self.num_activities
@@ -110,9 +118,10 @@ class DRLStateBuilder:
             role_idx = self.resource_to_role.get(res_id)
             if role_idx is None:
                 continue
-            if busy_until > current_time:
+            busy_until_naive = _strip_tz(busy_until)
+            if busy_until_naive > current_time:
                 role_busy_count[role_idx] += 1
-                remaining_h = (busy_until - current_time).total_seconds() / 3600.0
+                remaining_h = (busy_until_naive - current_time).total_seconds() / 3600.0
                 role_remaining_sum[role_idx] += remaining_h
 
         # role_idle_fraction = 1 - busy/total (clamped)
@@ -131,7 +140,7 @@ class DRLStateBuilder:
                 continue
             obs[2*K + idx] = min(len(queue) / self._max_queue, 1.0)
             total_wait_h = sum(
-                (current_time - w.arrival_time).total_seconds() / 3600.0
+                (current_time - _strip_tz(w.arrival_time)).total_seconds() / 3600.0
                 for w in queue
             )
             obs[2*K + A + idx] = min(total_wait_h / len(queue) / self._max_wait, 1.0)
