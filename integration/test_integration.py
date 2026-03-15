@@ -173,8 +173,8 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     drl_policy = None
     if config.resource_allocation_mode == "drl":
         import pickle
-        from resources.drl_state import DRLStateBuilder
-        from resources.drl_policy import DRLAllocationPolicy
+        from resources.drl_allocation.state import DRLStateBuilder
+        from resources.drl_allocation.policy import DRLAllocationPolicy
 
         model_path = config.drl_model_path
         config_path = os.path.join(os.path.dirname(model_path), "state_builder_config.pkl")
@@ -225,6 +225,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         batch_allocation_policy=batch_policy,
         processing_time_estimator=pt_estimator,
         drl_policy=drl_policy,
+        drl_max_postpone_wait_hours=config.drl_max_postpone_wait_hours,
         pmsp_config=pmsp_config,
         enable_profiling=enable_profiling,
     )

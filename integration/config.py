@@ -65,6 +65,7 @@ class SimulationConfig:
     drl_model_path: Optional[str] = "models/drl_allocation/drl_allocation_model"
     drl_deterministic: bool = True
     drl_reward_tau: float = 100.0
+    drl_max_postpone_wait_hours: float = 4.0
     # PMSP settings (only when resource_allocation_mode="pmsp")
     pmsp_dummy_delta: float = 1.0
     pmsp_solver_time_limit_seconds: Optional[float] = 2.0

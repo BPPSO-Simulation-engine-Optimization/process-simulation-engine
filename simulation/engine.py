@@ -415,6 +415,7 @@ class DESEngine:
         batch_allocation_policy=None,
         processing_time_estimator=None,
         drl_policy=None,
+        drl_max_postpone_wait_hours: float = 4.0,
         pmsp_config=None,
         pt_lifecycle_mode: str = "native",
         enable_profiling: bool = False,
@@ -525,6 +526,7 @@ class DESEngine:
 
         # DRL allocation policy (optional, overrides both batch and greedy)
         self._drl_policy = drl_policy
+        self._drl_max_postpone_wait_hours = drl_max_postpone_wait_hours
 
         # PMSP resource optimization config (optional)
         self._pmsp_config = pmsp_config
@@ -1351,15 +1353,22 @@ class DESEngine:
         if not any_feasible:
             return
 
-        # 5. Provide engine state to policy (for observation building)
+        # 5. Compute per-activity max wait hours (for postpone starvation prevention)
+        task_max_wait: dict[str, float] = {}
+        for t in tasks:
+            current_max = task_max_wait.get(t.allocation_activity, 0.0)
+            if t.hours_waited > current_max:
+                task_max_wait[t.allocation_activity] = t.hours_waited
+
+        # 6. Provide engine state to policy (for observation building)
         if hasattr(self._drl_policy, 'set_engine_state'):
             self._drl_policy.set_engine_state(self.resource_pool, self.case_manager)
 
-        # 6. Build pool snapshot for training bridge (InteractiveBatchPolicy)
+        # 7. Build pool snapshot for training bridge (InteractiveBatchPolicy)
         pool_snapshot = self._build_pool_snapshot()
         waiting_activities = {t.allocation_activity for t in tasks if self.resource_pool.has_waiting_work(t.allocation_activity)}
 
-        # 7. Call policy
+        # 8. Call policy
         decision = self._drl_policy.decide(
             freed_resource=freed_resource,
             current_time_s=current_time.timestamp(),
@@ -1371,12 +1380,14 @@ class DESEngine:
             waiting_activities=waiting_activities,
             pool_snapshot=pool_snapshot,
             active_case_count=self.case_manager.active_count(),
+            task_max_wait_hours=task_max_wait,
+            max_postpone_wait_hours=self._drl_max_postpone_wait_hours,
         )
 
         if decision is None:
             return
 
-        # 8. Parse task_id and dispatch
+        # 9. Parse task_id and dispatch
         parts = decision.task_id.split("::", 1)
         if len(parts) != 2:
             logger.warning("Invalid task_id from DRL policy: %s", decision.task_id)

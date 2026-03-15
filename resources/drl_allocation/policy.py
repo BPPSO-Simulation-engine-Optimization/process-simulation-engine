@@ -83,6 +83,7 @@ class DRLAllocationPolicy(BatchAllocationPolicy):
         workers: List[WorkerInfo],
         eligible_map: Dict[str, Set[str]],
         processing_time_fn: Callable[[str, str], float],
+        **kwargs,
     ) -> Optional[BatchDecision]:
         """Select which activity queue to serve using the trained PPO agent."""
         if self._resource_pool is None:
@@ -107,6 +108,16 @@ class DRLAllocationPolicy(BatchAllocationPolicy):
             eligible_map=eligible_map,
             waiting_activities=waiting_activities,
         )
+
+        # Mask out postpone if any task has waited too long (prevent starvation)
+        max_postpone_wait_hours = kwargs.get('max_postpone_wait_hours')
+        if max_postpone_wait_hours is not None:
+            task_max_wait_hours = kwargs.get('task_max_wait_hours', {})
+            if any(w > max_postpone_wait_hours for w in task_max_wait_hours.values()):
+                mask[self.state_builder.num_activities] = False
+                # Ensure at least one action is still feasible
+                if not mask.any():
+                    mask[self.state_builder.num_activities] = True  # re-enable postpone as last resort
 
         # Predict action
         action, _ = self.model.predict(obs, deterministic=self.deterministic, action_masks=mask)
