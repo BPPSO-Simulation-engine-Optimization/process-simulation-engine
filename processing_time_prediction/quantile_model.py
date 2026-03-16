@@ -13,10 +13,10 @@ import joblib
 class QuantileModelTrainer:
     """
     Trains quantile regression models for handling multimodal distributions.
-    
-    Instead of predicting the mean, this predicts multiple quantiles (e.g., 
+
+    Instead of predicting the mean, this predicts multiple quantiles (e.g.,
     median, 75th percentile, 90th percentile) which is better for skewed
-    and multimodal distributions like A_Concept.
+    and multimodal distributions.
     """
 
     def __init__(
@@ -31,27 +31,23 @@ class QuantileModelTrainer:
         Initialize the QuantileModelTrainer.
 
         Args:
-            quantiles: List of quantiles to predict. Can be any number of quantiles.
-                      Examples: [0.5], [0.5, 0.75], [0.5, 0.75, 0.9], [0.8, 0.9, 0.95, 0.99]
-                      Default: [0.5, 0.75, 0.9]
+            quantiles: List of quantiles to predict. Default: [0.5, 0.75, 0.9]
             categorical_features: List of categorical feature names
             numerical_features: List of numerical feature names
             random_state: Random state for reproducibility
-            optimized_for_extreme: If True, use optimized hyperparameters for extreme values (e.g., 0.99 quantile)
+            optimized_for_extreme: If True, use optimized hyperparameters for extreme quantiles
         """
         self.random_state = random_state
         self.optimized_for_extreme = optimized_for_extreme
 
-        # Default quantiles: median, 75th, 90th percentile
         self.quantiles = quantiles or [0.5, 0.75, 0.9]
 
-        # Default feature lists
         self.categorical_features = categorical_features or ["event", "lifecycle:transition"]
         self.numerical_features = numerical_features or [
             "event_index", "hour", "weekday"
         ]
 
-        self.models = {}  # Dictionary to store models per quantile
+        self.models = {}       # Dict: quantile -> {'model': ..., 'preprocessor': ..., 'is_lightgbm': ...}
         self.preprocessor = None
 
     def create_preprocessing_pipeline(self) -> ColumnTransformer:
@@ -59,9 +55,8 @@ class QuantileModelTrainer:
         Create sklearn preprocessing pipeline with NaN handling.
 
         Returns:
-            Configured preprocessing pipeline
+            Configured preprocessing pipeline (ColumnTransformer)
         """
-        # Handle NaN values in numerical features with median imputation
         preprocessor = ColumnTransformer(
             transformers=[
                 ("cat", OneHotEncoder(handle_unknown="ignore"), self.categorical_features),
@@ -78,7 +73,7 @@ class QuantileModelTrainer:
         y_train: pd.Series,
         additional_numerical_features: Optional[List[str]] = None,
         optimized_for_extreme: Optional[bool] = None
-    ) -> Dict[float, Pipeline]:
+    ) -> Dict[float, Dict]:
         """
         Train separate models for each quantile.
 
@@ -92,106 +87,73 @@ class QuantileModelTrainer:
         Returns:
             Dictionary with trained models per quantile
         """
-        # Use instance attribute if parameter not explicitly provided
         if optimized_for_extreme is None:
             optimized_for_extreme = getattr(self, 'optimized_for_extreme', False)
-        
+
         print(f"Training quantile models for quantiles: {self.quantiles}")
 
-        # Update numerical features if provided
         if additional_numerical_features:
             self.numerical_features.extend(additional_numerical_features)
 
-        # Check for NaN values in features before preprocessing
+        # Handle NaN-heavy features
         nan_counts = X_train.isna().sum()
         if nan_counts.any():
             print(f"  Warning: Found NaN values in features:")
             for col, count in nan_counts[nan_counts > 0].items():
                 print(f"    {col}: {count} NaN values ({count/len(X_train)*100:.1f}%)")
-            
-            # Remove features that are >95% NaN (likely activity-specific features)
+
             features_to_remove = nan_counts[nan_counts / len(X_train) > 0.95].index.tolist()
             if features_to_remove:
                 print(f"  Removing {len(features_to_remove)} features with >95% NaN values: {features_to_remove}")
                 X_train = X_train.drop(columns=features_to_remove)
-                # Update feature lists to exclude removed features
                 self.categorical_features = [f for f in self.categorical_features if f not in features_to_remove]
                 self.numerical_features = [f for f in self.numerical_features if f not in features_to_remove]
-                # Recreate preprocessor with updated features
                 self.preprocessor = None
-        
-        # Create preprocessing pipeline
+
         if self.preprocessor is None:
             self.create_preprocessing_pipeline()
 
-        # Preprocess features (NaN values will be imputed by SimpleImputer)
         X_train_processed = self.preprocessor.fit_transform(X_train)
-        
-        # Check if there are still NaN values after preprocessing (should not occur - indicates a problem)
+
         if isinstance(X_train_processed, np.ndarray):
             nan_count_after = np.isnan(X_train_processed).sum()
             if nan_count_after > 0:
-                print(f"ERROR: {nan_count_after} NaN values still present after preprocessing")
-                print(f"  This indicates a problem in feature preprocessing!")
-                raise ValueError(f"NaN values found in features after preprocessing. This should not happen - check feature preprocessing pipeline (SimpleImputer should have filled NaN values).")
+                raise ValueError(
+                    f"NaN values found after preprocessing ({nan_count_after}). "
+                    "Check feature preprocessing pipeline."
+                )
 
-        # Train one model per quantile
-        for quantile in self.quantiles:
-            print(f"  Training model for {quantile*100:.0f}th percentile...")
-
-            # Use XGBoost with custom quantile loss function
-            # This is better than GradientBoostingRegressor
-            from xgboost import XGBRegressor
-            
-            # Custom quantile loss function for XGBoost
-            def quantile_loss(y_pred, y_true):
-                """Quantile loss function for XGBoost"""
-                import numpy as np
-                residual = y_true - y_pred
-                return np.where(residual >= 0, quantile * residual, (quantile - 1) * residual)
-            
-            # Use XGBoost with squared error objective (we'll use custom eval metric)
-            # For quantile regression, we need to use a custom objective or eval_metric
-            # XGBoost doesn't have built-in quantile regression, so we use a workaround:
-            # Train with reg:squarederror but adjust predictions post-hoc
-            # OR use sklearn's approach but with better hyperparameters
-            
-            # Option 1: Use sklearn GradientBoostingRegressor (current, but slower)
-            # Option 2: Use LightGBM (faster and often better for quantile regression)
-            # Option 3: Use XGBoost with custom quantile objective (requires custom implementation)
-            # Try LightGBM first if available, otherwise fall back to sklearn
-            
+        # Try LightGBM if available
+        use_lightgbm = False
+        try:
+            import lightgbm as lgb
+            use_lightgbm = True
+        except ImportError:
+            from sklearn.ensemble import GradientBoostingRegressor
             use_lightgbm = False
-            try:
-                import lightgbm as lgb
-                use_lightgbm = True
-            except ImportError:
-                use_lightgbm = False
-            
-            if not use_lightgbm:
-                from sklearn.ensemble import GradientBoostingRegressor
-            
-            # Optimize hyperparameters based on quantile and whether extreme values are expected
-            # For extreme quantiles (0.9+) or if optimized_for_extreme, use more estimators and deeper trees
+
+        if not use_lightgbm:
+            from sklearn.ensemble import GradientBoostingRegressor
+
+        from datetime import datetime
+        total_quantiles = len(self.quantiles)
+        
+        for quantile_idx, quantile in enumerate(self.quantiles, 1):
+            print(f"  Training model {quantile_idx}/{total_quantiles} for {quantile*100:.0f}th percentile...")
+            quantile_start = datetime.now()
+
             is_extreme_quantile = quantile >= 0.9
             use_optimized = optimized_for_extreme or is_extreme_quantile
-            
+
             if use_optimized:
-                # Optimized hyperparameters for extreme values:
-                # - More estimators for better coverage of rare events
-                # - Deeper trees to capture complex patterns
-                # - Lower learning rate for better generalization
-                # - More patience for extreme quantiles to avoid early stopping
                 if quantile >= 0.99:
-                    # Extreme quantile (99th): Maximum effort for rare events
                     n_estimators = 1500
                     max_depth = 8
-                    learning_rate = 0.01  # Very low learning rate for stability
-                    min_samples_split = 50  # Very conservative to prevent overfitting
+                    learning_rate = 0.01
+                    min_samples_split = 50
                     min_samples_leaf = 25
-                    n_iter_no_change = 25  # Much more patience
+                    n_iter_no_change = 25
                 elif quantile >= 0.95:
-                    # Very high quantile (95th)
                     n_estimators = 1000
                     max_depth = 7
                     learning_rate = 0.015
@@ -199,41 +161,36 @@ class QuantileModelTrainer:
                     min_samples_leaf = 15
                     n_iter_no_change = 20
                 else:
-                    # High quantile (90th)
                     n_estimators = 800
                     max_depth = 6
                     learning_rate = 0.02
                     min_samples_split = 20
                     min_samples_leaf = 10
                     n_iter_no_change = 15
-                
-                subsample = 0.85  # Slightly more data per tree
-                
+                subsample = 0.85
                 if quantile >= 0.99:
-                    print(f"    Using extreme-optimized hyperparameters (n_estimators={n_estimators}, max_depth={max_depth}, lr={learning_rate}, min_samples_split={min_samples_split})")
+                    print(f"    Using extreme-optimized hyperparameters "
+                          f"(n_estimators={n_estimators}, max_depth={max_depth}, lr={learning_rate})")
             else:
-                # Standard hyperparameters for normal quantiles
                 n_estimators = 500
                 max_depth = 6
                 learning_rate = 0.03
                 subsample = 0.8
                 n_iter_no_change = 10
-                min_samples_split = 2  # Default
-                min_samples_leaf = 1  # Default
-            
-            # Use LightGBM if available and for extreme quantiles (better performance)
-            # Note: LightGBM needs to be installed separately (pip install lightgbm)
+                min_samples_split = 2
+                min_samples_leaf = 1
+
+            use_lightgbm_actual = False
             if use_lightgbm and (quantile >= 0.95 or use_optimized):
                 try:
                     import lightgbm as lgb
-                    
-                    # LightGBM parameters optimized for quantile regression
+
                     params = {
                         'objective': 'quantile',
-                        'alpha': quantile,  # Target quantile
+                        'alpha': quantile,
                         'metric': 'quantile',
                         'boosting_type': 'gbdt',
-                        'num_leaves': min(2 ** max_depth, 255),  # More leaves for deeper trees, but capped
+                        'num_leaves': min(2 ** max_depth, 255),
                         'max_depth': max_depth,
                         'learning_rate': learning_rate,
                         'n_estimators': n_estimators,
@@ -242,25 +199,22 @@ class QuantileModelTrainer:
                         'colsample_bytree': 0.8,
                         'min_child_samples': min_samples_leaf,
                         'min_split_gain': 0.0,
-                        'reg_alpha': 0.1,  # L1 regularization
-                        'reg_lambda': 0.1,  # L2 regularization
+                        'reg_alpha': 0.1,
+                        'reg_lambda': 0.1,
                         'random_state': self.random_state,
                         'n_jobs': -1,
                         'verbose': -1,
-                        'force_row_wise': True  # For better performance
+                        'force_row_wise': True
                     }
-                    
-                    # Create LightGBM dataset
+
                     train_data = lgb.Dataset(X_train_processed, label=y_train)
-                    
-                    # Train with early stopping
                     valid_sets = [train_data]
                     valid_names = ['train']
                     callbacks = [
                         lgb.early_stopping(stopping_rounds=n_iter_no_change, verbose=False),
                         lgb.log_evaluation(period=100, show_stdv=False)
                     ]
-                    
+
                     xgb_model = lgb.train(
                         params,
                         train_data,
@@ -269,19 +223,15 @@ class QuantileModelTrainer:
                         valid_names=valid_names,
                         callbacks=callbacks
                     )
-                    
+
                     if quantile >= 0.99:
                         print(f"    Using LightGBM for extreme quantile (faster and often better)")
                     use_lightgbm_actual = True
                 except Exception as e:
-                    # Fall back to sklearn if LightGBM fails
                     print(f"    Warning: LightGBM failed ({e}), falling back to GradientBoostingRegressor")
                     use_lightgbm_actual = False
-            else:
-                use_lightgbm_actual = False
-            
+
             if not use_lightgbm_actual:
-                # Use sklearn GradientBoostingRegressor (always available)
                 xgb_model = GradientBoostingRegressor(
                     n_estimators=n_estimators,
                     max_depth=max_depth,
@@ -290,26 +240,27 @@ class QuantileModelTrainer:
                     min_samples_split=min_samples_split,
                     min_samples_leaf=min_samples_leaf,
                     loss='quantile',
-                    alpha=quantile,  # Target quantile (0.5 = median, 0.75 = 75th percentile, etc.)
+                    alpha=quantile,
                     random_state=self.random_state,
-                    validation_fraction=0.1,  # Early stopping
+                    validation_fraction=0.1,
                     n_iter_no_change=n_iter_no_change,
                     tol=1e-4
                 )
 
-            # Train the model
             if not (use_lightgbm_actual and hasattr(xgb_model, 'predict')):
-                # Train sklearn model (LightGBM models are already trained)
+                print(f"    Fitting model (this may take a while for n_estimators={n_estimators})...")
                 xgb_model.fit(X_train_processed, y_train)
+                quantile_duration = (datetime.now() - quantile_start).total_seconds()
+                print(f"    ✓ Model fitted in {quantile_duration:.1f}s")
 
-            # Store the model (with indicator for LightGBM)
             self.models[quantile] = {
                 'model': xgb_model,
                 'preprocessor': self.preprocessor,
                 'is_lightgbm': use_lightgbm_actual
             }
 
-            print(f"    ✓ Model trained for {quantile*100:.0f}th percentile")
+            quantile_duration = (datetime.now() - quantile_start).total_seconds()
+            print(f"    ✓ Model trained for {quantile*100:.0f}th percentile ({quantile_duration:.1f}s)")
 
         return self.models
 
@@ -321,7 +272,7 @@ class QuantileModelTrainer:
             X: Feature matrix
 
         Returns:
-            DataFrame with predictions for each quantile
+            DataFrame with predictions for each quantile (in original hours scale)
         """
         if not self.models:
             raise ValueError("No models trained yet. Call train_quantile_models() first.")
@@ -333,24 +284,18 @@ class QuantileModelTrainer:
             model = model_dict['model']
             is_lightgbm = model_dict.get('is_lightgbm', False)
 
-            # Preprocess features
             X_processed = preprocessor.transform(X)
 
-            # Make predictions (in log space)
-            # Both LightGBM and sklearn models use .predict(), but LightGBM has optional num_iteration parameter
             try:
                 if is_lightgbm and hasattr(model, 'best_iteration'):
                     pred_log = model.predict(X_processed, num_iteration=model.best_iteration)
                 else:
                     pred_log = model.predict(X_processed)
             except Exception:
-                # Fallback for any prediction issues
                 pred_log = model.predict(X_processed)
 
-            # Transform back to original scale: log10(x+1) -> 10^y - 1
+            # Convert from log10(x+1) to original scale
             pred_original = np.power(10, pred_log) - 1
-            
-            # Ensure non-negative predictions (negative processing times are impossible)
             pred_original = np.maximum(pred_original, 0)
 
             predictions[f'quantile_{quantile*100:.0f}'] = pred_original
@@ -370,8 +315,7 @@ class QuantileModelTrainer:
         """
         if not self.models:
             raise ValueError("No models trained yet. Call train_quantile_models() first.")
-        
-        # Use 0.5 if available, otherwise use the lowest available quantile
+
         if 0.5 in self.models:
             quantile = 0.5
         else:
@@ -384,15 +328,17 @@ class QuantileModelTrainer:
         is_lightgbm = model_dict.get('is_lightgbm', False)
 
         X_processed = preprocessor.transform(X)
-        
-        # Make predictions (in log space)
+
         if is_lightgbm:
-            pred_log = model.predict(X_processed, num_iteration=model.best_iteration if hasattr(model, 'best_iteration') else None)
+            pred_log = model.predict(
+                X_processed,
+                num_iteration=model.best_iteration if hasattr(model, 'best_iteration') else None
+            )
         else:
             pred_log = model.predict(X_processed)
-        
-        return pred_log  # Return log-transformed values for consistency
-    
+
+        return pred_log
+
     def predict_lowest_quantile(self, X: pd.DataFrame) -> np.ndarray:
         """
         Predict using the lowest available quantile in log-transformed space.
@@ -405,7 +351,7 @@ class QuantileModelTrainer:
         """
         if not self.models:
             raise ValueError("No models trained yet. Call train_quantile_models() first.")
-        
+
         quantile = min(self.models.keys())
         model_dict = self.models[quantile]
         preprocessor = model_dict['preprocessor']
@@ -413,13 +359,15 @@ class QuantileModelTrainer:
         is_lightgbm = model_dict.get('is_lightgbm', False)
 
         X_processed = preprocessor.transform(X)
-        
-        # Make predictions (in log space)
+
         if is_lightgbm:
-            pred_log = model.predict(X_processed, num_iteration=model.best_iteration if hasattr(model, 'best_iteration') else None)
+            pred_log = model.predict(
+                X_processed,
+                num_iteration=model.best_iteration if hasattr(model, 'best_iteration') else None
+            )
         else:
             pred_log = model.predict(X_processed)
-        
+
         return pred_log
 
     def save_models(self, filepath_prefix: str) -> None:
@@ -449,7 +397,6 @@ class QuantileModelTrainer:
             try:
                 model_dict = joblib.load(filepath)
                 self.models[quantile] = model_dict
-                # Set preprocessor from the first loaded model (all models use the same preprocessor)
                 if self.preprocessor is None and 'preprocessor' in model_dict:
                     self.preprocessor = model_dict['preprocessor']
                 print(f"Loaded quantile {quantile*100:.0f} model from: {filepath}")
@@ -460,7 +407,7 @@ class QuantileModelTrainer:
 class ClassificationRegressionModel:
     """
     Two-stage approach: First classify into speed categories, then regress.
-    
+
     This is better for multimodal distributions where different patterns
     exist for fast vs. slow cases.
     """
@@ -477,24 +424,20 @@ class ClassificationRegressionModel:
 
         Args:
             speed_thresholds: Thresholds for speed categories (e.g., [5, 25, 45])
-                             Creates: fast (<5h), medium (5-25h), slow (25-45h), very_slow (>45h)
             categorical_features: List of categorical feature names
             numerical_features: List of numerical feature names
             random_state: Random state for reproducibility
         """
         self.random_state = random_state
-
-        # Default thresholds based on A_Concept distribution
         self.speed_thresholds = speed_thresholds or [5.0, 25.0, 45.0]
 
-        # Default feature lists
         self.categorical_features = categorical_features or ["event", "lifecycle:transition"]
         self.numerical_features = numerical_features or [
             "event_index", "hour", "weekday"
         ]
 
         self.classifier = None
-        self.regressors = {}  # One regressor per category
+        self.regressors = {}
         self.preprocessor = None
 
     def create_speed_categories(self, y: pd.Series) -> pd.Series:
@@ -509,26 +452,24 @@ class ClassificationRegressionModel:
         """
         categories = pd.Series(index=y.index, dtype=str)
 
-        # Convert from log scale if needed
         if y.max() < 10:  # Likely log scale
             y_original = np.expm1(y)
         else:
             y_original = y
 
-        # Create categories
         categories[y_original < self.speed_thresholds[0]] = "fast"
-        
+
         if len(self.speed_thresholds) == 1:
             categories[y_original >= self.speed_thresholds[0]] = "slow"
         elif len(self.speed_thresholds) == 2:
-            categories[(y_original >= self.speed_thresholds[0]) & 
-                      (y_original < self.speed_thresholds[1])] = "medium"
+            categories[(y_original >= self.speed_thresholds[0]) &
+                       (y_original < self.speed_thresholds[1])] = "medium"
             categories[y_original >= self.speed_thresholds[1]] = "slow"
         else:
-            categories[(y_original >= self.speed_thresholds[0]) & 
-                      (y_original < self.speed_thresholds[1])] = "medium"
-            categories[(y_original >= self.speed_thresholds[1]) & 
-                      (y_original < self.speed_thresholds[2])] = "slow"
+            categories[(y_original >= self.speed_thresholds[0]) &
+                       (y_original < self.speed_thresholds[1])] = "medium"
+            categories[(y_original >= self.speed_thresholds[1]) &
+                       (y_original < self.speed_thresholds[2])] = "slow"
             categories[y_original >= self.speed_thresholds[2]] = "very_slow"
 
         return categories
@@ -548,10 +489,10 @@ class ClassificationRegressionModel:
             y_train_original: Training target (original scale)
         """
         from sklearn.ensemble import RandomForestClassifier
+        from xgboost import XGBRegressor
 
         print("Training classification-regression model...")
 
-        # Create preprocessing pipeline
         preprocessor = ColumnTransformer(
             transformers=[
                 ("cat", OneHotEncoder(handle_unknown="ignore"), self.categorical_features),
@@ -562,12 +503,10 @@ class ClassificationRegressionModel:
         self.preprocessor = preprocessor
         X_train_processed = preprocessor.fit_transform(X_train)
 
-        # Create speed categories
         categories = self.create_speed_categories(y_train_original)
         print(f"  Category distribution:")
         print(categories.value_counts())
 
-        # Train classifier
         print("  Training classifier...")
         self.classifier = RandomForestClassifier(
             n_estimators=100,
@@ -577,7 +516,6 @@ class ClassificationRegressionModel:
         )
         self.classifier.fit(X_train_processed, categories)
 
-        # Train separate regressor for each category
         print("  Training regressors per category...")
         for category in categories.unique():
             category_mask = categories == category
@@ -618,10 +556,8 @@ class ClassificationRegressionModel:
 
         X_processed = self.preprocessor.transform(X)
 
-        # Stage 1: Classify
         categories = self.classifier.predict(X_processed)
 
-        # Stage 2: Regress per category
         predictions_log = np.zeros(len(X))
 
         for category in self.regressors.keys():
@@ -631,5 +567,4 @@ class ClassificationRegressionModel:
                 pred_log = self.regressors[category].predict(X_cat)
                 predictions_log[category_mask] = pred_log
 
-        # Transform back to original scale
         return np.expm1(predictions_log)

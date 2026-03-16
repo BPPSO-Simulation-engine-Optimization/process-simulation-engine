@@ -13,10 +13,30 @@ try:
 except ImportError:
     TF_AVAILABLE = False
 
+# XGBoost activity-specific model (optional)
+try:
+    from .activity_specific_model import ActivitySpecificModel
+    from .feature_engineering import FeatureEngineering
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    try:
+        from activity_specific_model import ActivitySpecificModel
+        from feature_engineering import FeatureEngineering
+        XGBOOST_AVAILABLE = True
+    except ImportError:
+        XGBOOST_AVAILABLE = False
+
 
 class ProcessingTimePredictionClass:
     """
     Predicts processing times between consecutive events.
+
+    Supported methods:
+        "distribution"     – Samples from log-normal distributions per transition pair.
+        "ml"               – Random-Forest point-prediction.
+        "probabilistic_ml" – LSTM with heteroscedastic Gaussian output.
+        "xgboost"          – Activity-specific XGBoost / quantile models.
+                             Returns the median prediction (log10 → hours → seconds).
     """
 
     def __init__(
@@ -28,7 +48,7 @@ class ProcessingTimePredictionClass:
         Initialize the prediction class by loading a model from disk.
 
         Args:
-            method: Method to use ("distribution", "ml", or "probabilistic_ml").
+            method: Method to use ("distribution", "ml", "probabilistic_ml", or "xgboost").
             model_path: Base path of the saved model (without suffixes like _model.joblib);
                         if None, a default path ``models/processing_time_model`` is used.
         """
@@ -46,7 +66,7 @@ class ProcessingTimePredictionClass:
         self.categorical_features: List[str] = []
         self.numerical_features: List[str] = []
         self.feature_defaults: Dict[str, any] = {}
-        
+
         self.lstm_model: Optional[keras.Model] = None
         self.sequence_length: int = 10
         self.activity_encoder: Optional[LabelEncoder] = None
@@ -58,6 +78,10 @@ class ProcessingTimePredictionClass:
 
         # Resource hold time model
         self.resource_hold_data = None
+
+        # XGBoost activity-specific model
+        self.xgb_activity_model: Optional["ActivitySpecificModel"] = None
+        self._xgb_feature_engineer: Optional["FeatureEngineering"] = None
 
         base_path = model_path or "models/processing_time_model"
         self.load_model(base_path)
@@ -219,6 +243,44 @@ class ProcessingTimePredictionClass:
             self.y_std = metadata.get('y_std', 1.0)
             
             print(f"Probabilistic ML model loaded from {filepath}_*.joblib and {model_path}")
+
+        elif self.method == "xgboost":
+            if not XGBOOST_AVAILABLE:
+                raise ImportError(
+                    "The XGBoost activity-specific modules could not be imported. "
+                    "Ensure activity_specific_model.py and its dependencies are present "
+                    "in the processing_time_prediction package."
+                )
+
+            models_dir = metadata.get('models_dir')
+            if not models_dir:
+                raise ValueError("XGBoost metadata is missing 'models_dir'. Was the model saved correctly?")
+
+            activities = metadata.get('xgb_activities')
+            case_features = metadata.get('xgb_case_features')
+            base_features = metadata.get('xgb_base_features')
+            random_state = metadata.get('xgb_random_state', 42)
+
+            self.xgb_activity_model = ActivitySpecificModel(
+                activities=activities,
+                case_features=case_features,
+                base_features=base_features,
+                random_state=random_state,
+                models_dir=models_dir,
+            )
+            self.xgb_activity_model.load_models(models_dir)
+
+            # Keep a feature-engineering helper for building the feature row at inference time
+            self._xgb_feature_engineer = FeatureEngineering(
+                case_features=case_features,
+                base_features=base_features,
+            )
+
+            self.fallback_mean = metadata.get('fallback_mean')
+            self.fallback_std = metadata.get('fallback_std')
+
+            n_models = len(self.xgb_activity_model.models)
+            print(f"XGBoost activity-specific model loaded from {models_dir}/ ({n_models} activity models)")
 
     def _load_resource_hold_model(self, base_path: str):
         """Load resource hold time model if available."""
@@ -447,7 +509,7 @@ class ProcessingTimePredictionClass:
                 warnings.warn(f"Error in probabilistic ML prediction: {e}. Using fallback.")
                 return self.fallback_mean if self.fallback_mean else 3600.0
         
-        else:
+        elif self.method == "ml":
             if self.ml_model is None:
                 warnings.warn("ML model not trained. Using fallback.")
                 return self.fallback_mean if self.fallback_mean else 3600.0
@@ -485,6 +547,138 @@ class ProcessingTimePredictionClass:
             except Exception as e:
                 warnings.warn(f"Error in ML prediction: {e}. Using fallback.")
                 return self.fallback_mean if self.fallback_mean else 3600.0
+
+        elif self.method == "xgboost":
+            if self.xgb_activity_model is None:
+                warnings.warn("XGBoost model not loaded. Using fallback.")
+                return self.fallback_mean if self.fallback_mean else 3600.0
+
+            # The XGBoost models predict the processing time *of* the current activity,
+            # so we use curr_activity as the key.
+            activity = str(curr_activity)
+
+            if activity not in self.xgb_activity_model.models:
+                # Try prev_activity as a fallback key
+                activity = str(prev_activity)
+
+            if activity not in self.xgb_activity_model.models:
+                warnings.warn(
+                    f"No XGBoost model for activity '{curr_activity}'. Using fallback."
+                )
+                return self.fallback_mean if self.fallback_mean else 3600.0
+
+            try:
+                X_row = self._build_xgb_feature_row(
+                    curr_activity=str(curr_activity),
+                    context=context,
+                )
+                pred_log = self.xgb_activity_model.predict_for_activity(activity, X_row)
+                # pred_log is log10(hours + 1) → convert to seconds
+                pred_hours = float(np.power(10, pred_log[0]) - 1)
+                pred_seconds = pred_hours * 3600.0
+                return max(0.0, pred_seconds)
+
+            except Exception as e:
+                warnings.warn(f"Error in XGBoost prediction: {e}. Using fallback.")
+                return self.fallback_mean if self.fallback_mean else 3600.0
+
+        # Unknown method – should never reach here after load_model validation
+        warnings.warn(f"Unknown method '{self.method}'. Using fallback.")
+        return self.fallback_mean if self.fallback_mean else 3600.0
+
+    # ------------------------------------------------------------------
+    # XGBoost feature-row builder
+    # ------------------------------------------------------------------
+
+    def _build_xgb_feature_row(
+        self,
+        curr_activity: str,
+        context: Optional[Dict] = None,
+    ) -> pd.DataFrame:
+        """
+        Build a single-row DataFrame that matches the feature schema expected
+        by the XGBoost activity-specific models.
+
+        The schema mirrors what FeatureEngineering.prepare_features_and_target()
+        produces.  Unknown / missing columns are filled with sensible defaults.
+
+        Args:
+            curr_activity: Name of the activity being predicted.
+            context: Optional dict with additional context fields:
+                     'hour', 'weekday', 'month', 'day_of_month', 'day_of_year',
+                     'minute', 'second', 'microsecond', 'event_index',
+                     'org:resource', 'EventOrigin',
+                     'case:LoanGoal', 'case:ApplicationType',
+                     'case:RequestedAmount', … (any case feature).
+
+        Returns:
+            Single-row pd.DataFrame ready for model.predict().
+        """
+        from datetime import datetime
+
+        if context is None:
+            context = {}
+
+        now = datetime.now()
+
+        import math
+
+        row: Dict = {}
+
+        # ── Temporal features ──────────────────────────────────────────
+        hour     = float(context.get("hour", now.hour))
+        weekday  = float(context.get("weekday", now.weekday()))
+        row["hour"]        = hour
+        row["minute"]      = float(context.get("minute", now.minute))
+        row["second"]      = float(context.get("second", now.second))
+        row["microsecond"] = float(context.get("microsecond", now.microsecond))
+        row["weekday"]     = weekday
+        row["day_of_month"] = float(context.get("day_of_month", now.day))
+        row["month"]       = float(context.get("month", now.month))
+        row["day_of_year"] = float(context.get("day_of_year", now.timetuple().tm_yday))
+
+        # ── Cyclical time encodings ────────────────────────────────────
+        row["hour_sin"]     = math.sin(2 * math.pi * hour / 24)
+        row["hour_cos"]     = math.cos(2 * math.pi * hour / 24)
+        row["weekday_sin"]  = math.sin(2 * math.pi * weekday / 7)
+        row["weekday_cos"]  = math.cos(2 * math.pi * weekday / 7)
+
+        # ── Weekend flag ───────────────────────────────────────────────
+        row["is_weekend"] = 1 if weekday >= 5 else 0
+
+        # ── Event-level features ───────────────────────────────────────
+        row["event"]       = str(curr_activity)
+        row["event_index"] = float(context.get("event_index",
+                                               context.get("event_position_in_case", 1)))
+        row["org:resource"] = str(context.get("org:resource",
+                                              context.get("resource_2", "unknown")))
+        row["EventOrigin"] = str(context.get("EventOrigin", "unknown"))
+
+        # ── Advanced context features ──────────────────────────────────
+        row["time_since_case_start"] = float(
+            context.get("time_since_case_start", 0.0)
+        )
+        row["time_since_last_event"] = float(
+            context.get("time_since_last_event", 0.0)
+        )
+        row["prev_activity"] = str(
+            context.get("prev_activity", "CASE_START")
+        )
+
+        # ── Case-level features ────────────────────────────────────────
+        row["case:LoanGoal"]         = context.get("case:LoanGoal", None)
+        row["case:ApplicationType"]  = context.get("case:ApplicationType", None)
+        row["case:RequestedAmount"]  = context.get("case:RequestedAmount", None)
+
+        # Optional offer-level features
+        for col in [
+            "FirstWithdrawalAmount", "NumberOfTerms", "Accepted",
+            "MonthlyCost", "Selected", "CreditScore", "OfferedAmount", "OfferID",
+        ]:
+            if col in context:
+                row[col] = context[col]
+
+        return pd.DataFrame([row])
 
     def _context_to_features(
         self,
