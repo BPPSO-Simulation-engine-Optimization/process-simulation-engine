@@ -1,24 +1,24 @@
 # Process Simulation Engine
 
 Data-driven discrete-event simulation (DES) engine for the BPIC 2017 loan application process.
-Built for TUM Masters coursework (Business Process Prediction, Simulation and Optimization). Python 3.12+.
+Built for TUM Business Process Prediction, Simulation and Optimization Practical Course. Python 3.12+.
 
 ## Reproduction
 
 ### 1. Clone and set up environment
 
 ```bash
-git clone <repo-url> && cd process-simulation-engine
-conda create -n pse_env python=3.12 && conda activate pse_env
+git clone https://github.com/BPPSO-Simulation-engine-Optimization/process-simulation-engine.git && cd process-simulation-engine
+conda env create -f environment.yml
+conda activate pse_env
 ```
 
-### 2. Install dependencies
+### 2. Install PM4Py
 
-Vendored PM4Py **must** be installed first:
+The patched PM4Py build **must** be installed separately (not included in `environment.yml`):
 
 ```bash
 pip install pm4py-release/
-pip install -r requirements.txt
 ```
 
 ### 3. Download event log
@@ -31,30 +31,23 @@ eventlog/eventlog.xes.gz
 
 ### 4. Download trained models
 
-Models (~6 GB) are not tracked in git. Download and extract:
+Models (~4.4 GB) are not tracked in git. Download from [Google Drive](https://drive.google.com/drive/folders/1NpMEYyLnDi6gp3OdN7sf_f6kCCRPOPog?usp=sharing) and extract into the `models/` directory.
 
-```bash
-# <MODEL_DOWNLOAD_URL> — hosted separately, ask maintainers
-tar xzf models.tar.gz          # extracts to models/
-```
-
-Resource models are expected at `resources/resource_permissions/` and `resources/resource_availabilities/`.
+Resource models (`resources/resource_permissions/`, `resources/resource_availabilities/`) are tracked in git.
 
 ### 5. Run simulation
 
 ```bash
 conda activate pse_env
 python -m integration.test_integration \
-  --next-activity process_transformer \
-  --pt-lifecycle-mode gt_activity_gated \
-  --arrivals advanced \
-  --processing advanced \
-  --attributes advanced \
-  --resource-strategy random \
-  --resource-allocation-mode greedy \
-  --num-cases 1000 \
-  --pt-max-duration-days 30 \
-  --event-log eventlog/eventlog.xes.gz
+ 	--next-activity lifecycle_dual_start_complete_baseline
+	--arrivals advanced \
+	--attributes advanced \
+	--processing advanced \
+	--resource-strategy random \
+	--resource-allocation-mode greedy \
+	--num-cases 31509 \
+	--event-log eventlog/eventlog.xes.gz
 ```
 
 Output: `integration/output/simulated_log.csv`
