@@ -31,6 +31,12 @@ _lstm_predictor_cache: Optional[Any] = None
 
 _MAX_SECONDS = 7 * 24 * 3600  # 1 week upper bound
 
+# Tie-breaking constant (ms) added to the dummy/unassigned cost so that a real
+# resource is always preferred when its cost exactly equals the dummy threshold.
+# With delta=1 and a single eligible resource the dummy cost equals that
+# resource's cost exactly, which previously caused systematic "postpone" decisions.
+_DUMMY_TIEBREAK_MS = 1
+
 
 @dataclass(frozen=True)
 class SelectionConfig:
@@ -39,6 +45,7 @@ class SelectionConfig:
     avg_sample_size: int = 25
     pmsp_solver_time_limit_seconds: Optional[float] = None
     prediction_batch_size: int = 0  # Max predictions per task (0 = unlimited)
+    optimization_batch_size: int = 0  # Min waiting tasks to trigger optimization (0 = always optimize)
 
 
 def solve_assignment_jv(
@@ -69,7 +76,8 @@ def solve_assignment_jv(
         for j, r in enumerate(R):
             if (t, r) in costs:
                 C[i, j] = float(remaining.get(r, 0) + costs[(t, r)])
-        C[i, nR + i] = float(dummy_cost.get(t, 10**9))
+        # +_DUMMY_TIEBREAK_MS: real resources win ties against the dummy column
+        C[i, nR + i] = float(dummy_cost.get(t, 10**9)) + _DUMMY_TIEBREAK_MS
 
     row_ind, col_ind = linear_sum_assignment(C)
     objective = 0.0
@@ -193,7 +201,11 @@ def predict_processing_seconds(
                 curr_lifecycle="complete",
                 context=ctx,
             )
-        return _safe_seconds(seconds)
+        safe_seconds = _safe_seconds(seconds)
+        if safe_seconds == 0.0:
+            logger.debug("LSTM predictor returned 0.00s for %s -> %s (raw: %s)", 
+                        curr_activity, candidate_resource, seconds)
+        return safe_seconds
     except Exception as e:
         logger.error("LSTM predictor.predict failed: %s", e, exc_info=True)
         return None
@@ -214,8 +226,11 @@ def handle_batch_scheduling_optimization(
     if not waiting_tasks:
         return None, {"decision": "no_waiting_tasks"}
 
+    # logger.info("PMSP [Optimization]: Starting optimization for %d waiting tasks", len(waiting_tasks))
+
     authorized_resources_by_waiting_task: Dict[str, List[str]] = {}
     task_ids: List[str] = []
+    task_details: Dict[str, Dict[str, Any]] = {}  # For logging
 
     for waiting_work in waiting_tasks:
         task_id = f"{waiting_work.case_id}_{waiting_work.allocation_activity}"
@@ -230,8 +245,15 @@ def handle_batch_scheduling_optimization(
             eligible_resources = allocator.permissions.get_eligible_resources(allocation_activity)
 
         if not eligible_resources:
+            # logger.debug("PMSP [Optimization]: Task %s (activity: %s, case: %s) has no eligible resources", 
+            #             task_id, allocation_activity, waiting_work.case_id)
             continue
         authorized_resources_by_waiting_task[task_id] = eligible_resources
+        task_details[task_id] = {
+            "activity": allocation_activity,
+            "case_id": waiting_work.case_id,
+            "eligible_resources": len(eligible_resources)
+        }
 
     # Get busy_until for each authorized resource from the resource pool
     resource_busy_until: Dict[str, Optional[datetime]] = {}
@@ -246,7 +268,13 @@ def handle_batch_scheduling_optimization(
             resource_busy_until[r] = None
 
     if not authorized_resources_by_waiting_task:
+        # logger.warning("PMSP [Optimization]: No tasks with eligible resources, aborting")
         return None, {"decision": "no_eligible_resources"}
+
+    # logger.info("PMSP [Optimization]: Found %d tasks with eligible resources", len(authorized_resources_by_waiting_task))
+    # for task_id, details in task_details.items():
+    #     logger.info("  Task %s: Activity '%s' (case %s) - %d eligible resources", 
+    #                task_id, details["activity"], details["case_id"], details["eligible_resources"])
 
     # Build R_P candidates: authorized resources available in this time slot
     authorized_and_timeslotoperating_resources_per_task: Dict[str, List[str]] = {}
@@ -264,7 +292,7 @@ def handle_batch_scheduling_optimization(
         r for resources in authorized_and_timeslotoperating_resources_per_task.values() for r in resources
     }
     if not rp_candidates:
-        logger.debug("R_P is empty for current timeslot -> skipping PMSP")
+        # logger.warning("PMSP [Optimization]: R_P is empty for current timeslot -> skipping PMSP")
         assignment_all_dummy = {task_id: None for task_id in task_ids}
         debug = {
             "status": 0,
@@ -276,8 +304,11 @@ def handle_batch_scheduling_optimization(
         }
         return assignment_all_dummy, debug
 
+    # logger.info("PMSP [Optimization]: Calculating parameters for %d tasks with %d available resources (R_P)", 
+    #             len(authorized_resources_by_waiting_task), len(rp_candidates))
+    # logger.info("PMSP [Optimization]: Available resources: %s", ", ".join(sorted(rp_candidates)))
     # Calculate PMSP parameters
-    dummy_costs, predicted_remaining_times, costs_authorized_resource_task_assignment = calculate_pmsp_parameters(
+    dummy_costs, predicted_remaining_times, costs_authorized_resource_task_assignment, raw_processing_times = calculate_pmsp_parameters(
         delta=cfg.dummy_delta,
         authorized_resources_per_task=authorized_resources_by_waiting_task,
         waiting_tasks=waiting_tasks,
@@ -298,6 +329,8 @@ def handle_batch_scheduling_optimization(
                 if res in costs_authorized_resource_task_assignment[task_id]
             }
 
+    # logger.info("PMSP [Optimization]: Solving optimization problem for %d tasks and %d resources", 
+    #             len(task_ids), len(rp_candidates))
     # Solve PMSP
     assignment, debug = solve_pmsp_ilp(
         delta=cfg.dummy_delta,
@@ -312,6 +345,24 @@ def handle_batch_scheduling_optimization(
     )
 
     debug["costs_per_task_resource"] = costs_authorized_and_timeslotoperating_resources_per_task
+    debug["raw_processing_times"] = raw_processing_times  # task_id -> resource -> seconds (for SPT ordering)
+    if assignment:
+        assigned_count = sum(1 for v in assignment.values() if v is not None)
+        # logger.info("PMSP [Optimization]: Optimization finished - %d/%d tasks assigned to resources", 
+        #            assigned_count, len(assignment))
+        
+        # Log detailed assignment results
+        # logger.info("PMSP [Optimization]: Detailed assignment results:")
+        # for task_id, resource in sorted(assignment.items()):
+        #     task_info = task_details.get(task_id, {})
+        #     activity = task_info.get("activity", "unknown")
+        #     case_id = task_info.get("case_id", "unknown")
+        #     if resource is not None:
+        #         logger.info("  Task '%s' (case %s, activity '%s') -> Resource %s", 
+        #                    task_id, case_id, activity, resource)
+        #     else:
+        #         logger.info("  Task '%s' (case %s, activity '%s') -> DUMMY (unassigned)", 
+        #                    task_id, case_id, activity)
     return assignment, debug
 
 
@@ -333,11 +384,12 @@ def calculate_pmsp_parameters(
     ones up to ``prediction_batch_size`` per task (0 = unlimited).
 
     Returns:
-        (dummy_costs, predicted_remaining_times, costs_authorized_resource_task_assignment)
+        (dummy_costs, predicted_remaining_times, costs_authorized_resource_task_assignment, raw_processing_times)
     """
     dummy_costs: Dict[str, int] = {}
     predicted_remaining_times: Dict[str, float] = {}
     costs_authorized_resource_task_assignment: Dict[str, Dict[str, int]] = {}
+    raw_processing_times: Dict[str, Dict[str, float]] = {}  # task_id -> resource -> seconds (for SPT ordering)
 
     task_id_to_waiting_work: Dict[str, Any] = {}
     for waiting_work in waiting_tasks:
@@ -346,20 +398,39 @@ def calculate_pmsp_parameters(
 
     batch_limit_per_task = prediction_batch_size if prediction_batch_size > 0 else float('inf')
 
+    total_tasks = len(authorized_resources_per_task)
+    task_index = 0
     for task_id, authorized_resources in authorized_resources_per_task.items():
+        task_index += 1
+        # Log progress every 5 tasks or at milestones (10%, 25%, 50%, 75%, 100%)
+        # if total_tasks > 10 and (task_index % 5 == 0 or 
+        #                           task_index == 1 or 
+        #                           task_index == max(1, int(total_tasks * 0.1)) or
+        #                           task_index == max(1, int(total_tasks * 0.25)) or
+        #                           task_index == max(1, int(total_tasks * 0.5)) or
+        #                           task_index == max(1, int(total_tasks * 0.75)) or
+        #                           task_index == total_tasks):
+        #     logger.info("PMSP: Calculating parameters for task %d/%d (%.1f%%)", 
+        #                task_index, total_tasks, 100.0 * task_index / total_tasks)
         if task_id not in task_id_to_waiting_work:
             continue
 
         waiting_work = task_id_to_waiting_work[task_id]
         allocation_activity = waiting_work.allocation_activity
         case_state = waiting_work.case_state
+        case_id = waiting_work.case_id
 
         hist = getattr(case_state, "activity_history", []) or []
         prev_activity = hist[-1] if hist else "START"
 
         costs_authorized_resource_task_assignment[task_id] = {}
+        raw_processing_times[task_id] = {}  # Store raw PTs for SPT ordering
         task_costs = []
         task_prediction_count = 0
+        
+        # Log task start
+        # logger.info("PMSP [Parameters]: Calculating costs for task %s (activity: '%s', case: %s)", 
+        #            task_id, allocation_activity, case_id)
 
         # Split authorized resources into available / unavailable
         if allocator is not None:
@@ -377,8 +448,10 @@ def calculate_pmsp_parameters(
 
         ordered_resources = timeslot_available + timeslot_unavailable
 
+        # logger.info("PMSP [Parameters]:   Predicting processing times for %d resources:", len(ordered_resources))
         for resource in ordered_resources:
             if task_prediction_count >= batch_limit_per_task:
+                # logger.info("PMSP [Parameters]:   (Stopped at batch limit: %d predictions)", batch_limit_per_task)
                 break
 
             sec = predict_processing_seconds(
@@ -392,22 +465,61 @@ def calculate_pmsp_parameters(
             task_prediction_count += 1
 
             if sec is not None:
+                # Store raw processing time (for SPT ordering in worklists)
+                raw_processing_times[task_id][resource] = sec
+                # Cost = processing_time
                 cost_ms = int(sec * 1000)
                 costs_authorized_resource_task_assignment[task_id][resource] = cost_ms
-                task_costs.append(sec)
+                task_costs.append(sec)  # store raw processing time for dummy-cost averaging
+                
+                # Log each prediction
+                # logger.info("PMSP [Parameters]:     Resource %s: predicted_processing_time=%.2fs, cost=%d ms", 
+                #            resource, sec, cost_ms)
+            else:
+                # logger.warning("PMSP [Parameters]:     Resource %s: prediction failed (returned None)", resource)
+                pass
 
         # c_d(t) = delta * avg(c(t,r))
         if task_costs:
             avg_cost = sum(task_costs) / len(task_costs)
-            dummy_costs[task_id] = int(delta * avg_cost * 1000)
+            dummy_cost_seconds = delta * avg_cost
+            dummy_costs[task_id] = int(dummy_cost_seconds * 1000)
+            
+            # Log dummy cost calculation
+            # logger.info("PMSP [Parameters]:   Dummy cost calculation for task %s:", task_id)
+            # logger.info("PMSP [Parameters]:     - Number of predictions: %d", len(task_costs))
+            # logger.info("PMSP [Parameters]:     - Average processing time: %.2f seconds", avg_cost)
+            # logger.info("PMSP [Parameters]:     - Delta (multiplier): %.2f", delta)
+            # logger.info("PMSP [Parameters]:     - Final dummy cost: %.2f seconds = %d ms", 
+            #            dummy_cost_seconds, dummy_costs[task_id])
         else:
             dummy_costs[task_id] = 10**9
+            # logger.warning("PMSP [Parameters]:   Dummy cost for task %s: %d ms (no valid predictions)", 
+            #               task_id, dummy_costs[task_id])
+            pass
 
-    logger.debug(
-        "PMSP params: %d tasks (prediction limit per task: %s)",
-        len(authorized_resources_per_task),
-        prediction_batch_size or "unlimited",
-    )
+    # logger.info(
+    #     "PMSP [Parameters]: Calculated parameters for %d tasks (prediction limit per task: %s)",
+    #     len(authorized_resources_per_task),
+    #     prediction_batch_size or "unlimited",
+    # )
+    
+    # Log cost matrix summary
+    # logger.info("PMSP [Parameters]: Cost matrix summary:")
+    # for task_id in sorted(authorized_resources_per_task.keys()):
+    #     if task_id in costs_authorized_resource_task_assignment:
+    #         costs = costs_authorized_resource_task_assignment[task_id]
+    #         dummy_cost = dummy_costs.get(task_id, 0)
+    #         logger.info("PMSP [Parameters]:   Task %s: %d resources with costs, dummy_cost=%d ms", 
+    #                    task_id, len(costs), dummy_cost)
+    #         # Show min/max costs
+    #         if costs:
+    #             min_cost = min(costs.values())
+    #             max_cost = max(costs.values())
+    #             logger.info("PMSP [Parameters]:     Cost range: %d ms - %d ms (min: %s, max: %s)", 
+    #                        min_cost, max_cost,
+    #                        [r for r, c in costs.items() if c == min_cost][0],
+    #                        [r for r, c in costs.items() if c == max_cost][0])
 
     # Calculate remaining processing times for working resources (c_r(r))
     all_resources = set()
@@ -424,7 +536,7 @@ def calculate_pmsp_parameters(
         else:
             predicted_remaining_times[r] = 0.0
 
-    return dummy_costs, predicted_remaining_times, costs_authorized_resource_task_assignment
+    return dummy_costs, predicted_remaining_times, costs_authorized_resource_task_assignment, raw_processing_times
 
 
 def solve_pmsp_ilp(
@@ -459,29 +571,96 @@ def solve_pmsp_ilp(
     nR_P = len(R_P)
 
     if nT == 0 or nR_P == 0:
+        # logger.debug("PMSP: Empty problem (nT=%d, nR_P=%d), skipping", nT, nR_P)
         return {t: None for t in T}, {"status": 0, "nT": nT, "nR_P": nR_P, "solver": "empty"}
 
-    # Prepare JV fallback
-    costs_for_jv: Dict[Tuple[str, str], int] = {}
-    dummy_cost_for_jv: Dict[str, int] = {}
-    remaining_for_jv: Dict[str, int] = {}
+    # Fast-path: single-task case can be solved greedily without CP-SAT/JV.
+    if nT == 1:
+        t = T[0]
+        task_costs = costs_authorized_and_timeslotoperating_resources_per_task.get(t, {})
+        # No usable resource costs in this timeslot -> dummy.
+        if not task_costs:
+            # logger.info("PMSP [Solver]: Single-task fast-path: no available resources for task %s -> DUMMY", t)
+            return {t: None}, {
+                "status": 0,
+                "nT": 1,
+                "nR_P": nR_P,
+                "solver": "greedy_single",
+                "decision": "no_available_resource",
+            }
 
-    for task_id in T:
-        if task_id in costs_authorized_and_timeslotoperating_resources_per_task:
-            for r, cost in costs_authorized_and_timeslotoperating_resources_per_task[task_id].items():
-                costs_for_jv[(task_id, r)] = cost
-        dummy_cost_for_jv[task_id] = dummy_costs.get(task_id, 10**9)
+        # Choose resource that minimizes remaining[r] + c(t,r).
+        best_r = None
+        best_total_ms = None
+        for r, cost_ms in task_costs.items():
+            rem_ms = int(predicted_remaining_times.get(r, 0.0) * 1000)
+            total_ms = rem_ms + cost_ms
+            if best_total_ms is None or total_ms < best_total_ms:
+                best_total_ms = total_ms
+                best_r = r
 
-    for r in R_P:
-        remaining_for_jv[r] = int(predicted_remaining_times.get(r, 0.0) * 1000)
+        dummy_ms = int(dummy_costs.get(t, 10**9))
+        # Effective dummy objective includes the tie-break; we emulate the same
+        # behavior by letting the real resource win on exact equality.
+        if best_r is not None and best_total_ms is not None and best_total_ms <= dummy_ms:
+            # logger.info(
+            #     "PMSP [Solver]: Single-task fast-path: assigning task %s -> %s "
+            #     "(best_total=%d ms, dummy=%d ms)",
+            #     t,
+            #     best_r,
+            #     best_total_ms,
+            #     dummy_ms,
+            # )
+            return {t: best_r}, {
+                "status": 1,
+                "nT": 1,
+                "nR_P": nR_P,
+                "solver": "greedy_single",
+                "decision": "assign_real",
+                "objective": best_total_ms,
+            }
 
-    assignment_jv, debug_jv = solve_assignment_jv(
-        tasks=T,
-        resources=R_P,
-        costs=costs_for_jv,
-        dummy_cost=dummy_cost_for_jv,
-        remaining=remaining_for_jv,
-    )
+        # logger.info(
+        #     "PMSP [Solver]: Single-task fast-path: assigning task %s -> DUMMY "
+        #     "(best_total=%s ms, dummy=%d ms)",
+        #     t,
+        #     best_total_ms if best_total_ms is not None else -1,
+        #     dummy_ms,
+        # )
+        return {t: None}, {
+            "status": 1,
+            "nT": 1,
+            "nR_P": nR_P,
+            "solver": "greedy_single",
+            "decision": "assign_dummy",
+            "objective": dummy_ms + _DUMMY_TIEBREAK_MS,
+        }
+
+    def _run_jv_fallback() -> Tuple[Dict[str, Optional[str]], Dict[str, int]]:
+        """
+        Lazily run JV fallback only when CP-SAT is unavailable or clearly worse.
+        Avoids always paying O(N^3) JV cost when CP-SAT is fast and optimal.
+        """
+        costs_for_jv: Dict[Tuple[str, str], int] = {}
+        dummy_cost_for_jv: Dict[str, int] = {}
+        remaining_for_jv: Dict[str, int] = {}
+
+        for task_id in T:
+            if task_id in costs_authorized_and_timeslotoperating_resources_per_task:
+                for r, cost in costs_authorized_and_timeslotoperating_resources_per_task[task_id].items():
+                    costs_for_jv[(task_id, r)] = cost
+            dummy_cost_for_jv[task_id] = dummy_costs.get(task_id, 10**9)
+
+        for r in R_P:
+            remaining_for_jv[r] = int(predicted_remaining_times.get(r, 0.0) * 1000)
+
+        return solve_assignment_jv(
+            tasks=T,
+            resources=R_P,
+            costs=costs_for_jv,
+            dummy_cost=dummy_cost_for_jv,
+            remaining=remaining_for_jv,
+        )
 
     effective_time_limit = 2.0 if solver_time_limit_seconds is None else float(solver_time_limit_seconds)
     effective_time_limit = max(0.01, effective_time_limit)
@@ -552,7 +731,9 @@ def solve_pmsp_ilp(
         dummy_sum_terms = []
         for t in T:
             if t in dummy_costs:
-                dummy_sum_terms.append(dummy_costs[t] * y[t])
+                # +_DUMMY_TIEBREAK_MS per dummy assignment so that a real resource
+                # is strictly preferred when its cost equals the dummy threshold.
+                dummy_sum_terms.append((dummy_costs[t] + _DUMMY_TIEBREAK_MS) * y[t])
 
         if nR_P > 0:
             objective = nR_P * 2 * k_m - sum_workload_var + nR_P * sum(dummy_sum_terms)
@@ -569,8 +750,14 @@ def solve_pmsp_ilp(
         solver.parameters.max_time_in_seconds = effective_time_limit
         solver.parameters.num_search_workers = 1
 
+        # logger.info("PMSP [Solver]: Starting CP-SAT solver for %d tasks, %d resources (time limit: %.2fs)", 
+        #            nT, nR_P, effective_time_limit)
+        # logger.info("PMSP [Solver]: Problem size - Tasks: %d, Resources: %d, Variables: %d", 
+        #            nT, nR_P, len(x) + len(y))
         status = solver.Solve(model)
         status_name = solver.StatusName(status)
+        # logger.info("PMSP [Solver]: CP-SAT solver finished with status: %s (wall_time: %.3fs)", 
+        #            status_name, solver.WallTime())
 
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             assignment_cp: Dict[str, Optional[str]] = {t: None for t in T}
@@ -589,14 +776,22 @@ def solve_pmsp_ilp(
             sum_workload_val = solver.Value(sum_workload_var)
             k_f_val = k_m_val - (sum_workload_val / nR_P) if nR_P > 0 else 0.0
             dummy_sum = sum(int(dummy_costs.get(t, 0)) * solver.Value(y[t]) for t in T)
+            dummy_count = sum(1 for t in T if solver.Value(y[t]) >= 1)
             cp_obj = int(round(k_m_val + k_f_val + dummy_sum))
-            jv_obj = int(debug_jv.get("objective", 10**18))
+            # Only run JV if CP-SAT is non-optimal and we want to compare objectives.
+            if status != cp_model.OPTIMAL:
+                assignment_jv, debug_jv = _run_jv_fallback()
+                jv_obj = int(debug_jv.get("objective", 10**18))
+                if jv_obj <= cp_obj:
+                    dbg = dict(debug_jv)
+                    dbg.update({"status": int(status), "status_name": status_name, "fallback_from": "cp_sat"})
+                    return assignment_jv, dbg
 
-            if status != cp_model.OPTIMAL and jv_obj <= cp_obj:
-                dbg = dict(debug_jv)
-                dbg.update({"status": int(status), "status_name": status_name, "fallback_from": "cp_sat"})
-                return assignment_jv, dbg
-
+            assigned_count = sum(1 for v in assignment_cp.values() if v is not None)
+            # logger.info("PMSP [Solver]: Optimization complete - %d/%d tasks assigned (objective: %d, k_m: %d, k_f: %d)", 
+            #            assigned_count, nT, cp_obj, int(k_m_val), int(round(k_f_val)))
+            # logger.info("PMSP [Solver]: Makespan (k_m): %d ms, Fairness (k_f): %d ms, Dummy assignments: %d/%d tasks (cost: %d ms)", 
+            #            int(k_m_val), int(round(k_f_val)), dummy_count, nT, dummy_sum)
             return assignment_cp, {
                 "status": int(status),
                 "status_name": status_name,
@@ -608,12 +803,17 @@ def solve_pmsp_ilp(
                 "k_f": int(round(k_f_val)),
             }
 
+        # CP-SAT finished but without a feasible/optimal solution: use JV fallback.
+        assignment_jv, debug_jv = _run_jv_fallback()
         dbg = dict(debug_jv)
         dbg.update({"status": int(status), "status_name": status_name, "fallback_from": "cp_sat"})
         return assignment_jv, dbg
 
     except Exception as e:
-        logger.warning("CP-SAT solver failed, using JV fallback: %s", e)
+        # logger.warning("PMSP [Solver]: CP-SAT solver failed, using JV fallback: %s", e)
+        assignment_jv, debug_jv = _run_jv_fallback()
+        assigned_count = sum(1 for v in assignment_jv.values() if v is not None)
+        # logger.info("PMSP [Solver]: Using JV fallback - %d/%d tasks assigned", assigned_count, nT)
         dbg = dict(debug_jv)
         dbg.update({"fallback_from": "cp_sat_import_or_runtime_error", "error": str(e)})
         return assignment_jv, dbg

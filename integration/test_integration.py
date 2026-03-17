@@ -105,7 +105,6 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print("=" * 60)
     print(f"  Processing time mode: {config.processing_time_mode}")
     print(f"  Case arrival mode: {config.case_arrival_mode}")
-    print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Resource selection: {config.resource_selection_strategy}")
     print(f"  Resource allocation mode: {config.resource_allocation_mode}")
     if config.next_activity_class == "process_transformer":
@@ -119,21 +118,23 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         print(f"  PMSP delta: {config.pmsp_dummy_delta}")
         print(f"  PMSP solver time limit: {config.pmsp_solver_time_limit_seconds}s")
         print(f"  PMSP prediction batch size: {config.pmsp_prediction_batch_size}")
+        print(f"  PMSP optimization batch size: {config.pmsp_optimization_batch_size}")
     print(f"  Number of cases: {config.num_cases}")
     print("=" * 60 + "\n")
 
-    # Get start date from event log
-    if 'time:timestamp' in df.columns:
-        start_date = pd.to_datetime(df['time:timestamp']).min().to_pydatetime()
-    else:
-        start_date = datetime(2016, 1, 4, 8, 0)
+    # Get start date - use Monday 8am Jan 4, 2016 to avoid weekend/holiday issues
+    # (The event log starts on 2016-01-01 which is a holiday, causing many arrivals
+    #  to be pushed to 2016-01-04 08:00:00, making PMSP timestamps stuck)
+    start_date = datetime(2016, 1, 4, 8, 0)
     print(f"Simulation start date: {start_date}")
 
     # Setup predictors
     print("\nSetting up predictors...")
+    # Pass df if arrival mode is advanced (needed for training/fallback)
+    needs_df = config.case_arrival_mode == "advanced"
     arrivals, next_act_pred, proc_pred, attr_pred = setup_simulation(
         config,
-        df=df if config.case_arrival_mode == "advanced" or config.case_attribute_mode == "advanced" else None,
+        df=df if needs_df else None,
         start_date=start_date,
     )
     print(f"Generated {len(arrivals)} arrival timestamps")
@@ -205,8 +206,13 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
             dummy_delta=config.pmsp_dummy_delta,
             pmsp_solver_time_limit_seconds=config.pmsp_solver_time_limit_seconds,
             prediction_batch_size=config.pmsp_prediction_batch_size,
+            optimization_batch_size=config.pmsp_optimization_batch_size,
         )
         print(f"Created PMSP config (delta={config.pmsp_dummy_delta})")
+
+    # Prepare output directory and CSV path for incremental writing
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "simulated_log.csv")
 
     engine = DESEngine(
         resource_allocator=allocator,
@@ -228,6 +234,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
         drl_max_postpone_wait_hours=config.drl_max_postpone_wait_hours,
         pmsp_config=pmsp_config,
         enable_profiling=enable_profiling,
+        incremental_csv_path=csv_path,  # Enable incremental CSV writing every 100 cases
     )
 
     # Run simulation
@@ -247,14 +254,16 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     if batch_policy is not None and hasattr(batch_policy, 'print_diagnostics_summary'):
         batch_policy.print_diagnostics_summary()
 
-    # Export results
-    os.makedirs(output_dir, exist_ok=True)
-
-    csv_path = os.path.join(output_dir, "simulated_log.csv")
+    # Export results (CSV path already defined above for incremental writing)
     xes_path = os.path.join(output_dir, "simulated_log.xes")
-
-    LogExporter.to_csv(events, csv_path)
-    print(f"\nExported CSV to: {csv_path}")
+    
+    # Note: If incremental_csv_path was set, events are already written incrementally.
+    # This final export ensures all events are in the file (including any remaining ones).
+    if not hasattr(engine, '_incremental_csv_path') or engine._incremental_csv_path != csv_path:
+        LogExporter.to_csv(events, csv_path)
+        print(f"\nExported CSV to: {csv_path}")
+    else:
+        print(f"\nCSV already written incrementally to: {csv_path}")
 
     try:
         LogExporter.to_xes(events, xes_path)
@@ -276,20 +285,14 @@ def main():
     parser.add_argument(
         "--arrivals",
         choices=["basic", "advanced"],
-        default="basic",
-        help="Case arrival mode (default: basic)"
+        default="advanced",
+        help="Case arrival mode (default: advanced)"
     )
     parser.add_argument(
         "--processing",
         choices=["basic", "advanced"],
         default="basic",
         help="Processing time mode (default: basic)"
-    )
-    parser.add_argument(
-        "--attributes",
-        choices=["basic", "advanced"],
-        default="basic",
-        help="Case attribute mode (default: basic)"
     )
     parser.add_argument(
         "--processing-model-path",
@@ -372,6 +375,12 @@ def main():
         help="PMSP max predictions per task (0=unlimited, default: 0)"
     )
     parser.add_argument(
+        "--pmsp-optimization-batch-size",
+        type=int,
+        default=0,
+        help="PMSP min waiting tasks to trigger optimization (0=always optimize, default: 0)"
+    )
+    parser.add_argument(
         "--drl-model-path",
         default="models/drl_allocation/drl_allocation_model",
         help="Path to trained DRL model (for --resource-allocation-mode drl)"
@@ -418,7 +427,6 @@ def main():
     config = SimulationConfig(
         processing_time_mode=args.processing,
         case_arrival_mode=args.arrivals,
-        case_attribute_mode=args.attributes,
         event_log_path=args.event_log,
         num_cases=num_cases,
         verbose=args.verbose,
@@ -451,6 +459,7 @@ def main():
         config.pmsp_dummy_delta = args.pmsp_dummy_delta
         config.pmsp_solver_time_limit_seconds = args.pmsp_solver_time_limit
         config.pmsp_prediction_batch_size = args.pmsp_prediction_batch_size
+        config.pmsp_optimization_batch_size = args.pmsp_optimization_batch_size
 
     # Create resource allocator
     allocator = create_resource_allocator(args.event_log)

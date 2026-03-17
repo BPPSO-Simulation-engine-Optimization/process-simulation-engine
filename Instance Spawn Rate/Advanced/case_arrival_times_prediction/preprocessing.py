@@ -28,7 +28,19 @@ class DailyArrivalBuilder:
             raise KeyError("df muss Spalten 'time:timestamp' und 'case:concept:name' enthalten.")
 
         df = df.copy()
-        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+        # Ensure we always end up with tz-naive timestamps (UTC-based) regardless of
+        # whether the input is a Series or a DatetimeIndex (older pandas may not
+        # expose .dt on DatetimeIndex).
+        ts = pd.to_datetime(df["time:timestamp"])
+        # Series path (has .dt accessor)
+        if hasattr(ts, "dt"):
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+        else:
+            # DatetimeIndex or array-like with .tz attribute
+            if getattr(ts, "tz", None) is not None:
+                ts = ts.tz_convert("UTC").tz_localize(None)
+        df["time:timestamp"] = ts
 
         first_events = (
             df.sort_values("time:timestamp")

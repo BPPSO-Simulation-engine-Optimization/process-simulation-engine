@@ -48,16 +48,13 @@ def setup_simulation(
         next_activity_predictor may be None if auto-load should be used.
 
     Raises:
-        ValueError: If advanced mode requires df but df is None.
+        ValueError: If advanced arrival mode requires df but df is None.
     """
     if start_date is None:
         start_date = datetime.now()
 
-    # Validate: advanced modes require training data
-    needs_df = (
-        config.case_arrival_mode == "advanced" or
-        config.case_attribute_mode == "advanced"
-    )
+    # Validate: advanced arrival mode requires training data
+    needs_df = config.case_arrival_mode == "advanced"
     if needs_df and df is None:
         raise ValueError(
             "Event log DataFrame (df) is required for advanced mode predictors. "
@@ -170,6 +167,17 @@ def _setup_arrivals(
             from case_arrival_times_prediction import run
             from case_arrival_times_prediction.config import SimulationConfig as ArrivalConfig
 
+            # Normalize timezone handling in df to avoid tz-aware/naive comparison issues
+            df_for_arrivals = df
+            if df is not None:
+                # Work on a shallow copy to avoid mutating the caller's DataFrame
+                df_for_arrivals = df.copy()
+                for col in df_for_arrivals.columns:
+                    series = df_for_arrivals[col]
+                    # Convert tz-aware datetimes to UTC and then drop tz info (naive UTC)
+                    if pd.api.types.is_datetime64tz_dtype(series):
+                        df_for_arrivals[col] = series.dt.tz_convert("UTC").dt.tz_localize(None)
+
             # Build config for the arrival pipeline
             arr_config = ArrivalConfig(
                 train_ratio=config.arrival_train_ratio,
@@ -186,14 +194,25 @@ def _setup_arrivals(
             )
 
             # Determine whether to retrain or load cached model
-            model_path = "models/case_arrival_model.pkl"
+            # Use absolute path relative to project root
+            project_root = Path(__file__).parent.parent
+            model_dir = project_root / "models"
+            model_dir.mkdir(exist_ok=True)  # Create models directory if it doesn't exist
+            model_path = str(model_dir / "case_arrival_model.pkl")
 
             # Use cached model if it exists, otherwise retrain if data is available
-            if os.path.exists(model_path):
+            model_exists = os.path.exists(model_path)
+            if model_exists:
                 logger.info(f"Found existing case arrival model at {model_path}, using cached version.")
                 retrain_model = False
             else:
-                retrain_model = df is not None
+                if df_for_arrivals is None:
+                    raise ValueError(
+                        f"Case arrival model not found at {model_path} and no training data (df) provided. "
+                        f"Either provide df to train the model, or ensure the model exists at {model_path}."
+                    )
+                logger.info(f"Case arrival model not found. Training new model at {model_path}...")
+                retrain_model = True
 
             # The run() API generates by DAYS, not by case count.
             # BPIC17 event log statistics (analyzed from eventlog.xes.gz):
@@ -208,9 +227,11 @@ def _setup_arrivals(
             # Use the new run() API which handles model caching automatically
             # Retry loop: if insufficient timestamps, increase estimated_days and regenerate
             for attempt in range(max_retries):
+                # Only train on first attempt if needed, otherwise use existing model
+                should_retrain = retrain_model and attempt == 0
                 timestamps = run(
-                    df=df if attempt == 0 else None,  # Only pass df on first attempt
-                    retrain_model=retrain_model if attempt == 0 else False,
+                    df=df_for_arrivals if should_retrain else None,  # Only pass df when training
+                    retrain_model=should_retrain,
                     model_path=model_path,
                     n_days_to_simulate=estimated_days,
                     config=arr_config,
@@ -334,10 +355,23 @@ def _setup_processing_time(config: SimulationConfig) -> Any:
 
     logger.info("Setting up processing time predictor...")
 
+    # Use _lstm suffix for probabilistic_ml method
+    model_path = config.processing_time_model_path
+    if config.processing_time_method == "probabilistic_ml":
+        # If base path doesn't already end with _lstm, append it
+        if not model_path.endswith("_lstm"):
+            # For default path "models/processing_time_model", change to "models/processing_time_model_lstm"
+            if model_path == "models/processing_time_model":
+                model_path = "models/processing_time_model_lstm"
+            else:
+                # For custom paths, append _lstm
+                model_path = f"{model_path}_lstm"
+        logger.info(f"Using LSTM model path: {model_path}")
+
     try:
         predictor = ProcessingTimePredictionClass(
             method=config.processing_time_method,
-            model_path=config.processing_time_model_path,
+            model_path=model_path,
         )
         logger.info(f"Loaded processing time model: {config.processing_time_method}")
         return predictor
@@ -359,10 +393,10 @@ def _setup_case_attributes(
     """
     import sys
     from pathlib import Path
-    # Add Instance Spawn Rate/Advanced to path
-    advanced_path = Path(__file__).parent.parent / "Instance Spawn Rate" / "Advanced"
-    if str(advanced_path) not in sys.path:
-        sys.path.insert(0, str(advanced_path))
+    # case_attribute_prediction lives at the project root
+    project_root = Path(__file__).parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
     from case_attribute_prediction.simulator import AttributeSimulationEngine
 

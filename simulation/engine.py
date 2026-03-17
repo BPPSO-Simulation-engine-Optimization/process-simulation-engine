@@ -79,6 +79,9 @@ class WaitingWork:
     allocation_activity: str
     arrival_time: datetime  # When the work arrived (for FIFO ordering)
     case_state: CaseState
+    # Estimated processing time (seconds) for SPT ordering. Set when task is added
+    # to a resource worklist. None if not yet estimated.
+    estimated_pt_seconds: Optional[float] = None
 
     def __lt__(self, other):
         """For heap ordering - earlier arrival time = higher priority."""
@@ -419,6 +422,8 @@ class DESEngine:
         pmsp_config=None,
         pt_lifecycle_mode: str = "native",
         enable_profiling: bool = False,
+        pmsp_log_file: Optional[str] = None,
+        incremental_csv_path: Optional[str] = None,
     ):
         """
         Initialize the DES Engine.
@@ -531,8 +536,16 @@ class DESEngine:
         # PMSP resource optimization config (optional)
         self._pmsp_config = pmsp_config
 
+        # Per-resource worklists for PMSP mode (resource_id -> list of WaitingWork)
+        self._resource_worklists: Dict[str, List[WaitingWork]] = defaultdict(list)
+
+
         # Output: collected events for export
         self.completed_events: List[Dict] = []
+        
+        # Incremental CSV export (write every 100 cases)
+        self._incremental_csv_path: Optional[str] = incremental_csv_path
+        self._last_csv_exported_events_count: int = 0
 
         # Statistics
         self.stats = {
@@ -712,6 +725,14 @@ class DESEngine:
 
         # Start profiler wall clock
         self.profiler.start_wall_clock()
+        
+        # Initialize incremental CSV file (delete if exists to start fresh)
+        if self._incremental_csv_path:
+            import os
+            if os.path.exists(self._incremental_csv_path):
+                os.remove(self._incremental_csv_path)
+            self._last_csv_exported_events_count = 0
+            logger.info(f"Incremental CSV export enabled: will write to {self._incremental_csv_path} every 100 cases")
 
         # Main simulation loop
         print(f"\n{'='*60}", flush=True)
@@ -719,8 +740,10 @@ class DESEngine:
         print(f"{'='*60}\n", flush=True)
         
         event_count = 0
-        last_progress_print = 0
-        progress_interval = max(10, num_cases // 20)  # Print every ~5% or at least every 10 cases
+        
+        # Track last progress log time for 5-minute interval logging
+        last_progress_log_time = self.clock.now
+        progress_log_interval = timedelta(minutes=5)  # Log every 5 minutes of simulation time
         
         while not self.queue.is_empty():
             event = self.queue.pop()
@@ -734,13 +757,25 @@ class DESEngine:
             
             event_count += 1
             
-            # Print progress periodically
-            if event_count - last_progress_print >= progress_interval:
+            # Print progress every 5 minutes of simulation time
+            current_time = self.clock.now
+            if current_time - last_progress_log_time >= progress_log_interval:
                 print(f"Progress: {self.stats['cases_started']} cases started, "
                       f"{self.stats['cases_completed']} completed, "
                       f"{len(self.completed_events)} events logged, "
-                      f"{self.resource_pool.get_total_waiting_count()} waiting", flush=True)
-                last_progress_print = event_count
+                      f"{self.resource_pool.get_total_waiting_count()} waiting, "
+                      f"simulation time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+                last_progress_log_time = current_time
+            
+            # Incremental CSV export: write every 100 cases
+            if self._incremental_csv_path and self.stats['cases_started'] % 100 == 0 and self.stats['cases_started'] > 0:
+                new_events = self.completed_events[self._last_csv_exported_events_count:]
+                if new_events:
+                    from simulation.log_exporter import LogExporter
+                    write_header = (self._last_csv_exported_events_count == 0)
+                    LogExporter.append_to_csv(new_events, self._incremental_csv_path, write_header=write_header)
+                    self._last_csv_exported_events_count = len(self.completed_events)
+                    logger.info(f"Incremental CSV export: wrote {len(new_events)} events to {self._incremental_csv_path} (total cases: {self.stats['cases_started']})")
 
         # Drain phase: process remaining waiting work by advancing time
         if self.resource_pool.has_waiting_work():
@@ -766,6 +801,15 @@ class DESEngine:
             f"{self.stats['no_eligible_failures']} no eligible"
             + (f", {pending_count} stuck" if pending_count > 0 else "")
         )
+        
+        # Write remaining events to incremental CSV if enabled
+        if self._incremental_csv_path:
+            remaining_events = self.completed_events[self._last_csv_exported_events_count:]
+            if remaining_events:
+                from simulation.log_exporter import LogExporter
+                write_header = (self._last_csv_exported_events_count == 0)
+                LogExporter.append_to_csv(remaining_events, self._incremental_csv_path, write_header=write_header)
+                logger.info(f"Final incremental CSV export: wrote {len(remaining_events)} remaining events to {self._incremental_csv_path}")
 
         self.profiler.print_report()
 
@@ -907,7 +951,18 @@ class DESEngine:
             self._resource_strategy.notify_release(event.resource)
             # Try to dispatch waiting work now that this resource is free
             with self.profiler.measure("process_waiting_queue"):
-                self._process_waiting_queue(event.resource, event.timestamp)
+                logger.info("Processing waiting queue after activity completion. Resource freed: %s", event.resource)
+                # In PMSP mode: first drain the pre-planned worklist for this resource.
+                # Only fall back to the general waiting-queue / optimizer when the
+                # worklist is empty (nothing was dispatched from it).
+                if self._pmsp_config is not None:
+                    worklist_dispatched = self._process_resource_worklist(event.resource, event.timestamp)
+                    if not worklist_dispatched:
+                        # Es könnten inzwischen neue tasks in die waiting queue gekommen sein. 
+                        # Vefügbaren Ressourcen haen sich geändert
+                        self._process_waiting_queue(event.resource, event.timestamp)
+                else:
+                    self._process_waiting_queue(event.resource, event.timestamp)
 
         # Generate offer-dependent attributes when O_Create Offer completes
         if event.activity == "O_Create Offer" and case._attr_engine_case is not None:
@@ -979,6 +1034,7 @@ class DESEngine:
 
         Tries to dispatch waiting work to the freed resource if it's eligible.
         """
+        logger.info("Processing waiting queue.")
         # DRL policy overrides both batch and greedy
         if self._drl_policy is not None:
             self._process_waiting_queue_drl(freed_resource, current_time)
@@ -1043,23 +1099,191 @@ class DESEngine:
                 # Resource is now busy again, stop looking
                 return
 
+    def _transfer_unavailable_resource_worklists(self, current_time: datetime) -> int:
+        """
+        K-Batching: Transfer tasks from unavailable resources' worklists back to waiting queue.
+        
+        When a resource becomes unavailable (e.g., outside working hours), all tasks
+        on its worklist are transferred back to the set of unassigned tasks.
+        
+        Returns:
+            Number of tasks transferred back to waiting queue.
+        """
+        if not self._pmsp_config:
+            return 0
+        
+        total_transferred = 0
+        
+        # Check all resources with worklists
+        resources_to_check = list(self._resource_worklists.keys())
+        
+        for resource in resources_to_check:
+            # Check if resource is unavailable (not available due to working hours, etc.)
+            if not self.allocator.availability.is_available(resource, current_time):
+                worklist = self._resource_worklists.get(resource, [])
+                if worklist:
+                    logger.info(
+                        "K-Batching: Resource %s became unavailable, transferring %d tasks back to waiting queue",
+                        resource, len(worklist)
+                    )
+                    
+                    # Transfer all tasks from worklist back to waiting queue
+                    for work in worklist:
+                        self.resource_pool.add_to_waiting_queue(work)
+                        total_transferred += 1
+                    
+                    # Clear the worklist
+                    del self._resource_worklists[resource]
+        
+        return total_transferred
+
+    def _process_resource_worklist(self, resource: str, current_time: datetime) -> bool:
+        """
+        Process tasks from a resource's worklist in PMSP mode.
+
+        When a resource is freed, first check if there are tasks in its worklist
+        and execute those before processing the general waiting queue.
+        
+        K-Batching: If the resource is unavailable, transfer tasks back to waiting queue.
+
+        Returns True if at least one worklist task was dispatched (resource is now
+        busy again), False if the worklist was empty.
+        """
+        worklist = self._resource_worklists.get(resource, [])
+        if not worklist:
+            return False
+
+        # K-Batching: Check if resource is unavailable - if so, transfer tasks back
+        if not self.allocator.availability.is_available(resource, current_time):
+            logger.info(
+                "K-Batching: Resource %s is unavailable, transferring %d tasks from worklist back to waiting queue",
+                resource, len(worklist)
+            )
+            for work in worklist:
+                self.resource_pool.add_to_waiting_queue(work)
+            del self._resource_worklists[resource]
+            return False
+
+        # logger.info("PMSP: Processing worklist for resource %s (%d tasks)", resource, len(worklist))
+
+        # SPT ordering: sort worklist by estimated processing time (shortest first)
+        # Paper: "when multiple tasks are assigned to a resource, use shortest processing time first"
+        if len(worklist) > 1:
+            # Use pre-estimated PT if available, otherwise estimate on-the-fly
+            def get_pt(w):
+                if w.estimated_pt_seconds is not None:
+                    return w.estimated_pt_seconds
+                # Fallback: estimate now (shouldn't happen if tasks were added via PMSP dispatch)
+                return self._estimate_pt_seconds(w, resource, current_time)
+            worklist.sort(key=get_pt)
+            # logger.debug(
+            #     "PMSP SPT: Worklist for %s sorted by estimated PT: %s",
+            #     resource,
+            #     [(w.activity, w.case_id, f"{get_pt(w):.1f}s") for w in worklist],
+            # )
+
+        dispatched = False
+        # Dispatch the next worklist item (resource accepts one task at a time, SPT order)
+        while worklist and not self.resource_pool.is_busy(resource, current_time):
+            work = worklist.pop(0)  # SPT order (sorted above)
+
+            # Calculate wait time for stats
+            wait_seconds = (current_time - work.arrival_time).total_seconds()
+            self.stats['wait_time_total_seconds'] += wait_seconds
+
+            # logger.debug(
+            #     "PMSP worklist: dispatching %s for case %s to %s (waited %.0fs)",
+            #     work.activity, work.case_id, resource, wait_seconds,
+            # )
+
+            # Track assignment for strategy
+            self._resource_strategy.notify_assignment(resource, work.allocation_activity)
+
+            # Schedule the activity – this also marks the resource as busy
+            self._schedule_activity_with_resource(
+                work.case_id,
+                work.activity,
+                work.lifecycle,
+                current_time,
+                work.case_state,
+                resource,
+            )
+            dispatched = True
+
+        # Clean up the entry if the worklist is now empty
+        if not worklist and resource in self._resource_worklists:
+            del self._resource_worklists[resource]
+
+        return dispatched
+
+    def _log_resource_worklists(self) -> None:
+        """Log the current worklists for all resources."""
+        # logger.info("PMSP [Step 8 - Worklists]: Current worklists for all resources:")
+        # if self._resource_worklists:
+        #     for resource, worklist in sorted(self._resource_worklists.items()):
+        #         if worklist:
+        #             logger.info("  Resource %s: %d tasks in worklist:", resource, len(worklist))
+        #             for idx, work in enumerate(worklist, 1):
+        #                 logger.info("    [%d] Task '%s' (case %s, activity '%s', arrived: %s)", 
+        #                            idx, work.allocation_activity, work.case_id, work.activity, work.arrival_time)
+        #         else:
+        #             logger.info("  Resource %s: worklist empty", resource)
+        # else:
+        #     logger.info("  No resources have worklists")
+        pass
+
     def _process_waiting_queue_pmsp(
-        self, freed_resource: str, current_time: datetime
+        self, freed_resource: Optional[str], current_time: datetime
     ) -> None:
         """
-        PMSP-mode waiting-queue processing.
+        PMSP-mode waiting-queue processing (K-Batching adaptation).
 
-        Collects all waiting tasks, runs the PMSP optimizer, and dispatches
-        assignments to available resources.
+        K-Batching behavior:
+        1. Transfer tasks from unavailable resources' worklists back to waiting queue
+        2. Collect all waiting tasks
+        3. If k tasks have arrived (or batch_size == 0), solve PMSP for k tasks and all available resources
+        4. Assign tasks to resources (add to worklists if resource is busy)
+        5. When a resource becomes unavailable, tasks on its worklist are transferred back
+
+        Only triggers optimization if the number of waiting tasks reaches
+        the configured batch size (or always if batch_size == 0).
         """
+        # logger.info("=" * 80)
+        # logger.info("PMSP [PROCESS START]: Processing waiting queue in PMSP mode (K-Batching) at time %s", current_time)
+        # logger.info("=" * 80)
         from resources.resource_optimization.resource_optimization import (
             handle_batch_scheduling_optimization,
         )
 
+        # K-Batching: First, transfer tasks from unavailable resources back to waiting queue
+        transferred = self._transfer_unavailable_resource_worklists(current_time)
+        if transferred > 0:
+            # logger.info("PMSP [Step 1 - Transfer]: Transferred %d tasks from unavailable resources back to waiting queue", transferred)
+            pass
+
         waiting_tasks = self.resource_pool.get_all_waiting_tasks()
         if not waiting_tasks:
+            # logger.info("PMSP [PROCESS END]: No waiting tasks, exiting")
+            # Log worklists even if no waiting tasks
+            self._log_resource_worklists()
             return
 
+        # Log waiting tasks details
+        waiting_cases = set(wt.case_id for wt in waiting_tasks)
+        activity_counts = {}
+        for wt in waiting_tasks:
+            activity_counts[wt.allocation_activity] = activity_counts.get(wt.allocation_activity, 0) + 1
+        
+        # logger.info("PMSP [Step 2 - Queue Analysis]: Found %d waiting tasks across %d cases", 
+        #            len(waiting_tasks), len(waiting_cases))
+        # logger.info("PMSP [Step 2 - Queue Analysis]: Activities in queue: %s", 
+        #            ", ".join(f"{act}({count})" for act, count in sorted(activity_counts.items())))
+        # logger.info("PMSP [Step 2 - Queue Analysis]: Cases with waiting tasks: %s", 
+        #            ", ".join(sorted(waiting_cases)) if len(waiting_cases) <= 20 else f"{len(waiting_cases)} cases")
+
+        # logger.info("PMSP [Step 3 - Task Set]: Total tasks for optimization: %d", len(waiting_tasks))
+
+        # logger.info("PMSP [Step 5 - Optimization]: Starting optimization...")
         with self.profiler.measure("pmsp.optimize"):
             assignment, debug = handle_batch_scheduling_optimization(
                 cfg=self._pmsp_config,
@@ -1073,43 +1297,57 @@ class DESEngine:
             )
 
         if assignment is None:
+            # logger.info("PMSP [PROCESS END]: Optimization returned no assignment, exiting")
+            # Log worklists even if no assignment
+            self._log_resource_worklists()
             return
 
-        # Apply assignments: dispatch tasks to assigned resources
+        # Log assignment results
+        assigned_count = sum(1 for v in assignment.values() if v is not None)
+        unassigned_count = len(assignment) - assigned_count
+        # logger.info("PMSP [Step 6 - Assignment Results]: Optimization completed - %d assigned, %d unassigned (dummy)", 
+        #            assigned_count, unassigned_count)
+        
+        # Group assignments by resource for logging
+        assignments_by_resource = {}
+        for task_id, resource in assignment.items():
+            if resource is not None:
+                if resource not in assignments_by_resource:
+                    assignments_by_resource[resource] = []
+                assignments_by_resource[resource].append(task_id)
+        
+        # logger.info("PMSP [Step 6 - Assignment Results]: Assignments by resource:")
+        # for resource, task_list in sorted(assignments_by_resource.items()):
+        #     logger.info("  Resource %s: %d tasks -> %s", resource, len(task_list), 
+        #                ", ".join(task_list) if len(task_list) <= 5 else f"{len(task_list)} tasks")
+        
+        # Log unassigned tasks
+        unassigned_tasks = [task_id for task_id, res in assignment.items() if res is None]
+        # if unassigned_tasks:
+        #     logger.info("PMSP [Step 6 - Assignment Results]: Unassigned tasks (dummy): %d tasks -> %s", 
+        #                len(unassigned_tasks), ", ".join(unassigned_tasks) if len(unassigned_tasks) <= 10 else f"{len(unassigned_tasks)} tasks")
+
+        # Extract raw processing times from optimization (for SPT ordering)
+        raw_processing_times = debug.get("raw_processing_times", {})  # task_id -> resource -> seconds
+
+        # Apply assignments: dispatch tasks to assigned resources or add to worklists
+        # logger.info("PMSP [Step 7 - Dispatch]: Applying assignments...")
+        dispatched_count = 0
+        worklist_count = 0
         for task_id, assigned_resource in assignment.items():
             if assigned_resource is None:
-                # Dummy assignment — task stays in the queue (postponed)
+                # Dummy assignment — task stays in the queue
                 continue
 
-            # Check if the assigned resource is actually free right now
-            if self.resource_pool.is_busy(assigned_resource, current_time):
+            # Find the matching WaitingWork object
+            matched_work = None
+            for wt in waiting_tasks:
+                if f"{wt.case_id}_{wt.allocation_activity}" == task_id:
+                    matched_work = wt
+                    break
+            if matched_work is None:
+                # logger.warning("PMSP: task_id %s not found in waiting tasks", task_id)
                 continue
-
-            # Parse task_id back to case_id and allocation_activity
-            # task_id format: "{case_id}_{allocation_activity}"
-            parts = task_id.rsplit("_", 1)
-            if len(parts) != 2:
-                # Try splitting on the activity name from waiting tasks
-                matched_work = None
-                for wt in waiting_tasks:
-                    wt_id = f"{wt.case_id}_{wt.allocation_activity}"
-                    if wt_id == task_id:
-                        matched_work = wt
-                        break
-                if matched_work is None:
-                    logger.warning("PMSP: could not match task_id %s to waiting work", task_id)
-                    continue
-            else:
-                # Find the matching waiting work
-                matched_work = None
-                for wt in waiting_tasks:
-                    wt_id = f"{wt.case_id}_{wt.allocation_activity}"
-                    if wt_id == task_id:
-                        matched_work = wt
-                        break
-                if matched_work is None:
-                    logger.warning("PMSP: task_id %s not found in waiting tasks", task_id)
-                    continue
 
             # Remove from the waiting queue
             removed = self.resource_pool.remove_task_by_id(
@@ -1118,14 +1356,52 @@ class DESEngine:
             if removed is None:
                 continue
 
+            # K-Batching: Check if resource is unavailable - if so, keep task in waiting queue
+            if not self.allocator.availability.is_available(assigned_resource, current_time):
+                # Resource is unavailable - task stays in waiting queue (will be reassigned later)
+                logger.debug(
+                    "K-Batching: Resource %s is unavailable, keeping task %s for case %s in waiting queue",
+                    assigned_resource, removed.activity, removed.case_id
+                )
+                # Re-add to waiting queue since resource is unavailable
+                self.resource_pool.add_to_waiting_queue(removed)
+                continue
+
+            # Check if the assigned resource is actually free right now
+            if self.resource_pool.is_busy(assigned_resource, current_time):
+                # Resource is busy - add to its worklist instead of dispatching
+                # Use pre-estimated PT from optimization if available (avoids re-estimation)
+                if removed.estimated_pt_seconds is None:
+                    if task_id in raw_processing_times and assigned_resource in raw_processing_times[task_id]:
+                        removed.estimated_pt_seconds = raw_processing_times[task_id][assigned_resource]
+                        # logger.debug(
+                        #     "PMSP [Step 7 - Dispatch]: Using pre-estimated PT from optimization: %.2fs for task %s -> %s",
+                        #     removed.estimated_pt_seconds, task_id, assigned_resource
+                        # )
+                    else:
+                        # Fallback: estimate now (shouldn't happen if optimization ran)
+                        removed.estimated_pt_seconds = self._estimate_pt_seconds(removed, assigned_resource, current_time)
+                        # logger.debug(
+                        #     "PMSP [Step 7 - Dispatch]: PT not found in optimization results, estimating: %.2fs for task %s -> %s",
+                        #     removed.estimated_pt_seconds, task_id, assigned_resource
+                        # )
+                self._resource_worklists[assigned_resource].append(removed)
+                worklist_count += 1
+                # logger.info(
+                #     "PMSP [Step 7 - Dispatch]: Resource %s is busy, adding task '%s' (case %s) to worklist (estimated PT: %.1fs)",
+                #     assigned_resource, removed.activity, removed.case_id, removed.estimated_pt_seconds
+                # )
+                continue
+
             # Calculate wait time for stats
             wait_seconds = (current_time - removed.arrival_time).total_seconds()
             self.stats['wait_time_total_seconds'] += wait_seconds
 
-            logger.debug(
-                "PMSP dispatching %s for case %s to %s (waited %.0fs)",
-                removed.activity, removed.case_id, assigned_resource, wait_seconds,
-            )
+            dispatched_count += 1
+            # logger.info(
+            #     "PMSP [Step 7 - Dispatch]: DISPATCHING task '%s' (case %s) -> resource %s (waited %.1fs)",
+            #     removed.activity, removed.case_id, assigned_resource, wait_seconds,
+            # )
 
             # Track assignment for strategy
             self._resource_strategy.notify_assignment(assigned_resource, removed.allocation_activity)
@@ -1139,6 +1415,16 @@ class DESEngine:
                 removed.case_state,
                 assigned_resource,
             )
+        
+        # logger.info("PMSP [Step 7 - Dispatch]: Dispatch summary - %d dispatched, %d to worklists", 
+        #            dispatched_count, worklist_count)
+        
+        # Log worklists for all resources
+        self._log_resource_worklists()
+        
+        # logger.info("=" * 80)
+        # logger.info("PMSP [PROCESS END]: Completed PMSP processing cycle")
+        # logger.info("=" * 80)
 
     def _process_waiting_queue_batch(
         self, freed_resource: str, current_time: datetime
@@ -1457,6 +1743,7 @@ class DESEngine:
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
+        logger.info("Scheduling next activity after activity completion: %s", activity)
         # Some activities are control-flow artifacts (e.g., decision points) and must not
         # require an organizational resource.
         if not self._activity_requires_resource(activity):
@@ -1465,12 +1752,47 @@ class DESEngine:
 
         allocation_activity = self._normalize_activity_for_resources(activity)
 
-        # Try to allocate a resource (with dynamic busy checking)
-        with self.profiler.measure("resource_allocation"):
-            resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
+        if self._pmsp_config is None:
+            # Try to allocate a resource (with dynamic busy checking)
+            with self.profiler.measure("resource_allocation"):
+                resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
 
-        if resource is None:
-            # No resource available - add to waiting queue
+            if resource is None:
+                # No resource available - add to waiting queue
+                self.stats['waiting_events'] += 1
+                waiting_work = WaitingWork(
+                    case_id=case_id,
+                    activity=activity,
+                    lifecycle=lifecycle,
+                    allocation_activity=allocation_activity,
+                    arrival_time=current_time,
+                    case_state=case,
+                )
+                self.resource_pool.add_to_waiting_queue(waiting_work)
+
+                # Log the reason for waiting
+                if failure_reason == 'no_eligible':
+                    logger.warning(
+                        f"No eligible resources for activity '{activity}' - case {case_id} may be stuck. "
+                        f"Check permission model configuration."
+                    )
+                else:
+                    logger.debug(
+                        f"No resource for {activity} at {current_time} ({failure_reason}), "
+                        f"queued case {case_id}"
+                    )
+                
+                return
+
+            # Resource allocated - schedule the activity
+            self._schedule_activity_with_resource(
+                case_id, activity, lifecycle, current_time, case, resource
+            )
+
+        else: 
+            # Im optimization mode werden die tasks erst in batches gesammelt und nicht sofort zugeorndet. 
+            # Hier ist eine Resource freigeworden 
+            # logger.info("PMSP: Activity completed. New activity scheduled. Resource freed. Checking if optimization already applies ...")
             self.stats['waiting_events'] += 1
             waiting_work = WaitingWork(
                 case_id=case_id,
@@ -1481,24 +1803,17 @@ class DESEngine:
                 case_state=case,
             )
             self.resource_pool.add_to_waiting_queue(waiting_work)
+            # logger.debug(
+            #     f"PMSP: Queued activity '{activity}' for case {case_id} at {current_time} "
+            #     f"(will be assigned via batch optimization)"
+            # )
 
-            # Log the reason for waiting
-            if failure_reason == 'no_eligible':
-                logger.warning(
-                    f"No eligible resources for activity '{activity}' - case {case_id} may be stuck. "
-                    f"Check permission model configuration."
-                )
-            else:
-                logger.debug(
-                    f"No resource for {activity} at {current_time} ({failure_reason}), "
-                    f"queued case {case_id}"
-                )
-            return
-
-        # Resource allocated - schedule the activity
-        self._schedule_activity_with_resource(
-            case_id, activity, lifecycle, current_time, case, resource
-        )
+            waiting_tasks = self.resource_pool.get_all_waiting_tasks()
+            # logger.info("PMSP: Currently waiting tasks: %d", len(waiting_tasks))
+            batch_size = self._pmsp_config.optimization_batch_size
+            if batch_size == 0 or len(waiting_tasks) >= batch_size:
+                # logger.info("PMSP: Threshold of batch size reached! Triggering optimization")
+                self._process_waiting_queue_pmsp(None, current_time)
 
     def _activity_requires_resource(self, activity: Optional[str]) -> bool:
         """Return True if this activity needs an org resource assignment."""
