@@ -5,6 +5,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.preprocessing import StandardScaler
 
 from .preprocessing import DayArrivals
 
@@ -17,17 +18,25 @@ def compute_statistics_for_days(days: List[DayArrivals]) -> np.ndarray | None:
     avg_daily = daily_counts.mean()
     p25_daily, p75_daily = np.percentile(daily_counts, [25, 75])
 
-    timestamps = [ts for day in days for ts in day]
-    if len(timestamps) < 2:
-        std_ia = 0.0
-        p25_ia = 0.0
-        p75_ia = 0.0
-    else:
-        ts_series = pd.to_datetime(timestamps)
+    diffs_hours = []
+    for day in days:
+        if len(day) < 2:
+            continue
+        ts_series = pd.to_datetime(day)
         if ts_series.tz is not None:
             ts_series = ts_series.tz_localize(None)
         arr = np.sort(np.array(ts_series, dtype="datetime64[ns]"))
         diffs = np.diff(arr).astype("timedelta64[s]").astype(float) / 3600.0
+        diffs = diffs[diffs > 0]
+        if diffs.size > 0:
+            diffs_hours.extend(diffs.tolist())
+
+    if len(diffs_hours) == 0:
+        std_ia = 0.0
+        p25_ia = 0.0
+        p75_ia = 0.0
+    else:
+        diffs = np.array(diffs_hours, dtype=float)
         std_ia = np.std(diffs)
         p25_ia, p75_ia = np.percentile(diffs, [25, 75])
 
@@ -78,12 +87,16 @@ class WeekdayClusterer:
             F = np.array(F)
 
             if len(valid_weekdays) > 1:
+                # Paper Algorithm 2, Line 8: StandardizeFeatures before Ward clustering
+                scaler = StandardScaler()
+                F_scaled = scaler.fit_transform(F)
+
                 model = AgglomerativeClustering(
                     n_clusters=None,
-                    distance_threshold=1e-6,
+                    distance_threshold=1.5,
                     linkage="ward"
                 )
-                weekday_labels = model.fit_predict(F)
+                weekday_labels = model.fit_predict(F_scaled)
             else:
                 weekday_labels = np.array([0])
 

@@ -8,6 +8,7 @@ import pandas as pd
 from sklearn.neighbors import KernelDensity
 
 from .forecasting import SegmentForecaster
+from .intraday import IntradayBounds
 from .preprocessing import DailySequence, DayArrivals
 
 
@@ -35,6 +36,9 @@ class ArrivalGenerator:
         # EINMALIGER RNG: sorgt für reproduzierbare, aber nicht identische Samples pro call
         self._rng = np.random.RandomState(random_state) if random_state is not None else None
 
+        # Working-hour bounds (set by generate(); falls back to full-day if None)
+        self._bounds: Optional[IntradayBounds] = None
+
     def generate(
         self,
         N_hat: int,
@@ -44,9 +48,10 @@ class ArrivalGenerator:
         kde_models: Dict[Tuple[int, int, int], Optional[KernelDensity]],
         start_date: Optional[pd.Timestamp] = None,
         max_resample: int = 20,
+        bounds: Optional[IntradayBounds] = None,
     ) -> SimulationResult:
 
-        # 1) Startdatum bestimmen
+        # 1) Startzeitpunkt bestimmen (exakter Timestamp)
         if start_date is None:
             all_train_ts = [ts for day in D_train for ts in day]
             if len(all_train_ts) == 0:
@@ -54,20 +59,26 @@ class ArrivalGenerator:
             last_ts = max(pd.to_datetime(ts) for ts in all_train_ts)
             start_date = last_ts.normalize() + pd.Timedelta(days=1)
         else:
-            start_date = pd.to_datetime(start_date).normalize()
+            start_date = pd.to_datetime(start_date)
+
+        sim_start_ts = pd.to_datetime(start_date)
+        sim_start_day = sim_start_ts.floor("D")
 
         # 2) Globale Cluster (j) pro Tag schätzen
         est_segments_per_day = self.forecaster.estimate(N_hat, day_labels)
 
-        # 3) Bin-Länge in Sekunden
-        seconds_per_day = 24 * 60 * 60
-        bin_length_seconds = seconds_per_day / self.L
+        # 3) Bin-Länge in Sekunden – Paper: CreateTimeBins(lower, upper, L)
+        #    Bins span only the observed working-hour window, not 00:00–24:00.
+        if bounds is None:
+            bounds = IntradayBounds(lower=0.0, upper=24 * 60 * 60)
+        self._bounds = bounds
+        bin_length_seconds = (bounds.upper - bounds.lower) / self.L
 
         D_sim: DailySequence = []
 
         for i in range(N_hat):
-            current_date = start_date + pd.Timedelta(days=i)
-            weekday = current_date.weekday() + 1  # 1..7
+            current_day = sim_start_day + pd.Timedelta(days=i)
+            weekday = current_day.weekday() + 1  # 1..7
 
             # Globaler Cluster j für diesen Tag
             j = int(est_segments_per_day[i])
@@ -88,8 +99,20 @@ class ArrivalGenerator:
                         print(f"kde is none for (j={j}, k={k}, l={l})")
                     continue
 
-                bin_start = current_date + pd.Timedelta(seconds=(l - 1) * bin_length_seconds)
-                max_duration = bin_length_seconds
+                # Calendar-day anchoring: bins are tied to midnight-based day windows.
+                # If simulation starts mid-day, day 0 is treated as partial.
+                bin_start = current_day + pd.Timedelta(seconds=bounds.lower + (l - 1) * bin_length_seconds)
+                bin_end = current_day + pd.Timedelta(seconds=bounds.lower + l * bin_length_seconds)
+                if i == 0:
+                    if bin_end <= sim_start_ts:
+                        continue
+                    effective_start = max(bin_start, sim_start_ts)
+                else:
+                    effective_start = bin_start
+
+                max_duration = (bin_end - effective_start).total_seconds()
+                if max_duration <= 0:
+                    continue
 
                 t = 0.0  # kumulierte Zeit in Sekunden seit Bin-Start
 
@@ -116,7 +139,7 @@ class ArrivalGenerator:
                         # nächste Ankunft läge außerhalb des Bins
                         break
 
-                    ts = bin_start + pd.Timedelta(seconds=t_next)
+                    ts = effective_start + pd.Timedelta(seconds=t_next)
                     seq_day.append(ts)
                     t = t_next
 

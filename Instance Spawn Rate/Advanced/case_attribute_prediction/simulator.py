@@ -32,35 +32,57 @@ def _compute_case_sampler_artifact(
         if c not in df.columns:
             raise KeyError(f"Fehlende Spalte im Input df: '{c}'")
 
-    case_tbl = df.groupby(case_col)[[loan_goal_col, app_type_col, requested_col]].first().copy()
-    case_tbl[requested_col] = pd.to_numeric(case_tbl[requested_col], errors="coerce")
-    case_tbl = case_tbl.dropna(subset=[loan_goal_col, app_type_col, requested_col])
-    case_tbl = case_tbl[case_tbl[requested_col] > 0]
+    case_tbl_raw = df.groupby(case_col)[[loan_goal_col, app_type_col, requested_col]].first().copy()
+    case_tbl_raw[requested_col] = pd.to_numeric(case_tbl_raw[requested_col], errors="coerce")
 
-    # P(LoanGoal)
-    lg_p = case_tbl[loan_goal_col].value_counts(normalize=True)
+    # ── Vollständige Tabelle für Kategorial-Verteilungen ──────────────────────
+    # Nur NaN-Zeilen in LoanGoal/AppType ausschließen – RequestedAmount=0 ist
+    # kein Ausschlussgrund für die Kategorial-Verteilungen (z.B. "Unknown"-Fälle
+    # haben häufig RequestedAmount=0, sollen aber korrekt repräsentiert werden).
+    case_tbl_all = case_tbl_raw.dropna(subset=[loan_goal_col, app_type_col])
+
+    # ── Gefilterte Tabelle für RequestedAmount-Bootstrap ──────────────────────
+    # Nur Fälle mit RequestedAmount > 0 verwenden, damit der Bootstrap-Sampler
+    # stets positive Beträge liefert (verhindert NaN-Weitergabe an Offer-Prädiktoren).
+    # Für Gruppen ohne positive Werte (z.B. "Unknown") greift der globale Fallback.
+    case_tbl_req = case_tbl_raw.dropna(subset=[requested_col])
+    case_tbl_req = case_tbl_req[case_tbl_req[requested_col] > 0]
+
+    # P(LoanGoal) – aus vollständiger Tabelle ohne RequestedAmount-Filter
+    lg_p = case_tbl_all[loan_goal_col].value_counts(normalize=True)
     lg_vals = lg_p.index.to_numpy()
     lg_probs = lg_p.to_numpy()
 
     # P(AppType | LoanGoal)
-    at_marg = case_tbl[app_type_col].value_counts(normalize=True)
+    at_marg = case_tbl_all[app_type_col].value_counts(normalize=True)
     at_vals = at_marg.index.to_numpy()
     at_probs = at_marg.to_numpy()
 
+    # Bedingte Verteilung: P(AppType | LoanGoal)
+    # Beispiel-Struktur von at_cond:
+    # {
+    #   "Home": (array(['New', 'Renewal']), array([0.6, 0.4])),
+    #   "Car": (array(['New', 'Renewal']), array([0.3, 0.7])),
+    #   "Education": (array(['New']), array([1.0]))
+    # }
+    # Für jedes LoanGoal: (mögliche AppType-Werte, zugehörige Wahrscheinlichkeiten)
     at_cond: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for lg, sub in case_tbl.groupby(loan_goal_col):
+    for lg, sub in case_tbl_all.groupby(loan_goal_col):
         p = sub[app_type_col].value_counts(normalize=True)
         at_cond[str(lg)] = (p.index.to_numpy(), p.to_numpy())
 
     # RequestedAmount | (lg, at) + Fallbacks
-    req_global = case_tbl[requested_col].to_numpy(dtype=float)
+    # Erstellt ein Dictionary mit gruppierten RequestedAmount-Werten
+    # Gruppiert nach Kombinationen aus LoanGoal und ApplicationType
+    # Schlüssel: Tupel (LoanGoal, ApplicationType) (z. B. ("Home", "New"))
+    req_global = case_tbl_req[requested_col].to_numpy(dtype=float)
     req_by_pair = {
         (str(lg), str(at)): sub[requested_col].to_numpy(dtype=float)
-        for (lg, at), sub in case_tbl.groupby([loan_goal_col, app_type_col])
+        for (lg, at), sub in case_tbl_req.groupby([loan_goal_col, app_type_col])
     }
     req_by_lg = {
         str(lg): sub[requested_col].to_numpy(dtype=float)
-        for lg, sub in case_tbl.groupby(loan_goal_col)
+        for lg, sub in case_tbl_req.groupby(loan_goal_col)
     }
 
     return {
@@ -263,6 +285,11 @@ class AttributeSimulationEngine:
         self._init_models(df)
 
         # MonthlyCost: Artefakt oder fallback rate sampler
+        # Wenn kein explizites Artefakt übergeben, aber das Modell im Modell-Store
+        # geladen wurde, bevorzuge das Registry-Modell gegenüber dem Rate-Sampler.
+        if monthly_artifact is None and self.registry.monthly_cost.model is not None:
+            monthly_artifact = self.registry.monthly_cost.model
+
         self.monthly_artifact = monthly_artifact
         self.monthly_rate_sampler = None
 
@@ -391,6 +418,7 @@ class AttributeSimulationEngine:
         Zieht CreditScore/OfferedAmount/FWA/Terms/Monthly/Selected/Accepted nur,
         wenn noch nicht gezogen.
         """
+        #Enthalten in active_case: case_id, loan_goal, application_type, requested_amount
         assert self._active_case is not None
         cs = self._active_case
 
@@ -767,6 +795,46 @@ class AttributeSimulationEngine:
 
         return results
 
+    def simulate_n_cases(
+        self,
+        n: int = 10_000,
+        *,
+        with_offer_attributes: bool = True,
+        progress: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Zieht Attribute für *n* Cases und gibt ein Case-Level DataFrame zurück.
+
+        Args:
+            n: Anzahl der zu simulierenden Cases.
+            with_offer_attributes: Wenn True (default), werden auch die
+                Offer-abhängigen Attribute (CreditScore, OfferedAmount,
+                FirstWithdrawalAmount, NumberOfTerms, MonthlyCost,
+                Selected, Accepted) gezogen.
+            progress: Gibt einen Fortschritts-Indikator auf stdout aus.
+
+        Returns:
+            pd.DataFrame mit einer Zeile pro Case.
+        """
+        rows: list[dict[str, Any]] = []
+        step = max(1, n // 10)
+
+        for i in range(n):
+            cs = self.start_new_case()
+
+            if with_offer_attributes:
+                self.populate_offer_attributes(cs)
+
+            rows.append(self.finalize_case_row())
+            self.end_current_case()
+
+            if progress and (i + 1) % step == 0:
+                print(f"  … {i + 1:>7,} / {n:,} Cases simuliert")
+
+        if progress:
+            print(f"  ✓ {n:,} Cases fertig.")
+
+        return pd.DataFrame(rows)
 
     def draw_case_attributes(
         self,

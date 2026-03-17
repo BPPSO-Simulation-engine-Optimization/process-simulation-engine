@@ -9,6 +9,7 @@ from pathlib import Path
 
 from resources.resource_permissions.resource_permissions import BasicResourcePermissions, OrdinoRResourcePermissions
 from resources.resource_availabilities.resource_availabilities import AdvancedResourceAvailabilityModel
+from resources.selection_strategies import ResourceSelectionStrategy, RandomStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,8 @@ class ResourceAllocator:
                  use_sample: int = None, cache_path: str = None, df: pd.DataFrame = None,
                  permissions_model = None, availability_model = None,
                  availability_config: dict = None,
-                 availability_cache_path: str = None):
+                 availability_cache_path: str = None,
+                 selection_strategy: ResourceSelectionStrategy = None):
         """
         Initialize the ResourceAllocator.
 
@@ -160,7 +162,10 @@ class ResourceAllocator:
             else:
                 raise ValueError(f"Unknown permission method: '{self.permission_method}'. "
                                f"Valid options: 'basic', 'ordinor', 'ordinor-strict'")
-            
+
+        # 4. Selection strategy (R-RMA / R-RRA / R-SHQ)
+        self._selection_strategy = selection_strategy or RandomStrategy()
+
     def _load_log(self, log_path: str, sample_size: Optional[int]) -> pd.DataFrame:
         """Load and preprocess the event log into a DataFrame."""
         if not os.path.exists(log_path):
@@ -182,8 +187,8 @@ class ResourceAllocator:
 
         1. Finds all resources eligible for the activity (considering context).
         2. Filters them by availability at the timestamp.
-        3. Returns a randomly selected available resource, or None if none are found.
-        
+        3. Selects using the configured strategy (R-RMA / R-RRA / R-SHQ).
+
         Args:
             activity: Name of the activity.
             timestamp: Time when the activity is to be performed.
@@ -199,13 +204,11 @@ class ResourceAllocator:
              eligible_resources = self.permissions.get_eligible_resources(activity)
 
         if not eligible_resources:
-            # logger.debug(f"No eligible resources found for activity '{activity}'.")
             return None
 
         # 2. Availability
-        # Optimization: Filter list first
         available_resources = [
-            res for res in eligible_resources 
+            res for res in eligible_resources
             if self.availability.is_available(res, timestamp)
         ]
 
@@ -213,9 +216,9 @@ class ResourceAllocator:
             # Fallback: Use User_1 as 24/7 system resource when no other resource is available
             if 'User_1' in eligible_resources and self.availability.is_available('User_1', timestamp):
                 return 'User_1'
-            # logger.debug(f"No available resources found for activity '{activity}' at {timestamp}.")
             return None
 
-        # 3. Selection (Random for now, TODO improve in optimization?)
-        selected_resource = random.choice(available_resources)
+        # 3. Selection via configured heuristic
+        selected_resource = self._selection_strategy.select(available_resources, activity)
+        self._selection_strategy.notify_assignment(selected_resource, activity)
         return selected_resource

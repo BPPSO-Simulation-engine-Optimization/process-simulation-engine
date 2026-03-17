@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -34,9 +34,48 @@ class InterarrivalKDETrainer:
     Entspricht deiner learn_interarrival_kde(intraday_binned, ...).
     Trainiert KDE auf Interarrivals in Sekunden (wie im Notebook).
     """
-    def __init__(self, kernel: str = "gaussian", min_samples: int = 2):
+    def __init__(
+        self,
+        kernel: str = "gaussian",
+        min_samples: int = 2,
+        bandwidth_k_values: Sequence[float] = (1.0,),
+        bandwidth_val_ratio: float = 0.2,
+    ):
         self.kernel = kernel
         self.min_samples = min_samples
+        self.bandwidth_k_values = tuple(k for k in bandwidth_k_values if k > 0)
+        if len(self.bandwidth_k_values) == 0:
+            self.bandwidth_k_values = (1.0,)
+        self.bandwidth_val_ratio = float(min(max(bandwidth_val_ratio, 0.05), 0.5))
+
+    def _fit_kde_with_bandwidth_search(self, diffs: np.ndarray) -> tuple[KernelDensity, float, float]:
+        n = len(diffs)
+        base_h = _silverman_bandwidth(diffs)
+
+        split = int(n * (1.0 - self.bandwidth_val_ratio))
+        split = min(max(split, self.min_samples), n - 1)
+        train = diffs[:split]
+        val = diffs[split:]
+
+        best_h = max(base_h, 1e-6)
+        best_nll = float("inf")
+        best_model: Optional[KernelDensity] = None
+
+        for k in self.bandwidth_k_values:
+            h = max(base_h * float(k), 1e-6)
+            kde = KernelDensity(kernel=self.kernel, bandwidth=h)
+            kde.fit(train.reshape(-1, 1))
+            nll = float(-kde.score(val.reshape(-1, 1)) / len(val))
+            if nll < best_nll:
+                best_nll = nll
+                best_h = h
+                best_model = kde
+
+        if best_model is None:
+            best_model = KernelDensity(kernel=self.kernel, bandwidth=best_h)
+            best_model.fit(train.reshape(-1, 1))
+            best_nll = float(-best_model.score(val.reshape(-1, 1)) / len(val))
+        return best_model, best_h, best_nll
 
     def fit(self, intraday_binned: dict, L: int) -> KDETrainingResult:
         models: Dict[Tuple[int, int, int], Optional[KernelDensity]] = {}
@@ -89,15 +128,20 @@ class InterarrivalKDETrainer:
                         }
                         continue
 
-                    h = _silverman_bandwidth(diffs)
-                    kde = KernelDensity(kernel=self.kernel, bandwidth=h)
-                    kde.fit(diffs.reshape(-1, 1))
+                    if len(diffs) > self.min_samples:
+                        kde, h, val_nll = self._fit_kde_with_bandwidth_search(diffs)
+                    else:
+                        h = _silverman_bandwidth(diffs)
+                        kde = KernelDensity(kernel=self.kernel, bandwidth=h)
+                        kde.fit(diffs.reshape(-1, 1))
+                        val_nll = float("nan")
 
                     models[(j, k, l + 1)] = kde
                     info[(j, k, l + 1)] = {
                         "n_arrivals": n_arrivals,
                         "n_inters": len(diffs),
                         "bandwidth": h,
+                        "val_nll": val_nll,
                     }
 
         return KDETrainingResult(last_diffs=last_diffs, models=models, info=info)

@@ -26,20 +26,18 @@ class Evaluator:
         Returns:
             Dictionary with MAE and RMSE in original scale (hours)
         """
-        # Convert back from log10 scale to original scale
-        # Using log10(x+1) transformation, so reverse is: 10^y - 1
+        # Convert back from log10(x+1) scale to original scale
         y_true = np.power(10, y_true_log) - 1
         y_pred = np.power(10, y_pred_log) - 1
 
-        # Calculate metrics
         mae = mean_absolute_error(y_true, y_pred)
-        rmse = mean_squared_error(y_true, y_pred, squared=False)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
 
         metrics = {
             "mae_hours": mae,
             "rmse_hours": rmse,
             "mae_log": mean_absolute_error(y_true_log, y_pred_log),
-            "rmse_log": mean_squared_error(y_true_log, y_pred_log, squared=False)
+            "rmse_log": np.sqrt(mean_squared_error(y_true_log, y_pred_log))
         }
 
         return metrics
@@ -54,7 +52,7 @@ class Evaluator:
         Evaluate the trained model on test data.
 
         Args:
-            model_trainer: Trained ModelTrainer instance
+            model_trainer: Trained ModelTrainer instance (or wrapper with predict/get_feature_importance)
             X_test: Test feature matrix
             y_test: Test target vector
 
@@ -63,13 +61,10 @@ class Evaluator:
         """
         print("Evaluating model on test set...")
 
-        # Make predictions
         y_pred_log = model_trainer.predict(X_test)
 
-        # Calculate metrics
         metrics = self.calculate_regression_metrics(y_test.values, y_pred_log)
 
-        # Get feature importance
         feature_importance = model_trainer.get_feature_importance()
 
         results = {
@@ -78,7 +73,7 @@ class Evaluator:
             "predictions": {
                 "y_true_log": y_test.values,
                 "y_pred_log": y_pred_log,
-                "y_true_original": np.power(10, y_test.values) - 1,  # log10(x+1) -> 10^y - 1
+                "y_true_original": np.power(10, y_test.values) - 1,
                 "y_pred_original": np.power(10, y_pred_log) - 1
             }
         }
@@ -109,7 +104,7 @@ class Evaluator:
         print("\nTop 15 Feature Importance:")
         feature_importance = evaluation_results["feature_importance"]
         for i, (_, row) in enumerate(feature_importance.head(15).iterrows()):
-            print("2d")
+            print(f"  {i+1:2d}. {row['feature']}: {row['importance']:.4f}")
 
     def analyze_prediction_errors(
         self,
@@ -132,17 +127,14 @@ class Evaluator:
         y_true_orig = preds["y_true_original"]
         y_pred_orig = preds["y_pred_original"]
 
-        # Calculate absolute errors
         errors = np.abs(y_true_orig - y_pred_orig)
 
-        # Create analysis DataFrame
         error_analysis = X_test.copy()
         error_analysis["true_processing_time"] = y_true_orig
         error_analysis["predicted_processing_time"] = y_pred_orig
         error_analysis["absolute_error"] = errors
-        error_analysis["relative_error"] = errors / (y_true_orig + 1e-6)  # Avoid division by zero
+        error_analysis["relative_error"] = errors / (y_true_orig + 1e-6)
 
-        # Sort by absolute error (worst predictions first)
         error_analysis = error_analysis.sort_values("absolute_error", ascending=False)
 
         return error_analysis.head(n_worst)
@@ -162,12 +154,10 @@ class Evaluator:
         import os
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save feature importance
         fi_path = os.path.join(output_dir, "feature_importance.csv")
         evaluation_results["feature_importance"].to_csv(fi_path, index=False)
         print(f"Feature importance saved to: {fi_path}")
 
-        # Save metrics
         metrics_path = os.path.join(output_dir, "metrics.txt")
         with open(metrics_path, 'w') as f:
             f.write("Model Evaluation Metrics\n")

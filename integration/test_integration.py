@@ -9,9 +9,9 @@ This script runs a full simulation using:
 + It saves the respective subset of the GT EL in case num-cases is specified
 
 Usage:
-    python -m integration.test_integration --mode basic
-    python -m integration.test_integration --mode advanced --num-cases 31000
-    python -m integration.test_integration --mode mixed --arrivals advanced --attributes basic
+    python -m integration.test_integration --num-cases 1000 --event-log eventlog/eventlog.xes.gz
+    python -m integration.test_integration --arrivals advanced --processing advanced --num-cases 100
+    python -m integration.test_integration --processing advanced --processing-model-path models/processing_time_model
 """
 
 import argparse
@@ -31,6 +31,7 @@ from integration.config import SimulationConfig
 from integration.setup import setup_simulation
 from simulation.engine import DESEngine, NextActivityPredictorType
 from simulation.log_exporter import LogExporter
+from resources.selection_strategies import create_strategy
 
 
 def load_event_log(path: str) -> pd.DataFrame:
@@ -48,24 +49,12 @@ def load_event_log(path: str) -> pd.DataFrame:
     return df
 
 
-def create_resource_allocator(log_path: str, config: SimulationConfig):
+def create_resource_allocator(log_path: str):
     """Create resource allocator from event log."""
     try:
         from resources import ResourceAllocator
-        from resources.resource_permissions.resource_permissions import BasicResourcePermissions
-
-        exclude = getattr(config, "exclude_resources", None) or []
-        if exclude:
-            perms = BasicResourcePermissions(log_path=log_path, exclude_resources=exclude)
-            allocator = ResourceAllocator(
-                log_path=log_path,
-                permission_method="basic",
-                permissions_model=perms,
-            )
-            print(f"Loaded ResourceAllocator (excluded {len(exclude)} resources: {exclude[0]}..{exclude[-1]})")
-        else:
-            allocator = ResourceAllocator(log_path=log_path)
-            print("Loaded ResourceAllocator from event log")
+        allocator = ResourceAllocator(log_path=log_path)
+        print("Loaded ResourceAllocator from event log")
         return allocator
     except Exception as e:
         raise Exception(f"Could not load ResourceAllocator: {e}")
@@ -109,7 +98,7 @@ def save_ground_truth_subset(df: pd.DataFrame, num_cases: int, output_dir: str):
     return reduced_df
 
 
-def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str):
+def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output_dir: str, enable_profiling: bool = False):
     """Run the simulation with given configuration."""
     print("\n" + "=" * 60)
     print("SIMULATION CONFIGURATION")
@@ -117,9 +106,20 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Processing time mode: {config.processing_time_mode}")
     print(f"  Case arrival mode: {config.case_arrival_mode}")
     print(f"  Case attribute mode: {config.case_attribute_mode}")
+    print(f"  Resource selection: {config.resource_selection_strategy}")
+    print(f"  Resource allocation mode: {config.resource_allocation_mode}")
+    if config.next_activity_class == "process_transformer":
+        print(f"  PT lifecycle mode: {config.pt_lifecycle_mode}")
+        print(f"  PT max duration: {config.pt_max_duration_seconds / 3600:.0f}h ({config.pt_max_duration_seconds / 86400:.0f} days)")
+    if config.resource_allocation_mode == "batch":
+        print(f"  Batch policy: {config.batch_policy}")
+    elif config.resource_allocation_mode == "drl":
+        print(f"  DRL model: {config.drl_model_path}")
+    elif config.resource_allocation_mode == "pmsp":
+        print(f"  PMSP delta: {config.pmsp_dummy_delta}")
+        print(f"  PMSP solver time limit: {config.pmsp_solver_time_limit_seconds}s")
+        print(f"  PMSP prediction batch size: {config.pmsp_prediction_batch_size}")
     print(f"  Number of cases: {config.num_cases}")
-    excl = getattr(config, "exclude_resources", None) or []
-    print(f"  Excluded resources: {len(excl)} {excl}" if excl else "  Excluded resources: none")
     print("=" * 60 + "\n")
 
     # Get start date from event log
@@ -155,15 +155,79 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     if config.next_activity_class == "process_transformer":
         pred_type = NextActivityPredictorType.PROCESS_TRANSFORMER
 
+    # Create resource selection strategy
+    resource_strategy = create_strategy(config.resource_selection_strategy)
+
+    # Create batch allocation policy (if requested)
+    batch_policy = None
+    pt_estimator = None
+    if config.resource_allocation_mode == "batch":
+        from resources.batch_policies import create_batch_policy
+        from resources.processing_time_estimator import ProcessingTimeEstimator
+
+        batch_policy = create_batch_policy(config.batch_policy)
+        pt_estimator = ProcessingTimeEstimator(df=df)
+        print(f"Created batch policy: {config.batch_policy}")
+
+    # Create DRL allocation policy (if requested)
+    drl_policy = None
+    if config.resource_allocation_mode == "drl":
+        import pickle
+        from resources.drl_allocation.state import DRLStateBuilder
+        from resources.drl_allocation.policy import DRLAllocationPolicy
+
+        model_path = config.drl_model_path
+        config_path = os.path.join(os.path.dirname(model_path), "state_builder_config.pkl")
+
+        with open(config_path, "rb") as f:
+            sb_config = pickle.load(f)
+
+        state_builder = DRLStateBuilder(
+            activity_list=sb_config["activity_list"],
+            role_groups=sb_config["role_groups"],
+            resource_to_role=sb_config["resource_to_role"],
+            activity_to_roles=sb_config["activity_to_roles"],
+        )
+
+        drl_policy = DRLAllocationPolicy(
+            model_path=model_path,
+            state_builder=state_builder,
+            deterministic=config.drl_deterministic,
+        )
+        print(f"Created DRL policy from: {model_path}")
+
+    # Create PMSP config (if requested)
+    pmsp_config = None
+    if config.resource_allocation_mode == "pmsp":
+        from resources.resource_optimization.resource_optimization import SelectionConfig
+        pmsp_config = SelectionConfig(
+            mode="pmsp",
+            dummy_delta=config.pmsp_dummy_delta,
+            pmsp_solver_time_limit_seconds=config.pmsp_solver_time_limit_seconds,
+            prediction_batch_size=config.pmsp_prediction_batch_size,
+        )
+        print(f"Created PMSP config (delta={config.pmsp_dummy_delta})")
+
     engine = DESEngine(
         resource_allocator=allocator,
         arrival_timestamps=arrivals,
         next_activity_predictor=next_act_pred,  # May be None for auto-load or if delegated
         next_activity_predictor_type=pred_type,  # Explicit type trigger if predictor is None
-        next_activity_config={'temperature': config.next_activity_temperature},
+        next_activity_config={
+            'temperature': config.next_activity_temperature,
+            'pt_max_duration_seconds': config.pt_max_duration_seconds,
+        },
+        pt_lifecycle_mode=config.pt_lifecycle_mode,
         processing_time_predictor=proc_pred,
         case_attribute_predictor=attr_pred,
         start_time=engine_start_time,
+        resource_selection_strategy=resource_strategy,
+        batch_allocation_policy=batch_policy,
+        processing_time_estimator=pt_estimator,
+        drl_policy=drl_policy,
+        drl_max_postpone_wait_hours=config.drl_max_postpone_wait_hours,
+        pmsp_config=pmsp_config,
+        enable_profiling=enable_profiling,
     )
 
     # Run simulation
@@ -179,6 +243,9 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print(f"  Outside hours: {engine.stats['outside_hours_count']}")
     print(f"  No eligible: {engine.stats['no_eligible_failures']}")
     print("=" * 60)
+
+    if batch_policy is not None and hasattr(batch_policy, 'print_diagnostics_summary'):
+        batch_policy.print_diagnostics_summary()
 
     # Export results
     os.makedirs(output_dir, exist_ok=True)
@@ -207,44 +274,51 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
 def main():
     parser = argparse.ArgumentParser(description="Run integration test for simulation engine")
     parser.add_argument(
-        "--mode",
-        choices=["basic", "advanced", "mixed"],
-        default="basic",
-        help="Simulation mode (basic=all stubs, advanced=all ML, mixed=custom)"
-    )
-    parser.add_argument(
         "--arrivals",
         choices=["basic", "advanced"],
-        default=None,
-        help="Case arrival mode (for mixed mode)"
+        default="basic",
+        help="Case arrival mode (default: basic)"
     )
     parser.add_argument(
         "--processing",
         choices=["basic", "advanced"],
-        default=None,
-        help="Processing time mode (for mixed mode)"
+        default="basic",
+        help="Processing time mode (default: basic)"
     )
     parser.add_argument(
         "--attributes",
         choices=["basic", "advanced"],
+        default="basic",
+        help="Case attribute mode (default: basic)"
+    )
+    parser.add_argument(
+        "--processing-model-path",
         default=None,
-        help="Case attribute mode (for mixed mode)"
+        help="Path to processing time model (base path without suffixes)"
     )
     parser.add_argument(
         "--next-activity",
-        choices=[
-            "lstm", "process_transformer",
-            "lifecycle_dual_full_baseline", "lifecycle_dual_full_balanced",
-            "lifecycle_dual_start_complete_baseline",
-        ],
-        default="lifecycle_dual_full_balanced",
-        help="Next activity predictor (default: dual full_lifecycle balanced NAP)"
+        choices=["lstm", "process_transformer", "lifecycle_dual_full_baseline", "lifecycle_dual_start_complete_baseline"],
+        default="lstm",
+        help="Next activity predictor implementation"
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=1.5,
         help="Sampling temperature for next activity prediction (process_transformer only)"
+    )
+    parser.add_argument(
+        "--pt-lifecycle-mode",
+        choices=["native", "gt_activity_gated"],
+        default="native",
+        help="PT-only lifecycle logging mode: native predictor output, or GT activity-gated synthetic starts"
+    )
+    parser.add_argument(
+        "--pt-max-duration-days",
+        type=float,
+        default=30.0,
+        help="Max PT duration cap in days (prevents outlier durations from cascading queue buildup, default: 30)"
     )
     parser.add_argument(
         "--event-log",
@@ -259,8 +333,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        default=None,
-        help="Output directory for simulated log (default: integration/output or integration/output/<predictor> for dual predictors)"
+        default="integration/output",
+        help="Output directory for simulated log"
     )
     parser.add_argument(
         "--verbose",
@@ -268,24 +342,54 @@ def main():
         help="Enable verbose logging"
     )
     parser.add_argument(
-        "--no-exclude-resources",
-        action="store_true",
-        help="Do not exclude resources (default: all allowed; use config to exclude)"
+        "--resource-strategy",
+        choices=["random", "round_robin", "shortest_queue"],
+        default="random",
+        help="Resource selection heuristic (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)"
     )
     parser.add_argument(
-        "--exclude-resources",
-        type=str,
-        default=None,
-        help="Comma-separated resource names to exclude (e.g. User_102,User_144)"
+        "--resource-allocation-mode",
+        choices=["greedy", "batch", "drl", "pmsp"],
+        default="greedy",
+        help="Resource allocation mode (greedy=per-task heuristic, batch=MILP-based 1-Batch-1, drl=trained PPO, pmsp=PMSP optimizer)"
+    )
+    parser.add_argument(
+        "--pmsp-dummy-delta",
+        type=float,
+        default=1.0,
+        help="PMSP dummy cost multiplier delta (default: 1.0)"
+    )
+    parser.add_argument(
+        "--pmsp-solver-time-limit",
+        type=float,
+        default=2.0,
+        help="PMSP CP-SAT solver time limit in seconds (default: 2.0)"
+    )
+    parser.add_argument(
+        "--pmsp-prediction-batch-size",
+        type=int,
+        default=0,
+        help="PMSP max predictions per task (0=unlimited, default: 0)"
+    )
+    parser.add_argument(
+        "--drl-model-path",
+        default="models/drl_allocation/drl_allocation_model",
+        help="Path to trained DRL model (for --resource-allocation-mode drl)"
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiling of simulation components"
     )
 
     args = parser.parse_args()
 
-    if args.output_dir is None:
-        if args.next_activity == "lifecycle_dual_full_balanced":
-            args.output_dir = "integration/output/full_lifecycle_balanced"
-        else:
-            args.output_dir = "integration/output"
+    if args.pt_lifecycle_mode == "gt_activity_gated" and args.next_activity != "process_transformer":
+        raise ValueError(
+            "--pt-lifecycle-mode=gt_activity_gated is only valid with "
+            "--next-activity process_transformer. "
+            "Use --pt-lifecycle-mode native for non-PT predictors."
+        )
 
     # Setup logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -310,96 +414,53 @@ def main():
             mask = df['lifecycle:transition'].astype(str).str.lower().isin(['start', 'complete'])
             df = df[mask].copy()
 
-    # Create configuration
-    if args.mode == "basic":
-        config = SimulationConfig.all_basic()
-    elif args.mode == "advanced":
-        config = SimulationConfig.all_advanced(
-            event_log_path=args.event_log,
-            num_cases=num_cases,
-        )
-    else:  # mixed
-        config = SimulationConfig(
-            processing_time_mode=args.processing or "basic",
-            case_arrival_mode=args.arrivals or "basic",
-            case_attribute_mode=args.attributes or "basic",
-            event_log_path=args.event_log,
-            num_cases=num_cases,
-            verbose=args.verbose,
-        )
+    # Create configuration from individual flags
+    config = SimulationConfig(
+        processing_time_mode=args.processing,
+        case_arrival_mode=args.arrivals,
+        case_attribute_mode=args.attributes,
+        event_log_path=args.event_log,
+        num_cases=num_cases,
+        verbose=args.verbose,
+    )
 
+    if args.processing_model_path:
+        config.processing_time_model_path = args.processing_model_path
 
-    
-    # Set the implementation class
-    config.next_activity_class = args.next_activity
+    # Map CLI next-activity choice to config fields
     config.next_activity_temperature = args.temperature
-    if args.next_activity == "lifecycle_dual_full_baseline":
-        candidate_model_paths = [
-            "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
-            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline",
-        ]
-        selected_model_path = None
-        for candidate in candidate_model_paths:
-            if Path(candidate).exists():
-                selected_model_path = candidate
-                break
-        if selected_model_path is None:
-            selected_model_path = candidate_model_paths[0]
-
-        config.next_activity_class = "lstm"
-        config.next_activity_mode = "advanced"
-        config.next_activity_model_type = "lifecycle_dual"
-        config.next_activity_model_path = selected_model_path
-    elif args.next_activity == "lifecycle_dual_full_balanced":
-        candidate_model_paths = [
-            "next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced",
-            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced",
-        ]
-        selected_model_path = None
-        for candidate in candidate_model_paths:
-            if Path(candidate).exists():
-                selected_model_path = candidate
-                break
-        if selected_model_path is None:
-            selected_model_path = candidate_model_paths[0]
-
-        config.next_activity_class = "lstm"
-        config.next_activity_mode = "advanced"
-        config.next_activity_model_type = "lifecycle_dual"
-        config.next_activity_model_path = selected_model_path
-    elif args.next_activity == "lifecycle_dual_start_complete_baseline":
-        candidate_model_paths = [
-            "next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
-            "next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/start_complete/baseline",
-        ]
-        selected_model_path = None
-        for candidate in candidate_model_paths:
-            if Path(candidate).exists():
-                selected_model_path = candidate
-                break
-        if selected_model_path is None:
-            selected_model_path = candidate_model_paths[0]
-
-        config.next_activity_class = "lstm"
-        config.next_activity_mode = "advanced"
-        config.next_activity_model_type = "lifecycle_dual"
-        config.next_activity_model_path = selected_model_path
+    config.pt_lifecycle_mode = args.pt_lifecycle_mode
+    config.pt_max_duration_seconds = args.pt_max_duration_days * 24 * 3600
+    if args.next_activity == "lifecycle_dual_start_complete_baseline":
+        config.next_activity_class = "lifecycle_dual"
+        config.next_activity_lifecycle_variant = "start_complete"
+        config.next_activity_model_path = "next_activity_prediction_lifecycle_dual/models/start_complete/baseline"
+    elif args.next_activity == "lifecycle_dual_full_baseline":
+        config.next_activity_class = "lifecycle_dual"
+        config.next_activity_lifecycle_variant = "full_lifecycle"
+        config.next_activity_model_path = "next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"
+    else:
+        config.next_activity_class = args.next_activity  # "lstm" or "process_transformer"
 
     config.num_cases = num_cases
-    if args.no_exclude_resources:
-        config.exclude_resources = []
-    elif args.exclude_resources:
-        config.exclude_resources = [r.strip() for r in args.exclude_resources.split(",") if r.strip()]
+    config.resource_selection_strategy = args.resource_strategy
+    config.resource_allocation_mode = args.resource_allocation_mode
+    if hasattr(args, 'drl_model_path') and args.drl_model_path:
+        config.drl_model_path = args.drl_model_path
+    if args.resource_allocation_mode == "pmsp":
+        config.pmsp_dummy_delta = args.pmsp_dummy_delta
+        config.pmsp_solver_time_limit_seconds = args.pmsp_solver_time_limit
+        config.pmsp_prediction_batch_size = args.pmsp_prediction_batch_size
 
     # Create resource allocator
-    allocator = create_resource_allocator(args.event_log, config)
+    allocator = create_resource_allocator(args.event_log)
 
     # Save ground truth subset for comparison
     print(f"\nSaving ground truth subset ({num_cases} cases) for comparison...")
     save_ground_truth_subset(df, num_cases, args.output_dir)
 
     # Run simulation
-    events = run_simulation(config, df, allocator, args.output_dir)
+    events = run_simulation(config, df, allocator, args.output_dir, enable_profiling=args.profile)
 
     print("\n" + "=" * 60)
     print("INTEGRATION TEST COMPLETE")

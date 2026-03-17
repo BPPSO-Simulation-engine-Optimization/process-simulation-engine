@@ -10,7 +10,7 @@ import joblib
 
 
 class ModelTrainer:
-    """Handles machine learning pipeline for process mining prediction."""
+    """Handles machine learning pipeline for process mining prediction via XBoost."""
 
     def __init__(
         self,
@@ -28,7 +28,6 @@ class ModelTrainer:
         """
         self.random_state = random_state
 
-        # Default feature lists if not provided
         self.categorical_features = categorical_features or ["event", "lifecycle:transition"]
         self.numerical_features = numerical_features or [
             "event_index", "hour", "weekday"
@@ -53,19 +52,21 @@ class ModelTrainer:
             ]
         )
 
-        # XGBoost model with good defaults for this task
         xgb_model = XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
+            n_estimators=600,
+            max_depth=6,
+            learning_rate=0.03,
             subsample=0.8,
             colsample_bytree=0.8,
+            min_child_weight=5,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
             objective="reg:squarederror",
             random_state=self.random_state,
             n_jobs=-1
         )
 
-        # Create full pipeline
         pipeline = Pipeline([
             ("preprocessor", preprocessor),
             ("xgb", xgb_model)
@@ -95,16 +96,14 @@ class ModelTrainer:
         """
         print(f"Splitting data with test_size={test_size}...")
 
-        # Check if we have enough samples for splitting
         n_samples = len(X)
         min_train_size = max(1, int(n_samples * (1 - test_size)))
         min_test_size = max(1, int(n_samples * test_size))
-        
+
         if n_samples < (min_train_size + min_test_size):
             raise ValueError(
                 f"Insufficient samples for splitting: {n_samples} samples with test_size={test_size} "
-                f"requires at least {min_train_size + min_test_size} samples. "
-                f"Minimum train size: {min_train_size}, minimum test size: {min_test_size}"
+                f"requires at least {min_train_size + min_test_size} samples."
             )
 
         gss = GroupShuffleSplit(test_size=test_size, n_splits=1, random_state=self.random_state)
@@ -137,25 +136,25 @@ class ModelTrainer:
         Returns:
             Trained pipeline
         """
-        print("Training XGBoost model...")
+        from datetime import datetime
+        start_time = datetime.now()
+        print(f"[{start_time:%H:%M:%S}] Training XGBoost model...")
+        print(f"  Training samples: {len(X_train):,}, Features: {len(X_train.columns)}")
 
-        # Update numerical features if additional ones provided
         if additional_numerical_features:
             self.numerical_features.extend(additional_numerical_features)
-            # Recreate pipeline with updated features
             self.create_preprocessing_pipeline()
 
-        # Create pipeline if not exists
         if self.pipeline is None:
             self.create_preprocessing_pipeline()
 
-        # Train the model
+        print(f"  Fitting model (n_estimators=600, this may take a while)...")
         self.pipeline.fit(X_train, y_train)
 
-        # Store feature names for later analysis
         self.feature_names = self.pipeline.named_steps["preprocessor"].get_feature_names_out()
 
-        print("Model training completed")
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"[{datetime.now():%H:%M:%S}] ✓ Model training completed ({duration:.1f}s)")
 
         return self.pipeline
 
@@ -199,10 +198,9 @@ class ModelTrainer:
         """
         self.pipeline = joblib.load(filepath)
 
-        # Try to restore feature names
         try:
             self.feature_names = self.pipeline.named_steps["preprocessor"].get_feature_names_out()
-        except:
+        except Exception:
             print("Warning: Could not restore feature names")
 
         print(f"Model loaded from: {filepath}")

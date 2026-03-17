@@ -35,6 +35,7 @@ class DailyArrivalBuilder:
               .groupby("case:concept:name", as_index=False)["time:timestamp"]
               .first()
         )
+        first_events = first_events.sort_values("time:timestamp", kind="mergesort").reset_index(drop=True)
 
         if first_events.empty:
             raise ValueError("Keine Events gefunden (first_events ist leer).")

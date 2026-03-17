@@ -29,7 +29,7 @@ class DataLoader:
         # Convert to DataFrame
         df = pm4py.convert_to_dataframe(log)
 
-        # Rename columns to standard names (same as load_csv_to_dataframe)
+        # Rename columns to standard names
         rename_dict = {
             "case:concept:name": "case_id",
             "concept:name": "event",
@@ -41,7 +41,7 @@ class DataLoader:
         # Convert timestamp to datetime and clean timezone
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-            
+
             # Convert to Europe/Berlin timezone and remove timezone info
             if df["timestamp"].dt.tz is not None:
                 df["timestamp"] = (
@@ -50,7 +50,6 @@ class DataLoader:
                     .dt.tz_localize(None)
                 )
             else:
-                # If already timezone-naive, just ensure it's datetime
                 df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
             # Remove invalid timestamps
@@ -97,7 +96,7 @@ class DataLoader:
 
         # Convert timestamp to datetime and clean timezone
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        
+
         # Convert to Europe/Berlin timezone and remove timezone info
         if df["timestamp"].dt.tz is not None:
             df["timestamp"] = (
@@ -106,7 +105,6 @@ class DataLoader:
                 .dt.tz_localize(None)
             )
         else:
-            # If already timezone-naive, just ensure it's datetime
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
         # Remove invalid timestamps
