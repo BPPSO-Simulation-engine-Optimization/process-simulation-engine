@@ -6,11 +6,16 @@ differs. Produces a distribution of metric changes for use in log_comparison not
 
 Usage:
     python -m integration.run_termination_comparison --n-runs 10 --exclude-resources User_128,User_129
+    python -m integration.run_termination_comparison --n-runs 50 --jobs 8 --exclude-resources User_128,User_129
     python -m integration.run_termination_comparison --n-runs 5 --num-cases 200 --output-csv evaluation/termination_runs.csv
+
+Progress is written after each run pair. Re-run with the same --output-csv and --n-runs to resume
+(only missing run_ids are executed). Use --no-resume to start from scratch.
 """
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -41,18 +46,87 @@ def _pct_change(a: float, b: float) -> float:
     return (b - a) / a * 100
 
 
+def _available_memory_bytes_windows() -> int | None:
+    try:
+        import ctypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) == 0:
+            return None
+        return int(stat.ullAvailPhys)
+    except Exception:
+        return None
+
+
+def _choose_worker_count(requested: int | None, backend: str) -> int:
+    cpu = os.cpu_count() or 1
+    if requested is not None and requested > 0:
+        return min(requested, cpu)
+
+    if backend == "processes":
+        return cpu
+
+    avail = _available_memory_bytes_windows() if os.name == "nt" else None
+    if avail is None:
+        return cpu
+
+    per_worker_bytes = int(2.5 * 1024**3)
+    return max(1, min(cpu, avail // per_worker_bytes))
+
+
+def _append_row_to_csv(row: dict, path: Path, write_header: bool, columns: list[str] | None) -> list[str]:
+    if columns is None:
+        columns = ["run_id"] + sorted(k for k in row if k != "run_id")
+    ordered = [row.get(c) for c in columns]
+    df_one = pd.DataFrame([ordered], columns=columns)
+    mode = "w" if write_header else "a"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df_one.to_csv(path, mode=mode, header=write_header, index=False)
+    return columns
+
+
+_WORKER_DF: pd.DataFrame | None = None
+_WORKER_LOG_PATH: str | None = None
+
+
+def _init_worker(log_path: str) -> None:
+    global _WORKER_DF, _WORKER_LOG_PATH
+    _WORKER_LOG_PATH = log_path
+    _WORKER_DF = load_event_log(log_path)
+
+
 def run_one_pair(
     run_id: int,
     config: SimulationConfig,
-    df: pd.DataFrame,
+    df: pd.DataFrame | None,
     log_path: str,
     base_output_dir: Path,
     exclude_resources: list[str],
     cost_per_fte: float,
 ) -> dict:
     """Run with and without termination; return metrics and differences for this pair."""
-    from datetime import datetime
+    import copy
 
+    if df is None:
+        df = _WORKER_DF
+    if df is None:
+        df = load_event_log(log_path)
+
+    config = copy.deepcopy(config)
     config.random_seed = (config.random_seed or 42) + run_id
     out_base = base_output_dir / f"run_{run_id}"
     out_with = out_base / "with_termination"
@@ -93,7 +167,19 @@ def main():
         description="Run N paired simulations (with/without terminated resources) and save comparison CSV"
     )
     parser.add_argument("--n-runs", type=int, default=10, help="Number of run pairs")
-    parser.add_argument("--num-cases", type=int, default=100, help="Cases per run (default: full log)")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Parallel workers (default: all CPU cores)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["threads", "processes"],
+        default="threads",
+        help="Parallel backend. Use 'threads' to share memory (default); use 'processes' for true CPU parallelism.",
+    )
+    parser.add_argument("--num-cases", type=int, default=1000, help="Cases per run (default: full log)")
     parser.add_argument(
         "--exclude-resources",
         type=str,
@@ -126,6 +212,11 @@ def main():
         default="lifecycle_dual_full_balanced",
     )
     parser.add_argument("--seed", type=int, default=42, help="Base random seed; run i uses seed + i")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore existing output CSV and run all n-runs from scratch",
+    )
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -146,6 +237,30 @@ def main():
         exclude_list = [r.strip() for r in args.exclude_resources.split(",") if r.strip()]
     if not exclude_list:
         parser.error("--exclude-resources is required (e.g. --exclude-resources User_128,User_129)")
+
+    done_ids: set[int] = set()
+    csv_columns: list[str] | None = None
+    if args.output_csv.exists() and not args.no_resume:
+        try:
+            existing = pd.read_csv(args.output_csv)
+            if "run_id" in existing.columns and len(existing) > 0:
+                done_ids = set(existing["run_id"].astype(int))
+                csv_columns = list(existing.columns)
+                if done_ids:
+                    print(f"Resuming: {len(done_ids)} runs already in {args.output_csv}")
+        except Exception as e:
+            print(f"Could not read existing CSV: {e}")
+
+    run_ids_to_do = [i for i in range(args.n_runs) if i not in done_ids]
+    if not run_ids_to_do:
+        print("All runs already done.")
+        result = pd.read_csv(args.output_csv)
+        diff_cols = [c for c in result.columns if c.endswith("_diff")]
+        if diff_cols:
+            summary = result[diff_cols].agg(["mean", "std", "min", "max"])
+            summary.columns = [c.replace("_diff", "") for c in summary.columns]
+            print(summary.round(4).to_string())
+        return
 
     log_path = args.event_log
     if not Path(log_path).is_absolute():
@@ -185,23 +300,70 @@ def main():
         config.next_activity_mode = "advanced"
         config.next_activity_model_type = "lifecycle_dual"
 
-    rows = []
-    for run_id in range(args.n_runs):
-        print(f"\n--- Run pair {run_id + 1}/{args.n_runs} ---")
-        row = run_one_pair(
-            run_id=run_id,
-            config=config,
-            df=df,
-            log_path=log_path,
-            base_output_dir=args.output_dir,
-            exclude_resources=exclude_list,
-            cost_per_fte=COST_PER_FTE_HOUR,
-        )
-        rows.append(row)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    max_workers = _choose_worker_count(args.jobs, args.backend)
+    total_to_do = len(run_ids_to_do)
+    print(f"Running {total_to_do} pairs (of {args.n_runs}) with {max_workers} workers ({args.backend})")
 
-    result = pd.DataFrame(rows)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(args.output_csv, index=False)
+    from concurrent.futures import as_completed
+
+    file_has_content = args.output_csv.exists() and args.output_csv.stat().st_size > 0
+    if args.backend == "threads":
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    run_one_pair,
+                    run_id,
+                    config,
+                    df,
+                    log_path,
+                    args.output_dir,
+                    exclude_list,
+                    COST_PER_FTE_HOUR,
+                ): run_id
+                for run_id in run_ids_to_do
+            }
+            for i, fut in enumerate(as_completed(futures), start=1):
+                row = fut.result()
+                write_header = not file_has_content
+                csv_columns = _append_row_to_csv(row, args.output_csv, write_header, csv_columns)
+                file_has_content = True
+                print(f"Completed {i}/{total_to_do} (run_id={row['run_id']}) -> {args.output_csv}")
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        print(
+            "Note: process backend duplicates the event log per worker; "
+            "if you hit memory errors, lower --jobs or use --backend threads."
+        )
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_worker,
+            initargs=(log_path,),
+        ) as ex:
+            futures = {
+                ex.submit(
+                    run_one_pair,
+                    run_id,
+                    config,
+                    None,
+                    log_path,
+                    args.output_dir,
+                    exclude_list,
+                    COST_PER_FTE_HOUR,
+                ): run_id
+                for run_id in run_ids_to_do
+            }
+            for i, fut in enumerate(as_completed(futures), start=1):
+                row = fut.result()
+                write_header = not file_has_content
+                csv_columns = _append_row_to_csv(row, args.output_csv, write_header, csv_columns)
+                file_has_content = True
+                print(f"Completed {i}/{total_to_do} (run_id={row['run_id']}) -> {args.output_csv}")
+
+    result = pd.read_csv(args.output_csv).sort_values("run_id").reset_index(drop=True)
     print(f"\nSaved comparison CSV: {args.output_csv} ({len(result)} runs)")
 
     diff_cols = [c for c in result.columns if c.endswith("_diff")]
