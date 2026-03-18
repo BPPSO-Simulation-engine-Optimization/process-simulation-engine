@@ -112,6 +112,21 @@ def _load_log(path: Path) -> pd.DataFrame:
     return df
 
 
+def _filter_stuck_cases(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove cases that never reached a terminal lifecycle event (complete/withdraw/ate_abort)."""
+    if "lifecycle:transition" not in df.columns:
+        return df
+    terminal = {"complete", "withdraw", "ate_abort"}
+    completed_cases = df[
+        df["lifecycle:transition"].astype(str).str.lower().isin(terminal)
+    ]["case:concept:name"].unique()
+    n_total = df["case:concept:name"].nunique()
+    n_stuck = n_total - len(completed_cases)
+    if n_stuck > 0:
+        print(f"  Filtering {n_stuck} stuck cases (never reached terminal event) out of {n_total}")
+    return df[df["case:concept:name"].isin(completed_cases)].reset_index(drop=True)
+
+
 def _extract_resource_active_segments(df_raw: pd.DataFrame) -> pd.DataFrame:
     """Lifecycle-aware resource active segments: start|resume → complete|withdraw|ate_abort."""
     required = {"case:concept:name", "time:timestamp", "org:resource", "lifecycle:transition"}
@@ -189,7 +204,7 @@ def _wrf(busy_hours: np.ndarray) -> float:
 
 def compute_metrics(log_path: Path) -> dict:
     """Compute all evaluation metrics for a single simulated log."""
-    df_raw = _load_log(log_path)
+    df_raw = _filter_stuck_cases(_load_log(log_path))
 
     # ── Basic counts ──────────────────────────────────────────────────────
     num_cases = df_raw["case:concept:name"].nunique()
