@@ -1006,7 +1006,7 @@ class DESEngine:
             self._resource_strategy.notify_release(event.resource)
             # Try to dispatch waiting work now that this resource is free
             with self.profiler.measure("process_waiting_queue"):
-                logger.info("Processing waiting queue after activity completion. Resource freed: %s", event.resource)
+                logger.debug("Processing waiting queue after activity completion. Resource freed: %s", event.resource)
                 # In PMSP mode: first drain the pre-planned worklist for this resource.
                 if self._pmsp_config is not None:
                     logger.info("Processing resource worklist of ressource %s", event.resource)
@@ -1097,7 +1097,7 @@ class DESEngine:
 
         Tries to dispatch waiting work to the freed resource if it's eligible.
         """
-        logger.info("Processing waiting queue.")
+        logger.debug("Processing waiting queue.")
         # DRL policy overrides both batch and greedy
         if self._drl_policy is not None:
             self._process_waiting_queue_drl(freed_resource, current_time)
@@ -1185,7 +1185,7 @@ class DESEngine:
             if not self.allocator.availability.is_available(resource, current_time):
                 worklist = self._resource_worklists.get(resource, [])
                 if worklist:
-                    logger.info(
+                    logger.debug(
                         "K-Batching: Resource %s became unavailable, transferring %d tasks back to waiting queue",
                         resource, len(worklist)
                     )
@@ -1241,7 +1241,7 @@ class DESEngine:
 
         # K-Batching: Check if resource is unavailable - if so, transfer tasks back
         if not self.allocator.availability.is_available(resource, current_time):
-            logger.info(
+            logger.debug(
                 "K-Batching: Resource %s is unavailable, transferring %d tasks from worklist back to waiting queue",
                 resource, len(worklist)
             )
@@ -2036,6 +2036,7 @@ class DESEngine:
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
+        logger.debug("Scheduling next activity after activity completion: %s", activity)
         # Some activities are control-flow artifacts (e.g., decision points) and must not
         # require an organizational resource.
         if not self._activity_requires_resource(activity):

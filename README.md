@@ -40,10 +40,10 @@ Resource models (`resources/resource_permissions/`, `resources/resource_availabi
 ```bash
 conda activate pse_env
 python -m integration.test_integration \
- 	--next-activity lifecycle_dual_start_complete_baseline
+ 	--next-activity lifecycle_dual_start_complete_baseline \
 	--arrivals advanced \
-	--attributes advanced \
 	--processing advanced \
+	--attributes advanced \
 	--resource-strategy random \
 	--resource-allocation-mode greedy \
 	--num-cases 31509 \
