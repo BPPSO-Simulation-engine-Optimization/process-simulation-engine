@@ -551,6 +551,7 @@ class DESEngine:
         # Incremental CSV export (write every 100 cases)
         self._incremental_csv_path: Optional[str] = incremental_csv_path
         self._last_csv_exported_events_count: int = 0
+        self._last_csv_exported_cases: int = 0
 
         # Statistics
         self.stats = {
