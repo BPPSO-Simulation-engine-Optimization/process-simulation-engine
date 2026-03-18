@@ -105,6 +105,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     print("=" * 60)
     print(f"  Processing time mode: {config.processing_time_mode}")
     print(f"  Case arrival mode: {config.case_arrival_mode}")
+    print(f"  Case attribute mode: {config.case_attribute_mode}")
     print(f"  Resource selection: {config.resource_selection_strategy}")
     print(f"  Resource allocation mode: {config.resource_allocation_mode}")
     if config.next_activity_class == "process_transformer":
@@ -131,7 +132,7 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
     # Setup predictors
     print("\nSetting up predictors...")
     # Pass df if arrival mode is advanced (needed for training/fallback)
-    needs_df = config.case_arrival_mode == "advanced"
+    needs_df = config.case_arrival_mode == "advanced" or config.case_attribute_mode == "advanced"
     arrivals, next_act_pred, proc_pred, attr_pred = setup_simulation(
         config,
         df=df if needs_df else None,
@@ -285,14 +286,20 @@ def main():
     parser.add_argument(
         "--arrivals",
         choices=["basic", "advanced"],
-        default="advanced",
-        help="Case arrival mode (default: advanced)"
+        default="basic",
+        help="Case arrival mode (default: basic)"
     )
     parser.add_argument(
         "--processing",
         choices=["basic", "advanced"],
         default="basic",
         help="Processing time mode (default: basic)"
+    )
+    parser.add_argument(
+        "--attributes",
+        choices=["basic", "advanced"],
+        default="basic",
+        help="Case attribute mode (default: basic)"
     )
     parser.add_argument(
         "--processing-model-path",
@@ -427,6 +434,7 @@ def main():
     config = SimulationConfig(
         processing_time_mode=args.processing,
         case_arrival_mode=args.arrivals,
+        case_attribute_mode=args.attributes,
         event_log_path=args.event_log,
         num_cases=num_cases,
         verbose=args.verbose,

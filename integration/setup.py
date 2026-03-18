@@ -48,13 +48,16 @@ def setup_simulation(
         next_activity_predictor may be None if auto-load should be used.
 
     Raises:
-        ValueError: If advanced arrival mode requires df but df is None.
+        ValueError: If advanced mode requires df but df is None.
     """
     if start_date is None:
         start_date = datetime.now()
 
-    # Validate: advanced arrival mode requires training data
-    needs_df = config.case_arrival_mode == "advanced"
+    # Validate: advanced modes require training data
+    needs_df = (
+        config.case_arrival_mode == "advanced" or
+        config.case_attribute_mode == "advanced"
+    )
     if needs_df and df is None:
         raise ValueError(
             "Event log DataFrame (df) is required for advanced mode predictors. "
