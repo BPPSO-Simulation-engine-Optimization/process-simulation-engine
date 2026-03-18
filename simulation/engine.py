@@ -546,6 +546,7 @@ class DESEngine:
         # Incremental CSV export (write every 100 cases)
         self._incremental_csv_path: Optional[str] = incremental_csv_path
         self._last_csv_exported_events_count: int = 0
+        self._last_csv_exported_cases: int = 0
 
         # Statistics
         self.stats = {
@@ -741,9 +742,8 @@ class DESEngine:
         
         event_count = 0
         
-        # Track last progress log time for 5-minute interval logging
-        last_progress_log_time = self.clock.now
-        progress_log_interval = timedelta(minutes=5)  # Log every 5 minutes of simulation time
+        last_progress_print = 0
+        progress_interval = max(10, num_cases // 20)  # Print every ~5% or at least every 10 cases
         
         while not self.queue.is_empty():
             event = self.queue.pop()
@@ -757,25 +757,26 @@ class DESEngine:
             
             event_count += 1
             
-            # Print progress every 5 minutes of simulation time
-            current_time = self.clock.now
-            if current_time - last_progress_log_time >= progress_log_interval:
+            # Print progress periodically
+            if self.stats['cases_started'] - last_progress_print >= progress_interval:
                 print(f"Progress: {self.stats['cases_started']} cases started, "
                       f"{self.stats['cases_completed']} completed, "
                       f"{len(self.completed_events)} events logged, "
-                      f"{self.resource_pool.get_total_waiting_count()} waiting, "
-                      f"simulation time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-                last_progress_log_time = current_time
-            
-            # Incremental CSV export: write every 100 cases
-            if self._incremental_csv_path and self.stats['cases_started'] % 100 == 0 and self.stats['cases_started'] > 0:
+                      f"{self.resource_pool.get_total_waiting_count()} waiting", flush=True)
+                last_progress_print = self.stats['cases_started']
+
+            # Incremental CSV export: write when cases_started crosses a new 100-case boundary
+            cases_started = self.stats['cases_started']
+            if (self._incremental_csv_path
+                    and cases_started >= self._last_csv_exported_cases + 100):
                 new_events = self.completed_events[self._last_csv_exported_events_count:]
                 if new_events:
                     from simulation.log_exporter import LogExporter
                     write_header = (self._last_csv_exported_events_count == 0)
                     LogExporter.append_to_csv(new_events, self._incremental_csv_path, write_header=write_header)
                     self._last_csv_exported_events_count = len(self.completed_events)
-                    logger.info(f"Incremental CSV export: wrote {len(new_events)} events to {self._incremental_csv_path} (total cases: {self.stats['cases_started']})")
+                    self._last_csv_exported_cases = cases_started
+                    logger.debug(f"Incremental CSV export: wrote {len(new_events)} events to {self._incremental_csv_path} (total cases: {cases_started})")
 
         # Drain phase: process remaining waiting work by advancing time
         if self.resource_pool.has_waiting_work():
