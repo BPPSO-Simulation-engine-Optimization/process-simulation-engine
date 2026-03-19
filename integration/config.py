@@ -30,7 +30,7 @@ class SimulationConfig:
     # PT-only lifecycle logging mode (ignored unless next_activity_class is process_transformer)
     pt_lifecycle_mode: Literal["native", "gt_activity_gated"] = "native"
     # Max PT duration cap in seconds (prevents outlier durations from cascading queue buildup)
-    pt_max_duration_seconds: Optional[float] = None
+    pt_max_duration_seconds: Optional[float] = 86400.0
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
@@ -66,8 +66,8 @@ class SimulationConfig:
     drl_reward_tau: float = 100.0
     drl_max_postpone_wait_hours: float = 4.0
     # PMSP settings (only when resource_allocation_mode="pmsp")
-    pmsp_dummy_delta: float = 1.0
-    pmsp_solver_time_limit_seconds: Optional[float] = 2.0
+    pmsp_dummy_delta: float = 1.5
+    pmsp_solver_time_limit_seconds: Optional[float] = 0.2
     pmsp_prediction_batch_size: int = 0  # 0 = unlimited
     pmsp_optimization_batch_size: int = 0  # Min waiting tasks to trigger optimization (0 = always optimize)
     pmsp_park_song_lookahead: bool = True  # Park & Song [13] look-ahead: add predicted next tasks to optimization

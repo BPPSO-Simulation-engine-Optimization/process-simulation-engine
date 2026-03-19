@@ -1,6 +1,7 @@
 from typing import Dict, Tuple, Optional, List
 import pandas as pd
 import numpy as np
+import math
 from scipy import stats
 import warnings
 from sklearn.ensemble import RandomForestRegressor
@@ -12,6 +13,8 @@ try:
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
+
+_MAX_SECONDS = 7 * 24 * 3600  # must match resource_optimization._MAX_SECONDS
 
 # XGBoost activity-specific model (optional)
 try:
@@ -585,6 +588,75 @@ class ProcessingTimePredictionClass:
         # Unknown method – should never reach here after load_model validation
         warnings.warn(f"Unknown method '{self.method}'. Using fallback.")
         return self.fallback_mean if self.fallback_mean else 3600.0
+
+    def predict_batch(self, inputs: List[Dict]) -> List[Optional[float]]:
+        """
+        Batch prediction for multiple (prev_activity, resource, …) combinations.
+
+        Each element of *inputs* is a dict with keys:
+            prev_activity, prev_lifecycle, curr_activity, curr_lifecycle, context
+
+        For the "ml" method all feature vectors are stacked into a single matrix
+        and the underlying sklearn model is called **once**, reducing Python/numpy
+        overhead by N× compared to N individual predict() calls.
+
+        For all other methods the function falls back to sequential predict() calls.
+
+        Returns a list of floats (seconds) with the same length as *inputs*.
+        ``None`` entries indicate prediction failure for that slot.
+        """
+        if not inputs:
+            return []
+
+        if self.method == "ml" and self.ml_model is not None and hasattr(self, "feature_plan"):
+            results: List[Optional[float]] = [None] * len(inputs)
+            batch_indices: List[int] = []
+            batch_vectors: List[np.ndarray] = []
+
+            for i, inp in enumerate(inputs):
+                try:
+                    feature_dict = self._context_to_features(
+                        inp["prev_activity"],
+                        inp["prev_lifecycle"],
+                        inp["curr_activity"],
+                        inp["curr_lifecycle"],
+                        inp.get("context"),
+                    )
+                    vec = self._prepare_single_vector(feature_dict)  # shape (1, n_features)
+                    batch_indices.append(i)
+                    batch_vectors.append(vec[0])  # shape (n_features,)
+                except Exception:
+                    pass
+
+            if batch_vectors:
+                X = np.stack(batch_vectors, axis=0)  # (N, n_features)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="X does not have valid feature names")
+                    preds = self.ml_model.predict(X)
+                for idx, pred in zip(batch_indices, preds):
+                    v = float(pred)
+                    # Match resource_optimization._safe_seconds semantics:
+                    # - invalid/non-finite => None
+                    # - negative => None
+                    # - clamp extreme values
+                    if not math.isfinite(v) or v < 0:
+                        results[idx] = None
+                    else:
+                        results[idx] = min(v, _MAX_SECONDS)
+
+            return results
+
+        # Fallback: sequential predict() for non-ML methods
+        return [
+            self.predict(
+                prev_activity=inp["prev_activity"],
+                prev_lifecycle=inp["prev_lifecycle"],
+                curr_activity=inp["curr_activity"],
+                curr_lifecycle=inp["curr_lifecycle"],
+                context=inp.get("context"),
+            )
+            for inp in inputs
+        ]
 
     # ------------------------------------------------------------------
     # XGBoost feature-row builder

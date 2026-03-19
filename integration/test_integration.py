@@ -151,10 +151,15 @@ def run_simulation(config: SimulationConfig, df: pd.DataFrame, allocator, output
              engine_start_time = arrivals[0]
              print(f"Adjusting simulation start time to first arrival: {engine_start_time}")
 
-    # Determine appropriate predictor type argument
+    # Determine appropriate predictor type argument.
+    # DESEngine requires either an explicit predictor instance OR a predictor type
+    # to auto-load. For "lstm" we delegate loading to the engine, so we must pass
+    # NextActivityPredictorType.LSTM here.
     pred_type = None
     if config.next_activity_class == "process_transformer":
         pred_type = NextActivityPredictorType.PROCESS_TRANSFORMER
+    elif config.next_activity_class == "lstm":
+        pred_type = NextActivityPredictorType.LSTM
 
     # Create resource selection strategy
     resource_strategy = create_strategy(config.resource_selection_strategy)
@@ -300,6 +305,12 @@ def main():
         help="Path to processing time model (base path without suffixes)"
     )
     parser.add_argument(
+        "--processing-time-method",
+        choices=["distribution", "ml", "probabilistic_ml"],
+        default="probabilistic_ml",
+        help="Processing time prediction method (default: probabilistic_ml)"
+    )
+    parser.add_argument(
         "--next-activity",
         choices=["lstm", "process_transformer", "lifecycle_dual_full_baseline", "lifecycle_dual_start_complete_baseline"],
         default="lstm",
@@ -359,8 +370,8 @@ def main():
     parser.add_argument(
         "--pmsp-dummy-delta",
         type=float,
-        default=1.0,
-        help="PMSP dummy cost multiplier delta (default: 1.0)"
+        default=1.5,
+        help="PMSP dummy cost multiplier delta (default: 1.5)"
     )
     parser.add_argument(
         "--pmsp-solver-time-limit",
@@ -371,8 +382,8 @@ def main():
     parser.add_argument(
         "--pmsp-prediction-batch-size",
         type=int,
-        default=0,
-        help="PMSP max predictions per task (0=unlimited, default: 0)"
+        default=25,
+        help="PMSP max predictions per task (0=unlimited, default: 25)"
     )
     parser.add_argument(
         "--pmsp-optimization-batch-size",
@@ -401,8 +412,10 @@ def main():
         )
 
     # Setup logging
+    # Note: many callers redirect stdout to a file. Python logging defaults to stderr,
+    # so we explicitly log to stdout to make PMSP/optimizer messages visible.
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level, format='%(message)s')
+    logging.basicConfig(level=log_level, format='%(message)s', stream=sys.stdout)
 
     # Load event log
     print(f"Loading event log from: {args.event_log}")
@@ -434,6 +447,8 @@ def main():
 
     if args.processing_model_path:
         config.processing_time_model_path = args.processing_model_path
+
+    config.processing_time_method = args.processing_time_method
 
     # Map CLI next-activity choice to config fields
     config.next_activity_temperature = args.temperature

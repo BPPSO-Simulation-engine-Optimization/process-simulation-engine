@@ -158,7 +158,7 @@ class OrdinoRResourcePermissions:
 
         # Activities with ONLY incomplete events (hardcoded to avoid parsing raw log)
         self.INCOMPLETE_ACTIVITY_MD = {
-            "W_Shortened completion ": {
+            "W_Shortened completion": {
                 "User_43", "User_11", "User_18", "User_42", "User_2", "User_28",
                 "User_49", "User_5", "User_53", "User_106", "User_75", "User_124",
                 "User_30", "User_77", "User_79"
