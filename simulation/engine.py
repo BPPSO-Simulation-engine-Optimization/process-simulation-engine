@@ -2037,7 +2037,6 @@ class DESEngine:
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
-        logger.debug("Scheduling next activity after activity completion: %s", activity)
         # Some activities are control-flow artifacts (e.g., decision points) and must not
         # require an organizational resource.
         if not self._activity_requires_resource(activity):
