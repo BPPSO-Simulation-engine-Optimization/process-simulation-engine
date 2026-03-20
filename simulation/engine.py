@@ -813,14 +813,18 @@ class DESEngine:
                         flush=True,
                     )
             
-                # Incremental CSV export: write every 100 cases
-                if self._incremental_csv_path and self.stats['cases_started'] % 100 == 0 and self.stats['cases_started'] > 0:
+                # Incremental CSV export: write when cases_started crosses a new 100-case boundary
+                cases_started = self.stats['cases_started']
+                if (self._incremental_csv_path
+                        and cases_started >= self._last_csv_exported_cases + 100):
                     new_events = self.completed_events[self._last_csv_exported_events_count:]
                     if new_events:
                         from simulation.log_exporter import LogExporter
                         write_header = (self._last_csv_exported_events_count == 0)
                         LogExporter.append_to_csv(new_events, self._incremental_csv_path, write_header=write_header)
                         self._last_csv_exported_events_count = len(self.completed_events)
+                        self._last_csv_exported_cases = cases_started
+                        logger.debug(f"Incremental CSV export: wrote {len(new_events)} events to {self._incremental_csv_path} (total cases: {cases_started})")
         finally:
             pass
 
@@ -2039,6 +2043,7 @@ class DESEngine:
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
+        logger.debug("Scheduling next activity after activity completion: %s", activity)
         # Some activities are control-flow artifacts (e.g., decision points) and must not
         # require an organizational resource.
         if not self._activity_requires_resource(activity):
