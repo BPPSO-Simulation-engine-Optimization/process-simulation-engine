@@ -754,15 +754,8 @@ class DESEngine:
         print(f"{'='*60}\n", flush=True)
         
         event_count = 0
-        progress_every_n_events = 25
+        progress_every_n_events = 100
 
-        # Silence all logging for PMSP runs; keep only the Progress print below.
-        # (The codebase contains many logger.* calls across modules; disabling
-        # logging here avoids having to comment them out individually.)
-        import logging as _logging
-        _prev_disable_level = _logging.root.manager.disable
-        _logging.disable(_logging.CRITICAL)
-        
         try:
             while not self.queue.is_empty():
                 event = self.queue.pop()
@@ -779,7 +772,6 @@ class DESEngine:
                 if (
                     progress_every_n_events
                     and event_count % progress_every_n_events == 0
-                    and self._pmsp_config is None
                 ):
                     current_time = self.clock.now
 
@@ -830,8 +822,7 @@ class DESEngine:
                         LogExporter.append_to_csv(new_events, self._incremental_csv_path, write_header=write_header)
                         self._last_csv_exported_events_count = len(self.completed_events)
         finally:
-            # Restore previous logging disable level
-            _logging.disable(_prev_disable_level)
+            pass
 
         # Drain phase: process remaining waiting work by advancing time
         if self.resource_pool.has_waiting_work():
@@ -959,7 +950,7 @@ class DESEngine:
             arrival_time = self._get_next_business_hour(arrival_time)
 
         # Print arrival info for visibility
-        if self.stats['cases_started'] <= 5 or self.stats['cases_started'] % 100 == 0:
+        if self.stats['cases_started'] <= 100 or self.stats['cases_started'] % 100 == 0:
             print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {arrival_time.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
         # Get case attributes from AttributeSimulationEngine
@@ -1012,18 +1003,29 @@ class DESEngine:
                 if self._pmsp_config is not None:
                     logger.info("Processing resource worklist of ressource %s", event.resource)
                     self._process_resource_worklist(event.resource, event.timestamp)
-                    all_resources = getattr(self.allocator.availability, 'resources', [])
-                    free_resources = [
-                        r for r in all_resources
-                        if not self.resource_pool.is_busy(r, event.timestamp)
-                        and self.allocator.availability.is_available(r, event.timestamp)
-                    ]
-                    if len(free_resources) >= 100:
+                    # In PMSP mode, do NOT optimize on every resource-free event.
+                    # Only run PMSP when the waiting batch is "full" according to
+                    # `pmsp_optimization_batch_size` (0 = always).
+                    waiting_count = self.resource_pool.get_total_waiting_count()
+                    batch_size = getattr(self._pmsp_config, "optimization_batch_size", 0) or 0
+
+                    if waiting_count > 0 and (batch_size == 0 or waiting_count >= batch_size):
                         logger.info(
-                            "PMSP [TRIGGER]: Resource %s freed -> running optimization on waiting queue",
+                            "PMSP [TRIGGER]: Resource %s freed -> running PMSP optimization "
+                            "(waiting_count=%d, batch_size=%d)",
                             event.resource,
+                            waiting_count,
+                            batch_size,
                         )
                         self._process_waiting_queue_pmsp(event.resource, event.timestamp)
+                    else:
+                        logger.debug(
+                            "PMSP [SKIP TRIGGER]: Resource %s freed, but waiting_count=%d "
+                            "does not satisfy batch_size=%d",
+                            event.resource,
+                            waiting_count,
+                            batch_size,
+                        )
                 else:
                     self._process_waiting_queue(event.resource, event.timestamp)
 
@@ -2501,41 +2503,58 @@ class DESEngine:
             current_time = self.clock.now
             dispatched_this_round = 0
 
-            # Get all waiting activities
-            waiting_activities = self.resource_pool.get_all_waiting_activities()
+            # If PMSP is enabled, run a single PMSP optimization cycle instead of
+            # greedy per-activity allocation. This ensures the final leftover work
+            # respects the configured optimization batch behavior.
+            if self._pmsp_config is not None:
+                waiting_before = self.resource_pool.get_total_waiting_count()
+                self._process_waiting_queue_pmsp(None, current_time)
+                waiting_after = self.resource_pool.get_total_waiting_count()
 
-            # Try to dispatch each waiting activity
-            for activity in list(waiting_activities):
-                while self.resource_pool.has_waiting_work(activity):
-                    # Try to allocate a resource
-                    waiting_work = self.resource_pool.peek_waiting_work(activity)
-                    if not waiting_work:
-                        break
+                if waiting_after < waiting_before:
+                    dispatched_this_round = waiting_before - waiting_after
+                elif not self.queue.is_empty():
+                    # PMSP scheduled completion events even if tasks remain in queues
+                    # (e.g., transferred to resource worklists).
+                    dispatched_this_round = 1
+                else:
+                    failure_reason = "PMSP no progress"
+            else:
+                # Get all waiting activities
+                waiting_activities = self.resource_pool.get_all_waiting_activities()
 
-                    resource, reason = self._try_allocate_resource_with_reason(
-                        activity, current_time, waiting_work.case_state
-                    )
-                    
-                    if resource:
-                        # Got a resource - dispatch the work
-                        work = self.resource_pool.get_waiting_work(activity)
-                        wait_seconds = (current_time - work.arrival_time).total_seconds()
-                        self.stats['wait_time_total_seconds'] += wait_seconds
+                # Try to dispatch each waiting activity
+                for activity in list(waiting_activities):
+                    while self.resource_pool.has_waiting_work(activity):
+                        # Try to allocate a resource
+                        waiting_work = self.resource_pool.peek_waiting_work(activity)
+                        if not waiting_work:
+                            break
 
-                        logger.debug(
-                            f"[Drain] Dispatching {activity} for case {work.case_id} "
-                            f"to {resource} (waited {wait_seconds:.0f}s)"
+                        resource, reason = self._try_allocate_resource_with_reason(
+                            activity, current_time, waiting_work.case_state
                         )
+                        
+                        if resource:
+                            # Got a resource - dispatch the work
+                            work = self.resource_pool.get_waiting_work(activity)
+                            wait_seconds = (current_time - work.arrival_time).total_seconds()
+                            self.stats['wait_time_total_seconds'] += wait_seconds
 
-                        self._schedule_activity_with_resource(
-                            work.case_id, work.activity, work.lifecycle, current_time,
-                            work.case_state, resource
-                        )
-                        dispatched_this_round += 1
-                    else:
-                        # No resource available for this activity right now
-                        failure_reason = reason
-                        break
+                            logger.debug(
+                                f"[Drain] Dispatching {activity} for case {work.case_id} "
+                                f"to {resource} (waited {wait_seconds:.0f}s)"
+                            )
+
+                            self._schedule_activity_with_resource(
+                                work.case_id, work.activity, work.lifecycle, current_time,
+                                work.case_state, resource
+                            )
+                            dispatched_this_round += 1
+                        else:
+                            # No resource available for this activity right now
+                            failure_reason = reason
+                            break
 
             # Process any completion events that are now schedulable
             while not self.queue.is_empty():

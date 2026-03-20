@@ -419,9 +419,13 @@ def main():
         )
 
     # Setup logging
-    # Note: many callers redirect stdout to a file. Python logging defaults to stderr,
-    # so we explicitly log to stdout to make PMSP/optimizer messages visible.
-    log_level = logging.DEBUG if args.verbose else logging.INFO
+    # Many callers redirect stdout to a file. Python logging defaults to stderr,
+    # so we explicitly log to stdout to make messages visible.
+    #
+    # Default to WARNING so that only high-signal messages are emitted during
+    # experiments. The detailed PMSP/solver output uses logger.info and will
+    # therefore be suppressed unless --verbose is set.
+    log_level = logging.DEBUG if args.verbose else logging.WARNING
     logging.basicConfig(level=log_level, format='%(message)s', stream=sys.stdout)
 
     # Load event log

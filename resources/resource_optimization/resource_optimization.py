@@ -266,6 +266,15 @@ def handle_batch_scheduling_optimization(
             details["eligible_resources"],
         )
 
+        eligible_resources = authorized_resources_by_waiting_task.get(task_id, [])
+        eligible_resources_sorted = sorted(set(eligible_resources))
+        # In verbose runs this helps diagnose why a task gets assigned (or why dummy wins).
+        logger.info(
+            "  PMSP [Optimization]: Eligible resources for task %s: %s",
+            task_id,
+            ", ".join(eligible_resources_sorted),
+        )
+
     # Build R_P candidates: authorized resources available in this time slot
     authorized_and_timeslotoperating_resources_per_task: Dict[str, List[str]] = {}
     for task_id in task_ids:
@@ -659,7 +668,16 @@ def calculate_pmsp_parameters(
         elif resource_busy_until and r in resource_busy_until:
             busy_until = resource_busy_until[r]
             if busy_until is not None and busy_until > timestamp:
-                predicted_remaining_times[r] = float((busy_until - timestamp).total_seconds())
+                remaining_s = float((busy_until - timestamp).total_seconds())
+                predicted_remaining_times[r] = remaining_s
+                # Useful debugging: show which resources are currently busy and how long
+                # they are expected to remain busy at the optimization timestamp.
+                logger.info(
+                    "PMSP [Parameters]: Resource %s (busy): busy_until=%s remaining=%.1fs",
+                    r,
+                    busy_until,
+                    remaining_s,
+                )
             else:
                 predicted_remaining_times[r] = 0.0
         else:
@@ -702,68 +720,11 @@ def solve_pmsp_ilp(
     if nT == 0 or nR_P == 0:
         return {t: None for t in T}, {"status": 0, "nT": nT, "nR_P": nR_P, "solver": "empty"}
 
-    # Fast-path: single-task case can be solved greedily without CP-SAT/JV.
-    if nT == 1:
-        t = T[0]
-        task_costs = costs_authorized_and_timeslotoperating_resources_per_task.get(t, {})
-        # No usable resource costs in this timeslot -> dummy.
-        if not task_costs:
-            logger.info(
-                "PMSP [Solver]: Single-task fast-path: no available resources for task %s -> DUMMY",
-                t,
-            )
-            return {t: None}, {
-                "status": 0,
-                "nT": 1,
-                "nR_P": nR_P,
-                "solver": "greedy_single",
-                "decision": "no_available_resource",
-            }
-
-        # Choose resource that minimizes remaining[r] + c(t,r).
-        best_r = None
-        best_total_ms = None
-        for r, cost_ms in task_costs.items():
-            rem_ms = int(predicted_remaining_times.get(r, 0.0) * 1000)
-            total_ms = rem_ms + cost_ms
-            if best_total_ms is None or total_ms < best_total_ms:
-                best_total_ms = total_ms
-                best_r = r
-
-        dummy_ms = int(dummy_costs.get(t, 10**9))
-        # Effective dummy objective includes the tie-break; we emulate the same
-        # behavior by letting the real resource win on exact equality.
-        if best_r is not None and best_total_ms is not None and best_total_ms <= dummy_ms:
-            logger.info(
-                "PMSP [Solver]: Single-task fast-path: assigning task %s -> %s (best_total=%d ms, dummy=%d ms)",
-                t,
-                best_r,
-                best_total_ms,
-                dummy_ms,
-            )
-            return {t: best_r}, {
-                "status": 1,
-                "nT": 1,
-                "nR_P": nR_P,
-                "solver": "greedy_single",
-                "decision": "assign_real",
-                "objective": best_total_ms,
-            }
-
-        logger.info(
-            "PMSP [Solver]: Single-task fast-path: assigning task %s -> DUMMY (best_total=%s ms, dummy=%d ms)",
-            t,
-            best_total_ms if best_total_ms is not None else -1,
-            dummy_ms,
-        )
-        return {t: None}, {
-            "status": 1,
-            "nT": 1,
-            "nR_P": nR_P,
-            "solver": "greedy_single",
-            "decision": "assign_dummy",
-            "objective": dummy_ms + _DUMMY_TIEBREAK_MS,
-        }
+    # Intentionally do NOT use a greedy fast-path for nT == 1.
+    # The CP-SAT objective (makespan + fairness + dummy decision)
+    # can differ meaningfully from "min remaining[r] + c(t,r)".
+    # Keeping CP-SAT ensures we don't systematically bias assignments
+    # toward `User_1` when only a single task is optimized.
 
     def _run_jv_fallback() -> Tuple[Dict[str, Optional[str]], Dict[str, int]]:
         """
