@@ -79,152 +79,75 @@ def setup_simulation(
     return arrival_timestamps, next_activity_pred, processing_time_pred, case_attr_pred
 
 
-LIFECYCLE_DUAL_HF_REPOS = {
-    "balanced": "Nixion/next_activity_prediction_lifecycle_dual_full_lifecycle_balanced",
-    "start_complete": "Nixion/next-activity-lifecycle-dual-start-complete-baseline",
-    "baseline": "Nixion/next-activity-lifecycle-dual-full-baseline",
+_LIFECYCLE_DUAL_HF_REPOS = {
+    "start_complete": "Nixion/next_activity_prediction_lifecycle_dual",
+    "full_lifecycle": "Nixion/next-activity-lifecycle-dual-full-baseline",
 }
-
-
-def _resolve_lifecycle_dual_path(model_path: Path) -> Optional[Path]:
-    """Resolve lifecycle_dual model path. If local path missing, try HuggingFace fallback."""
-    model_file = model_path / "model.keras"
-    checkpoint_file = model_path / "checkpoints" / "best_model.keras"
-    if model_path.exists() and (model_file.exists() or checkpoint_file.exists()):
-        return model_path
-    path_str = str(model_path)
-    if "balanced" in path_str:
-        repo_id = LIFECYCLE_DUAL_HF_REPOS["balanced"]
-    elif "start_complete" in path_str:
-        repo_id = LIFECYCLE_DUAL_HF_REPOS["start_complete"]
-    else:
-        repo_id = LIFECYCLE_DUAL_HF_REPOS["baseline"]
-    try:
-        from huggingface_hub import hf_hub_download
-        model_path_hf = hf_hub_download(repo_id=repo_id, filename="model.keras")
-        hf_hub_download(repo_id=repo_id, filename="metadata.json")
-        logger.info("Lifecycle dual model not found locally. Loaded from HuggingFace: %s", repo_id)
-        return Path(model_path_hf).parent
-    except Exception as e:
-        logger.debug("HuggingFace fallback failed for %s: %s", repo_id, e)
-        return None
-
-
-def _try_load_predictor(model_path: Path, model_type: str) -> Optional[Any]:
-    """
-    Try to load a next activity predictor from the given path.
-
-    Args:
-        model_path: Path to model directory
-        model_type: "embedding", "onehot", "lifecycle_dual", or "auto"
-
-    Returns:
-        Predictor instance if successful, None otherwise
-    """
-    # Determine which predictor to try based on model_type
-    # If "auto", try both in order
-    predictors_to_try = []
-    if model_type == "embedding":
-        predictors_to_try = [("embedding", "next_activity_prediction", "LSTMNextActivityPredictor")]
-    elif model_type == "onehot":
-        predictors_to_try = [("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot")]
-    elif model_type == "lifecycle_dual":
-        predictors_to_try = [("lifecycle_dual", "next_activity_prediction_lifecycle_dual", "DualLifecycleNextActivityPredictor")]
-    else:  # auto
-        predictors_to_try = [
-            ("embedding", "next_activity_prediction", "LSTMNextActivityPredictor"),
-            ("onehot", "next_activity_prediction_onehot", "LSTMNextActivityPredictorOneHot"),
-            ("lifecycle_dual", "next_activity_prediction_lifecycle_dual", "DualLifecycleNextActivityPredictor"),
-        ]
-
-    for pred_type, module_name, class_name in predictors_to_try:
-        path_to_use = model_path
-        if pred_type == "lifecycle_dual":
-            resolved = _resolve_lifecycle_dual_path(model_path)
-            if resolved is None:
-                continue
-            path_to_use = resolved
-
-        model_file = path_to_use / "model.keras"
-        checkpoint_file = path_to_use / "checkpoints" / "best_model.keras"
-        if not path_to_use.exists() or (not model_file.exists() and not checkpoint_file.exists()):
-            continue
-
-        try:
-            module = __import__(module_name, fromlist=[class_name])
-            PredictorClass = getattr(module, class_name)
-
-            if checkpoint_file.exists():
-                predictor = PredictorClass(model_path=str(checkpoint_file))
-                logger.info(f"✓ {pred_type.capitalize()} model loaded from checkpoint: {checkpoint_file}")
-            else:
-                predictor = PredictorClass(model_path=str(path_to_use))
-                logger.info(f"✓ {pred_type.capitalize()} model loaded from: {path_to_use}")
-
-            return predictor
-        except ImportError:
-            continue
-        except Exception as e:
-            logger.debug(f"Could not load {pred_type} predictor from {path_to_use}: {e}")
-            continue
-
-    return None
 
 
 def _setup_next_activity(config: SimulationConfig) -> Optional[Any]:
     """
-    Set up next activity predictor based on config.
+    Set up next activity predictor based on config.next_activity_class.
 
-    Supports both embedding-based and one-hot encoded models.
-
-    Args:
-        config: Simulation configuration
-
-    Returns:
-        Next activity predictor instance, or None to use engine auto-load
+    Returns predictor instance, or None to delegate to engine auto-load.
     """
-    from pathlib import Path
-
-    model_type = getattr(config, 'next_activity_model_type', 'auto')
-
     if config.next_activity_class == "process_transformer":
-        # Return None to allow DESEngine to load it via next_activity_predictor_type
-        # (or we could load it here, but engine has the logic)
         logger.info("Process Transformer selected: delegating loading to DESEngine")
         return None
 
-    if config.next_activity_mode == "advanced" and config.next_activity_model_path:
-        model_path = Path(config.next_activity_model_path)
+    if config.next_activity_class == "lifecycle_dual":
+        return _load_lifecycle_dual(
+            model_path=config.next_activity_model_path,
+            variant=config.next_activity_lifecycle_variant or "start_complete",
+            hf_repo_override=config.next_activity_hf_repo,
+        )
 
-        predictor = _try_load_predictor(model_path, model_type)
-        if predictor:
-            logger.info("Setting up next activity predictor...")
-            return predictor
-        else:
-            logger.warning(f"Next activity model not found at {model_path}")
-            logger.info("Falling back to engine auto-load")
-            return None
+    # "lstm" or unknown — return None to let engine auto-load
+    logger.info("Next activity: delegating loading to DESEngine")
+    return None
 
-    # Basic mode - full_lifecycle balanced is standard (HF fallback: Nixion/next_activity_prediction_lifecycle_dual_full_lifecycle_balanced)
-    possible_paths = [
-        Path("next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced"),
-        Path("next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/balanced"),
-        Path("next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
-        Path("next_activity_prediction_lifecycle_dual/next_activity_prediction_lifecycle_dual/models/full_lifecycle/baseline"),
-        Path("models/next_activity_lstm"),
-        Path("next_activity_prediction/models/next_activity_lstm"),
-        Path("models/next_activity_lstm_onehot"),
-        Path("next_activity_prediction_onehot/models/next_activity_lstm_onehot"),
-    ]
 
-    for model_path in possible_paths:
-        predictor = _try_load_predictor(model_path, model_type)
-        if predictor:
-            logger.info(f"Auto-loading next activity predictor from {model_path}...")
+def _load_lifecycle_dual(model_path: Optional[str], variant: str, hf_repo_override: Optional[str] = None) -> Optional[Any]:
+    """Load lifecycle dual predictor from local path, falling back to HuggingFace."""
+    from next_activity_prediction_lifecycle_dual import DualLifecycleNextActivityPredictor
+
+    # Try local path first
+    if model_path:
+        load_path = _find_keras_model(Path(model_path))
+        if load_path:
+            predictor = DualLifecycleNextActivityPredictor(model_path=str(load_path))
+            logger.info("Loaded DualLifecycleNextActivityPredictor from %s", load_path)
             return predictor
 
-    # No model found - return None to trigger engine auto-load (which will try again)
-    logger.info("No next activity model found, using engine auto-load fallback")
+    # Fallback to HuggingFace — explicit override takes priority over variant default
+    hf_repo = hf_repo_override or _LIFECYCLE_DUAL_HF_REPOS.get(variant)
+    if not hf_repo:
+        logger.warning("Unknown lifecycle_dual variant: %s", variant)
+        return None
+
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_model = hf_hub_download(repo_id=hf_repo, filename="model.keras")
+        hf_hub_download(repo_id=hf_repo, filename="metadata.json")
+        hf_dir = Path(hf_model).parent
+        logger.info("Loaded lifecycle dual model from HuggingFace: %s", hf_repo)
+        predictor = DualLifecycleNextActivityPredictor(model_path=str(hf_dir))
+        return predictor
+    except Exception as e:
+        logger.warning("Could not load lifecycle_dual model from HuggingFace (%s): %s", hf_repo, e)
+        return None
+
+
+def _find_keras_model(model_dir: Path) -> Optional[Path]:
+    """Return the best keras model path in a directory, or None if not found."""
+    if not model_dir.exists():
+        return None
+    checkpoint = model_dir / "checkpoints" / "best_model.keras"
+    if checkpoint.exists():
+        return checkpoint
+    model_file = model_dir / "model.keras"
+    if model_file.exists():
+        return model_dir
     return None
 
 
@@ -247,6 +170,17 @@ def _setup_arrivals(
             from case_arrival_times_prediction import run
             from case_arrival_times_prediction.config import SimulationConfig as ArrivalConfig
 
+            # Normalize timezone handling in df to avoid tz-aware/naive comparison issues
+            df_for_arrivals = df
+            if df is not None:
+                # Work on a shallow copy to avoid mutating the caller's DataFrame
+                df_for_arrivals = df.copy()
+                for col in df_for_arrivals.columns:
+                    series = df_for_arrivals[col]
+                    # Convert tz-aware datetimes to UTC and then drop tz info (naive UTC)
+                    if pd.api.types.is_datetime64tz_dtype(series):
+                        df_for_arrivals[col] = series.dt.tz_convert("UTC").dt.tz_localize(None)
+
             # Build config for the arrival pipeline
             arr_config = ArrivalConfig(
                 train_ratio=config.arrival_train_ratio,
@@ -263,14 +197,25 @@ def _setup_arrivals(
             )
 
             # Determine whether to retrain or load cached model
-            model_path = "models/case_arrival_model.pkl"
+            # Use absolute path relative to project root
+            project_root = Path(__file__).parent.parent
+            model_dir = project_root / "models"
+            model_dir.mkdir(exist_ok=True)  # Create models directory if it doesn't exist
+            model_path = str(model_dir / "case_arrival_model.pkl")
 
             # Use cached model if it exists, otherwise retrain if data is available
-            if os.path.exists(model_path):
+            model_exists = os.path.exists(model_path)
+            if model_exists:
                 logger.info(f"Found existing case arrival model at {model_path}, using cached version.")
                 retrain_model = False
             else:
-                retrain_model = df is not None
+                if df_for_arrivals is None:
+                    raise ValueError(
+                        f"Case arrival model not found at {model_path} and no training data (df) provided. "
+                        f"Either provide df to train the model, or ensure the model exists at {model_path}."
+                    )
+                logger.info(f"Case arrival model not found. Training new model at {model_path}...")
+                retrain_model = True
 
             # The run() API generates by DAYS, not by case count.
             # BPIC17 event log statistics (analyzed from eventlog.xes.gz):
@@ -285,9 +230,11 @@ def _setup_arrivals(
             # Use the new run() API which handles model caching automatically
             # Retry loop: if insufficient timestamps, increase estimated_days and regenerate
             for attempt in range(max_retries):
+                # Only train on first attempt if needed, otherwise use existing model
+                should_retrain = retrain_model and attempt == 0
                 timestamps = run(
-                    df=df if attempt == 0 else None,  # Only pass df on first attempt
-                    retrain_model=retrain_model if attempt == 0 else False,
+                    df=df_for_arrivals if should_retrain else None,  # Only pass df when training
+                    retrain_model=should_retrain,
                     model_path=model_path,
                     n_days_to_simulate=estimated_days,
                     config=arr_config,
@@ -349,39 +296,92 @@ def _generate_basic_arrivals(
     start_date: datetime,
     seed: int = 42,
 ) -> List[datetime]:
-    """Generate basic random arrival timestamps."""
+    """Generate basic random arrival timestamps during business hours only (Mon-Fri 8-17)."""
     rng = random.Random(seed)
     timestamps = []
     current_time = start_date
+
+    # Snap start to business hours if needed
+    current_time = _snap_to_business_hours(current_time)
 
     for _ in range(num_cases):
         # Random 1-30 minutes between cases
         minutes = rng.randint(1, 30)
         current_time = current_time + timedelta(minutes=minutes)
+        # Ensure arrival falls within business hours
+        current_time = _snap_to_business_hours(current_time)
         timestamps.append(current_time)
 
     return timestamps
+
+
+def _snap_to_business_hours(dt: datetime, start_hour: int = 8, end_hour: int = 17) -> datetime:
+    """Snap a datetime to the next business hour if it falls outside Mon-Fri 8-17."""
+    weekday = dt.weekday()
+    hour = dt.hour
+
+    if weekday < 5 and start_hour <= hour < end_hour:
+        return dt  # Already in business hours
+
+    # Before start on a weekday
+    if weekday < 5 and hour < start_hour:
+        return dt.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+
+    # After end or weekend — advance to next working day
+    next_dt = (dt + timedelta(days=1)).replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    while next_dt.weekday() >= 5:
+        next_dt += timedelta(days=1)
+    return next_dt
+
+
+class _StubProcessingTimePredictor:
+    """Basic stub that returns random processing times."""
+
+    def predict(self, prev_activity, prev_lifecycle, curr_activity, curr_lifecycle, context=None):
+        return random.uniform(60, 3600)  # 1 min to 1 hour
 
 
 def _setup_processing_time(config: SimulationConfig) -> Any:
     """
     Set up processing time predictor.
 
-    Always returns a ProcessingTimePredictionClass instance.
-    Requires a trained model at the configured path.
+    In basic mode, returns a stub with random durations.
+    In advanced mode, loads a trained ProcessingTimePredictionClass model.
     """
+    if config.processing_time_mode == "basic":
+        logger.info("Processing time: basic mode (random stub)")
+        return _StubProcessingTimePredictor()
+
     from processing_time_prediction.ProcessingTimePredictionClass import (
         ProcessingTimePredictionClass
     )
 
-    logger.info("Setting up processing time predictor (ProcessingTimePredictionClass)...")
+    logger.info("Setting up processing time predictor...")
 
-    predictor = ProcessingTimePredictionClass(
-        method=config.processing_time_method,
-        model_path=config.processing_time_model_path,
-    )
-    logger.info(f"Loaded processing time model: {config.processing_time_method}")
-    return predictor
+    # Use _lstm suffix for probabilistic_ml method
+    model_path = config.processing_time_model_path
+    if config.processing_time_method == "probabilistic_ml":
+        # If base path doesn't already end with _lstm, append it
+        if not model_path.endswith("_lstm"):
+            # For default path "models/processing_time_model", change to "models/processing_time_model_lstm"
+            if model_path == "models/processing_time_model":
+                model_path = "models/processing_time_model_lstm"
+            else:
+                # For custom paths, append _lstm
+                model_path = f"{model_path}_lstm"
+        logger.info(f"Using LSTM model path: {model_path}")
+
+    try:
+        predictor = ProcessingTimePredictionClass(
+            method=config.processing_time_method,
+            model_path=model_path,
+        )
+        logger.info(f"Loaded processing time model: {config.processing_time_method}")
+        return predictor
+    except FileNotFoundError as e:
+        logger.warning(f"Processing time model missing: {e}")
+        logger.info("Falling back to basic (stub) processing time predictor...")
+        return _StubProcessingTimePredictor()
 
 
 def _setup_case_attributes(
@@ -396,10 +396,10 @@ def _setup_case_attributes(
     """
     import sys
     from pathlib import Path
-    # Add Instance Spawn Rate/Advanced to path
-    advanced_path = Path(__file__).parent.parent / "Instance Spawn Rate" / "Advanced"
-    if str(advanced_path) not in sys.path:
-        sys.path.insert(0, str(advanced_path))
+    # case_attribute_prediction lives at the project root
+    project_root = Path(__file__).parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
     from case_attribute_prediction.simulator import AttributeSimulationEngine
 

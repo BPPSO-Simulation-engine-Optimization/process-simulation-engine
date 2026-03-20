@@ -19,48 +19,82 @@ except ImportError:
     TF_AVAILABLE = False
     Lambda = None
 
+# XGBoost activity-specific model (optional – only imported when needed)
+try:
+    from .activity_specific_model import ActivitySpecificModel
+    from .data_loader import DataLoader as _XGBDataLoader
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    try:
+        from activity_specific_model import ActivitySpecificModel
+        from data_loader import DataLoader as _XGBDataLoader
+        XGBOOST_AVAILABLE = True
+    except ImportError:
+        XGBOOST_AVAILABLE = False
+
 
 class ProcessingTimeTrainer:
     """
-    training and fitting of processing time prediction models.
+    Training and fitting of processing time prediction models.
+
+    Supported methods:
+        "distribution"     – Log-normal distributions per transition pair.
+        "ml"               – Random-Forest regressor with hand-crafted features.
+        "probabilistic_ml" – LSTM with heteroscedastic Gaussian output.
+        "xgboost"          – Activity-specific XGBoost / Gradient-Boosting models
+                             (with optional quantile regression and outlier separation).
     """
 
     def __init__(
-        self, 
-        data_log_df: pd.DataFrame, 
-        method: str = "distribution", 
+        self,
+        data_log_df: pd.DataFrame,
+        method: str = "distribution",
         min_observations: int = 2,
         n_estimators: int = 500,
         max_depth: Optional[int] = 30,
         min_samples_split: int = 10,
         min_samples_leaf: int = 5,
-        max_features: str = 'sqrt'
+        max_features: str = 'sqrt',
+        # ── XGBoost-specific ──────────────────────────────────────────
+        xgb_activities: Optional[List[str]] = None,
+        xgb_case_features: Optional[List[str]] = None,
+        xgb_base_features: Optional[List[str]] = None,
+        xgb_use_business_time: bool = True,
+        xgb_models_dir: Optional[str] = None,
+        xgb_random_state: int = 42,
     ):
         """
         Args:
-            data_log_df: DataFrame with event log data 
-            method: "distribution", "ml", or "probabilistic_ml"
-            min_observations: Minimum number of observations required to fit a distribution
-            n_estimators: Number of trees in the forest (higher = better performance but slower training)
-            max_depth: Maximum depth of trees (None for unlimited)
-            min_samples_split: Minimum samples required to split a node
-            min_samples_leaf: Minimum samples required at a leaf node
-            max_features: Number of features to consider for best split
+            data_log_df: DataFrame with event log data.
+            method: One of "distribution", "ml", "probabilistic_ml", "xgboost".
+            min_observations: Minimum observations required to fit a distribution.
+            n_estimators: Number of trees for the Random-Forest (ml method).
+            max_depth: Maximum tree depth for Random-Forest.
+            min_samples_split: Min samples to split a node (RF).
+            min_samples_leaf: Min samples at leaf (RF).
+            max_features: Features considered per split (RF).
+            xgb_activities: Optional list of activities for XGBoost models.
+                            If None, the default list inside ActivitySpecificModel is used.
+            xgb_case_features: Case-level feature columns for XGBoost.
+            xgb_base_features: Base event-level feature columns for XGBoost.
+            xgb_use_business_time: If True, apply business-hour filtering (5-22 h) for XGBoost.
+            xgb_models_dir: Directory to persist XGBoost activity models.
+            xgb_random_state: Random seed for XGBoost training.
         """
         self.data_log_df = data_log_df.copy()
         self.method = method
         self.min_observations = min_observations
-        
+
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
         self.max_features = max_features
-        
+
         self.distributions: Dict[Tuple[str, str, str, str], Dict] = {}
         self.fallback_mean: Optional[float] = None
         self.fallback_std: Optional[float] = None
-        
+
         self.ml_model: Optional[RandomForestRegressor] = None
         self.label_encoders: Dict[str, LabelEncoder] = {}
         self.scaler: Optional[MinMaxScaler] = None
@@ -68,7 +102,7 @@ class ProcessingTimeTrainer:
         self.categorical_features: List[str] = []
         self.numerical_features: List[str] = []
         self.feature_defaults: Dict[str, any] = {}
-        
+
         self.lstm_model: Optional[keras.Model] = None
         self.sequence_length: int = 10
         self.activity_encoder: Optional[LabelEncoder] = None
@@ -76,6 +110,15 @@ class ProcessingTimeTrainer:
         self.resource_encoder: Optional[LabelEncoder] = None
         self.y_mean: Optional[float] = None
         self.y_std: Optional[float] = None
+
+        # ── XGBoost state ─────────────────────────────────────────────
+        self.xgb_activity_model: Optional["ActivitySpecificModel"] = None
+        self._xgb_activities = xgb_activities
+        self._xgb_case_features = xgb_case_features
+        self._xgb_base_features = xgb_base_features
+        self._xgb_use_business_time = xgb_use_business_time
+        self._xgb_models_dir = xgb_models_dir
+        self._xgb_random_state = xgb_random_state
 
     def fit_distributions(self):
         """
@@ -883,13 +926,165 @@ class ProcessingTimeTrainer:
         print("Model training completed!")
         print("="*80)
 
-    def train(self, cache_path: Optional[str] = None, force_recompute: bool = False):
+    def extract_resource_hold_times(self) -> Dict:
+        """
+        Extract actual work burst durations from the full event log.
+
+        A work burst is a start→suspend, resume→suspend, or resume→complete segment —
+        the period a resource is actively working before putting the work item down.
+        For activities with only start→complete (no suspend/resume), the start→complete
+        duration is used as the work burst.
+
+        Returns a dict mapping (activity, resource) → {'mu': float, 'sigma': float, 'count': int}
+        with lognormal distribution parameters, plus activity-level and global fallbacks.
+        """
+        df = self.data_log_df.copy()
+        if "time:timestamp" in df.columns:
+            df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], errors="coerce")
+        df = df.dropna(subset=["time:timestamp"])
+        df = df.sort_values(["case:concept:name", "time:timestamp"])
+
+        # Collect work burst durations
+        bursts = []  # list of (activity, resource, duration_seconds)
+
+        for case_id, case_data in df.groupby("case:concept:name"):
+            case_data = case_data.reset_index(drop=True)
+            # Track open work segments per activity within a case
+            # A work segment starts at 'start' or 'resume' and ends at 'suspend' or 'complete'
+            open_segments = {}  # activity -> (start_time, resource)
+
+            for _, event in case_data.iterrows():
+                activity = str(event["concept:name"])
+                lifecycle = str(event.get("lifecycle:transition", "complete")).lower()
+                timestamp = event["time:timestamp"]
+                resource = str(event.get("org:resource", "unknown")) if not pd.isna(event.get("org:resource")) else "unknown"
+
+                if lifecycle in ("start", "resume"):
+                    open_segments[activity] = (timestamp, resource)
+                elif lifecycle in ("suspend", "complete"):
+                    if activity in open_segments:
+                        seg_start, seg_resource = open_segments.pop(activity)
+                        duration = (timestamp - seg_start).total_seconds()
+                        if 0 < duration < 86400:  # sanity: < 24h for a single burst
+                            bursts.append((activity, seg_resource, duration))
+
+        if not bursts:
+            print("WARNING: No work bursts found. Using default resource hold times.")
+            return {'distributions': {}, 'activity_distributions': {}, 'global_mu': np.log(60), 'global_sigma': 1.0}
+
+        burst_df = pd.DataFrame(bursts, columns=["activity", "resource", "duration"])
+        print(f"Extracted {len(burst_df)} work bursts from {burst_df['activity'].nunique()} activities")
+
+        # Fit lognormal per (activity, resource)
+        distributions = {}
+        for (act, res), group in burst_df.groupby(["activity", "resource"]):
+            durations = group["duration"].values
+            if len(durations) < 3:
+                continue
+            log_d = np.log(durations)
+            mu = float(np.mean(log_d))
+            sigma = max(float(np.std(log_d, ddof=1)), 1e-6)
+            distributions[(act, res)] = {
+                'mu': mu, 'sigma': sigma, 'count': len(durations),
+                'mean': float(np.mean(durations)), 'median': float(np.median(durations)),
+            }
+
+        # Activity-level fallback
+        activity_distributions = {}
+        for act, group in burst_df.groupby("activity"):
+            durations = group["duration"].values
+            if len(durations) < 3:
+                continue
+            log_d = np.log(durations)
+            mu = float(np.mean(log_d))
+            sigma = max(float(np.std(log_d, ddof=1)), 1e-6)
+            activity_distributions[act] = {
+                'mu': mu, 'sigma': sigma, 'count': len(durations),
+                'mean': float(np.mean(durations)), 'median': float(np.median(durations)),
+            }
+
+        # Global fallback
+        all_durations = burst_df["duration"].values
+        log_all = np.log(all_durations)
+        global_mu = float(np.mean(log_all))
+        global_sigma = max(float(np.std(log_all, ddof=1)), 1e-6)
+
+        print(f"Fitted {len(distributions)} (activity, resource) distributions")
+        print(f"Fitted {len(activity_distributions)} activity-level distributions")
+        for act, info in sorted(activity_distributions.items()):
+            print(f"  {act}: {info['count']} bursts, mean={info['mean']:.1f}s ({info['mean']/60:.1f}min), median={info['median']:.1f}s")
+        print(f"Global: mean={float(np.mean(all_durations)):.1f}s, median={float(np.median(all_durations)):.1f}s")
+
+        return {
+            'distributions': distributions,
+            'activity_distributions': activity_distributions,
+            'global_mu': global_mu,
+            'global_sigma': global_sigma,
+        }
+
+    def save_resource_hold_model(self, filepath: str):
+        """Extract and save resource hold time model to disk."""
+        hold_data = self.extract_resource_hold_times()
+        joblib.dump(hold_data, filepath)
+        print(f"Resource hold time model saved to {filepath}")
+        return hold_data
+
+    def train_xgboost_model(
+        self,
+        test_size: float = 0.2,
+        quantile_config: Optional[Dict] = None,
+    ) -> None:
+        """
+        Train activity-specific XGBoost / Gradient-Boosting models.
+
+        One model is trained per activity type. Depending on the activity,
+        the trainer uses standard XGBoost regression, quantile regression, or
+        outlier-separation models automatically.
+
+        Args:
+            test_size: Fraction of data used for the held-out test set.
+            quantile_config: Optional dict mapping activity names to quantile lists,
+                             e.g. {"A_Concept": [0.8, 0.9, 0.95]}.
+        """
+        if not XGBOOST_AVAILABLE:
+            raise ImportError(
+                "The XGBoost activity-specific modules could not be imported. "
+                "Make sure activity_specific_model.py and its dependencies exist "
+                "in the processing_time_prediction package."
+            )
+
+        print("=" * 60)
+        print("TRAINING ACTIVITY-SPECIFIC XGBOOST MODELS")
+        print("=" * 60)
+
+        self.xgb_activity_model = ActivitySpecificModel(
+            activities=self._xgb_activities,
+            case_features=self._xgb_case_features,
+            base_features=self._xgb_base_features,
+            random_state=self._xgb_random_state,
+            models_dir=self._xgb_models_dir,
+        )
+
+        self.xgb_activity_model.prepare_activity_data(
+            self.data_log_df,
+            test_size=test_size,
+            use_business_time=self._xgb_use_business_time,
+        )
+
+        self.xgb_activity_model.train_activity_models(quantile_config=quantile_config)
+
+        print("\nXGBoost activity-specific models trained successfully.")
+
+    def train(self, cache_path: Optional[str] = None, force_recompute: bool = False,
+              xgb_test_size: float = 0.2, xgb_quantile_config: Optional[Dict] = None):
         """
         Train/fit the model based on the specified method.
-        
+
         Args:
-            cache_path: Path for caching sequences (only used for probabilistic_ml)
-            force_recompute: Force re-extraction of sequences even if cache exists
+            cache_path: Path for caching sequences (only used for probabilistic_ml).
+            force_recompute: Force re-extraction of sequences even if cache exists.
+            xgb_test_size: Test-set fraction (only used for xgboost method).
+            xgb_quantile_config: Per-activity quantile lists (only for xgboost method).
         """
         if self.method == "distribution":
             self.fit_distributions()
@@ -897,8 +1092,16 @@ class ProcessingTimeTrainer:
             self.train_ml_model()
         elif self.method == "probabilistic_ml":
             self.train_probabilistic_ml_model(cache_path=cache_path, force_recompute=force_recompute)
+        elif self.method == "xgboost":
+            self.train_xgboost_model(
+                test_size=xgb_test_size,
+                quantile_config=xgb_quantile_config,
+            )
         else:
-            raise ValueError(f"Unknown method: {self.method}. Use 'distribution', 'ml', or 'probabilistic_ml'.")
+            raise ValueError(
+                f"Unknown method: {self.method}. "
+                "Use 'distribution', 'ml', 'probabilistic_ml', or 'xgboost'."
+            )
 
     def save_model(self, filepath: str):
         """
@@ -980,3 +1183,29 @@ class ProcessingTimeTrainer:
             
             print(f"Model saved to {filepath}_*.joblib")
 
+        elif self.method == "xgboost":
+            if self.xgb_activity_model is None:
+                raise ValueError("No XGBoost model to save. Train model first.")
+
+            # Determine where to store the individual activity models.
+            # If a dedicated models_dir was set, use it; otherwise derive from filepath.
+            models_dir = self._xgb_models_dir or f"{filepath}_xgb_activity_models"
+            self.xgb_activity_model.save_models(models_dir)
+
+            # Save top-level metadata so the prediction class can reload everything.
+            metadata_path = f"{filepath}_metadata.joblib"
+            joblib.dump(
+                {
+                    'method': 'xgboost',
+                    'models_dir': models_dir,
+                    'xgb_activities': self._xgb_activities,
+                    'xgb_case_features': self._xgb_case_features,
+                    'xgb_base_features': self._xgb_base_features,
+                    'xgb_use_business_time': self._xgb_use_business_time,
+                    'xgb_random_state': self._xgb_random_state,
+                    'fallback_mean': self.fallback_mean,
+                    'fallback_std': self.fallback_std,
+                },
+                metadata_path,
+            )
+            print(f"XGBoost models saved to {models_dir}/ and metadata to {metadata_path}")

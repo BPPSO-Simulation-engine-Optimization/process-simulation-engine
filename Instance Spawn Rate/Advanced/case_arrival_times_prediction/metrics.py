@@ -13,9 +13,17 @@ def flatten_days(D: DailySequence) -> List[pd.Timestamp]:
     return [pd.to_datetime(ts) for day in D for ts in day]
 
 
+def _to_tz_naive(ts_list) -> list:
+    """Convert a list of timestamps to tz-naive (UTC-based) pd.Timestamp objects."""
+    series = pd.to_datetime(ts_list)
+    if series.tz is not None:
+        series = series.tz_convert("UTC").tz_localize(None)
+    return series.tolist()
+
+
 def cadd_distance(arrivals_true, arrivals_sim) -> float:
-    arrivals_true = [pd.to_datetime(ts) for ts in arrivals_true]
-    arrivals_sim = [pd.to_datetime(ts) for ts in arrivals_sim]
+    arrivals_true = _to_tz_naive(arrivals_true)
+    arrivals_sim = _to_tz_naive(arrivals_sim)
 
     if len(arrivals_true) == 0 and len(arrivals_sim) == 0:
         return 0.0
@@ -35,7 +43,7 @@ def cadd_distance(arrivals_true, arrivals_sim) -> float:
     bins_sim = to_hour_bins(arrivals_sim)
 
     if len(bins_true) == 0 or len(bins_sim) == 0:
-        return 0.0
+        return float("inf")
 
     max_bin = max(bins_true.max(), bins_sim.max())
     n_bins = max_bin + 1
@@ -46,7 +54,7 @@ def cadd_distance(arrivals_true, arrivals_sim) -> float:
     total_true = counts_true.sum()
     total_sim = counts_sim.sum()
     if total_true == 0 or total_sim == 0:
-        return 0.0
+        return float("inf")
 
     p = counts_true / total_true
     q = counts_sim / total_sim

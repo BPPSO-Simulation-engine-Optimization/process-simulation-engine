@@ -26,22 +26,30 @@ Resource Allocation Model:
 This creates realistic resource contention and waiting times.
 """
 
+import os
+import time
 import uuid
 import random
 import logging
+import threading
+import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import List, Dict, Optional, Protocol, Set
+from typing import List, Dict, Optional, Protocol, Set, Tuple
 from collections import defaultdict
 import heapq
 
+import numpy as np
 import pandas as pd
+import scipy.stats
 
 from .events import SimulationEvent, EventType
 from .event_queue import EventQueue
 from .clock import SimulationClock
 from .case_manager import CaseState, CaseManager
+from resources.selection_strategies import ResourceSelectionStrategy, RandomStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +79,78 @@ class WaitingWork:
     allocation_activity: str
     arrival_time: datetime  # When the work arrived (for FIFO ordering)
     case_state: CaseState
+    # Estimated processing time (seconds) for SPT ordering. Set when task is added
+    # to a resource worklist. None if not yet estimated.
+    estimated_pt_seconds: Optional[float] = None
 
     def __lt__(self, other):
         """For heap ordering - earlier arrival time = higher priority."""
         return self.arrival_time < other.arrival_time
+
+
+class SimulationProfiler:
+    """Lightweight profiler using time.perf_counter() for wall-clock measurement."""
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._totals: Dict[str, float] = defaultdict(float)
+        self._counts: Dict[str, int] = defaultdict(int)
+        self._wall_start: float = 0.0
+
+    def start_wall_clock(self):
+        if self.enabled:
+            self._wall_start = time.perf_counter()
+
+    @contextmanager
+    def measure(self, component: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        yield
+        elapsed = time.perf_counter() - t0
+        self._totals[component] += elapsed
+        self._counts[component] += 1
+
+    def print_report(self):
+        if not self.enabled:
+            return
+        wall_total = time.perf_counter() - self._wall_start
+
+        # Separate event-level from component-level measurements
+        event_items = {k: v for k, v in self._totals.items() if k.startswith("event.")}
+        component_items = {k: v for k, v in self._totals.items() if not k.startswith("event.")}
+
+        print(f"\n{'='*80}")
+        print("PERFORMANCE PROFILE")
+        print(f"{'='*80}")
+        print(f"Total wall-clock time: {wall_total:.2f}s\n")
+
+        # Event-level breakdown
+        print("Event type breakdown:")
+        print(f"{'Event type':<45} {'Total (s)':>10} {'Calls':>7} {'Avg (ms)':>10} {'% Wall':>8}")
+        print("-" * 80)
+        for comp in sorted(event_items, key=event_items.get, reverse=True):
+            total = self._totals[comp]
+            count = self._counts[comp]
+            avg_ms = (total / count * 1000) if count else 0
+            pct = (total / wall_total * 100) if wall_total else 0
+            print(f"{comp:<45} {total:>10.3f} {count:>7} {avg_ms:>10.3f} {pct:>7.1f}%")
+        event_accounted = sum(event_items.values())
+        event_unaccounted = wall_total - event_accounted
+        print(f"{'(unaccounted / overhead)':<45} {event_unaccounted:>10.3f} {'':>7} {'':>10} {(event_unaccounted/wall_total*100) if wall_total else 0:>7.1f}%")
+
+        # Component-level breakdown
+        print(f"\nComponent breakdown (within event handlers):")
+        print(f"{'Component':<45} {'Total (s)':>10} {'Calls':>7} {'Avg (ms)':>10} {'% Wall':>8}")
+        print("-" * 80)
+        for comp in sorted(component_items, key=component_items.get, reverse=True):
+            total = self._totals[comp]
+            count = self._counts[comp]
+            avg_ms = (total / count * 1000) if count else 0
+            pct = (total / wall_total * 100) if wall_total else 0
+            print(f"{comp:<45} {total:>10.3f} {count:>7} {avg_ms:>10.3f} {pct:>7.1f}%")
+        print(f"{'='*80}\n")
 
 
 class ResourcePool:
@@ -189,6 +265,40 @@ class ResourcePool:
         """Get summary of waiting work per activity."""
         return {act: len(q) for act, q in self._waiting_queues.items() if q}
 
+    def get_all_waiting_tasks(self) -> List[WaitingWork]:
+        """
+        Return a flat list of all waiting work across all queues.
+
+        Non-destructive: items remain in their queues.
+        """
+        result = []
+        for q in self._waiting_queues.values():
+            result.extend(q)
+        return result
+
+    def remove_task_by_id(
+        self, allocation_activity: str, case_id: str
+    ) -> Optional[WaitingWork]:
+        """
+        Remove a specific task from its waiting queue by case_id.
+
+        O(n) scan + heapify.  Only called on worker-idle events so
+        performance is fine for queue sizes in the hundreds.
+
+        Returns:
+            The removed WaitingWork, or None if not found.
+        """
+        q = self._waiting_queues.get(allocation_activity)
+        if not q:
+            return None
+
+        for idx, work in enumerate(q):
+            if work.case_id == case_id:
+                q.pop(idx)
+                heapq.heapify(q)
+                return work
+        return None
+
 
 # Protocol definitions for pluggable predictors
 class NextActivityPredictor(Protocol):
@@ -281,6 +391,16 @@ class DESEngine:
     2. ACTIVITY_COMPLETE -> log event, predict next -> schedule next or CASE_END
     3. CASE_END -> cleanup
     """
+
+    PT_LIFECYCLE_MODES = {"native", "gt_activity_gated"}
+    PT_GT_START_ACTIVITIES = {
+        "W_Assess potential fraud",
+        "W_Call after offers",
+        "W_Call incomplete files",
+        "W_Complete application",
+        "W_Handle leads",
+        "W_Validate application",
+    }
     
     def __init__(
         self,
@@ -293,7 +413,17 @@ class DESEngine:
         case_arrival_predictor: CaseArrivalPredictor = None,
         case_attribute_predictor: CaseAttributePredictor = None,
         start_time: datetime = None,
-        max_activities_per_case: int = 500,
+        max_activities_per_case: int = 100,
+        resource_selection_strategy: ResourceSelectionStrategy = None,
+        batch_allocation_policy=None,
+        processing_time_estimator=None,
+        drl_policy=None,
+        drl_max_postpone_wait_hours: float = 4.0,
+        pmsp_config=None,
+        pt_lifecycle_mode: str = "native",
+        enable_profiling: bool = False,
+        pmsp_log_file: Optional[str] = None,
+        incremental_csv_path: Optional[str] = None,
     ):
         """
         Initialize the DES Engine.
@@ -310,6 +440,21 @@ class DESEngine:
             case_attribute_predictor: Predicts case attributes (required).
             start_time: Simulation start time.
             max_activities_per_case: Safety limit to prevent infinite loops.
+            resource_selection_strategy: Heuristic for selecting among available resources.
+                Defaults to RandomStrategy (R-RMA).
+            batch_allocation_policy: Optional BatchAllocationPolicy (e.g. OneBatchOnePolicy).
+                When set, _process_waiting_queue uses holistic MILP instead of greedy.
+            processing_time_estimator: Optional ProcessingTimeEstimator for batch policy
+                p_{ij} lookups.  Required when batch_allocation_policy is set.
+            drl_policy: Optional DRL allocation policy (DRLAllocationPolicy or
+                InteractiveBatchPolicy).  When set, overrides both batch and greedy.
+            pmsp_config: Optional SelectionConfig for PMSP-based resource optimization.
+                When set, _process_waiting_queue uses PMSP solver instead of greedy.
+            pt_lifecycle_mode: PT-only lifecycle logging mode.
+                "native": keep predictor lifecycle output.
+                "gt_activity_gated": emit synthetic "start" for GT start-capable
+                activities and force completion logs to "complete".
+            enable_profiling: If True, measure wall-clock time per component.
         """
         self.queue = EventQueue()
         self.clock = SimulationClock(start_time)
@@ -318,6 +463,17 @@ class DESEngine:
 
         # Pre-generated arrival timestamps (optional)
         self._arrival_timestamps = arrival_timestamps
+
+        # Processing time predictor is required (must be ProcessingTimePredictionClass)
+        # NOTE: This MUST be assigned before _create_next_activity_predictor, because
+        # the Process Transformer path overrides self._processing_time with its own
+        # PTTimeAdapter. If we assign after, the override gets clobbered.
+        if processing_time_predictor is None:
+            raise ValueError(
+                "processing_time_predictor is required. "
+                "Use ProcessingTimePredictionClass from processing_time_prediction"
+            )
+        self._processing_time = processing_time_predictor
 
         # Next activity predictor: use provided instance, or create from type
         if next_activity_predictor is not None:
@@ -332,15 +488,23 @@ class DESEngine:
                 "Either next_activity_predictor or next_activity_predictor_type is required. "
                 "Use a valid NextActivityPredictorType or pass a predictor instance."
             )
-        self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
-        # Processing time predictor is required (must be ProcessingTimePredictionClass)
-        if processing_time_predictor is None:
+        self._is_process_transformer_predictor = self._detect_process_transformer_predictor(
+            predictor=self._next_activity,
+            predictor_type=next_activity_predictor_type,
+        )
+        self._pt_lifecycle_mode = str(pt_lifecycle_mode or "native")
+        if self._pt_lifecycle_mode not in self.PT_LIFECYCLE_MODES:
             raise ValueError(
-                "processing_time_predictor is required. "
-                "Use ProcessingTimePredictionClass from processing_time_prediction"
+                f"Unknown pt_lifecycle_mode: {self._pt_lifecycle_mode}. "
+                f"Expected one of: {sorted(self.PT_LIFECYCLE_MODES)}"
             )
-        self._processing_time = processing_time_predictor
+        if self._pt_lifecycle_mode == "gt_activity_gated" and not self._is_process_transformer_predictor:
+            raise ValueError(
+                "pt_lifecycle_mode='gt_activity_gated' is only valid with the "
+                "Process Transformer next activity predictor."
+            )
+        self._case_arrival = case_arrival_predictor or _StubCaseArrivalPredictor()
 
         # Case attribute predictor is required (must be AttributeSimulationEngine)
         if case_attribute_predictor is None:
@@ -358,8 +522,31 @@ class DESEngine:
             availability_model=resource_allocator.availability if resource_allocator else None
         )
 
+        # Resource selection heuristic (R-RMA, R-RRA, or R-SHQ)
+        self._resource_strategy = resource_selection_strategy or RandomStrategy()
+
+        # Batch allocation policy (optional, overrides greedy waiting-queue logic)
+        self._batch_policy = batch_allocation_policy
+        self._pt_estimator = processing_time_estimator
+
+        # DRL allocation policy (optional, overrides both batch and greedy)
+        self._drl_policy = drl_policy
+        self._drl_max_postpone_wait_hours = drl_max_postpone_wait_hours
+
+        # PMSP resource optimization config (optional)
+        self._pmsp_config = pmsp_config
+
+        # Per-resource worklists for PMSP mode (resource_id -> list of WaitingWork)
+        self._resource_worklists: Dict[str, List[WaitingWork]] = defaultdict(list)
+
+
         # Output: collected events for export
         self.completed_events: List[Dict] = []
+        
+        # Incremental CSV export (write every 100 cases)
+        self._incremental_csv_path: Optional[str] = incremental_csv_path
+        self._last_csv_exported_events_count: int = 0
+        self._last_csv_exported_cases: int = 0
 
         # Statistics
         self.stats = {
@@ -371,6 +558,63 @@ class DESEngine:
             'waiting_events': 0,  # Cases that had to wait for resources
             'wait_time_total_seconds': 0,  # Total time spent waiting
         }
+
+        # Profiler
+        self.profiler = SimulationProfiler(enabled=enable_profiling)
+
+        # Per-transition P99 duration caps and activity whitelist
+        self._transition_p99_caps, self._valid_activities = self._load_transition_caps()
+
+        # Per-activity repetition limit (GT max is ~10-12 for W_ activities)
+        self._max_activity_repeats = 15
+
+    @staticmethod
+    def _load_transition_caps() -> Tuple[Dict[tuple, float], Set[str]]:
+        """Load per-transition P99 caps from the distribution model.
+
+        Returns (transition_key → P99_seconds, set_of_valid_activities).
+        If the model file is missing, returns empty structures (no caps applied).
+        """
+        model_path = os.path.join("models", "processing_time_model_complete_only_distributions.joblib")
+        if not os.path.exists(model_path):
+            logger.warning("Distribution model not found at %s — P99 caps disabled", model_path)
+            return {}, set()
+
+        import joblib
+        dist_params = joblib.load(model_path)
+
+        caps: Dict[tuple, float] = {}
+        activities: Set[str] = set()
+        for key, params in dist_params.items():
+            mu, sigma = float(params["mu"]), float(params["sigma"])
+            p99 = float(scipy.stats.lognorm(s=sigma, scale=np.exp(mu)).ppf(0.99))
+            caps[key] = p99
+            activities.add(key[0])
+            activities.add(key[2])
+
+        logger.info(
+            "Loaded P99 caps for %d transitions, %d valid activities",
+            len(caps), len(activities),
+        )
+        return caps, activities
+
+    @staticmethod
+    def _detect_process_transformer_predictor(
+        predictor,
+        predictor_type: Optional[NextActivityPredictorType],
+    ) -> bool:
+        """Best-effort detection of Process Transformer predictor wiring."""
+        if predictor_type == NextActivityPredictorType.PROCESS_TRANSFORMER:
+            return True
+        if predictor is None:
+            return False
+
+        cls = predictor.__class__
+        module_name = getattr(cls, "__module__", "")
+        class_name = getattr(cls, "__name__", "")
+        if "process_transformer_v2" in module_name:
+            return True
+        return class_name in {"PTActivityAdapter", "ProcessTransformerV2Predictor"}
     
     def _create_next_activity_predictor(
         self, 
@@ -435,8 +679,11 @@ class DESEngine:
             # This is a bit of a hack: The engine calls this method to get the *Activity* predictor.
             # But we also need to set the *Time* predictor.
             # Since we have reference to 'self', we can override it!
-            time_adapter = PTTimeAdapter(unified)
+            max_dur = config.get('pt_max_duration_seconds')
+            time_adapter = PTTimeAdapter(unified, max_duration_seconds=max_dur)
             self._processing_time = time_adapter
+            if max_dur:
+                logger.info(f"ProcessTransformerV2: Duration cap set to {max_dur/3600:.0f}h ({max_dur/86400:.0f} days)")
             logger.info("ProcessTransformerV2: Also registered as ProcessingTimePredictor.")
             
             return activity_adapter
@@ -476,13 +723,25 @@ class DESEngine:
 
         # Schedule initial case arrivals
         self._schedule_case_arrivals(num_cases)
+
+        # Start profiler wall clock
+        self.profiler.start_wall_clock()
         
+        # Initialize incremental CSV file (delete if exists to start fresh)
+        if self._incremental_csv_path:
+            import os
+            if os.path.exists(self._incremental_csv_path):
+                os.remove(self._incremental_csv_path)
+            self._last_csv_exported_events_count = 0
+            logger.info(f"Incremental CSV export enabled: will write to {self._incremental_csv_path} every 100 cases")
+
         # Main simulation loop
         print(f"\n{'='*60}", flush=True)
         print(f"Starting simulation loop with {len(self.queue)} scheduled events...", flush=True)
         print(f"{'='*60}\n", flush=True)
         
         event_count = 0
+        
         last_progress_print = 0
         progress_interval = max(10, num_cases // 20)  # Print every ~5% or at least every 10 cases
         
@@ -499,12 +758,25 @@ class DESEngine:
             event_count += 1
             
             # Print progress periodically
-            if event_count - last_progress_print >= progress_interval:
+            if self.stats['cases_started'] - last_progress_print >= progress_interval:
                 print(f"Progress: {self.stats['cases_started']} cases started, "
                       f"{self.stats['cases_completed']} completed, "
                       f"{len(self.completed_events)} events logged, "
                       f"{self.resource_pool.get_total_waiting_count()} waiting", flush=True)
-                last_progress_print = event_count
+                last_progress_print = self.stats['cases_started']
+
+            # Incremental CSV export: write when cases_started crosses a new 100-case boundary
+            cases_started = self.stats['cases_started']
+            if (self._incremental_csv_path
+                    and cases_started >= self._last_csv_exported_cases + 100):
+                new_events = self.completed_events[self._last_csv_exported_events_count:]
+                if new_events:
+                    from simulation.log_exporter import LogExporter
+                    write_header = (self._last_csv_exported_events_count == 0)
+                    LogExporter.append_to_csv(new_events, self._incremental_csv_path, write_header=write_header)
+                    self._last_csv_exported_events_count = len(self.completed_events)
+                    self._last_csv_exported_cases = cases_started
+                    logger.debug(f"Incremental CSV export: wrote {len(new_events)} events to {self._incremental_csv_path} (total cases: {cases_started})")
 
         # Drain phase: process remaining waiting work by advancing time
         if self.resource_pool.has_waiting_work():
@@ -530,6 +802,17 @@ class DESEngine:
             f"{self.stats['no_eligible_failures']} no eligible"
             + (f", {pending_count} stuck" if pending_count > 0 else "")
         )
+        
+        # Write remaining events to incremental CSV if enabled
+        if self._incremental_csv_path:
+            remaining_events = self.completed_events[self._last_csv_exported_events_count:]
+            if remaining_events:
+                from simulation.log_exporter import LogExporter
+                write_header = (self._last_csv_exported_events_count == 0)
+                LogExporter.append_to_csv(remaining_events, self._incremental_csv_path, write_header=write_header)
+                logger.info(f"Final incremental CSV export: wrote {len(remaining_events)} remaining events to {self._incremental_csv_path}")
+
+        self.profiler.print_report()
 
         return self.completed_events
     
@@ -592,7 +875,8 @@ class DESEngine:
 
         handler = handlers.get(event.event_type)
         if handler:
-            handler(event)
+            with self.profiler.measure(f"event.{event.event_type.name}"):
+                handler(event)
         else:
             logger.warning(f"Unknown event type: {event.event_type}")
 
@@ -614,13 +898,19 @@ class DESEngine:
     def _on_case_arrival(self, event: SimulationEvent) -> None:
         """Handle case arrival: create case state, schedule first activity."""
         self.stats['cases_started'] += 1
-        
+
+        # Delay arrival to next business hour if outside working hours
+        arrival_time = event.timestamp
+        if not self._is_business_hours(arrival_time):
+            arrival_time = self._get_next_business_hour(arrival_time)
+
         # Print arrival info for visibility
         if self.stats['cases_started'] <= 5 or self.stats['cases_started'] % 100 == 0:
-            print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {event.timestamp.strftime('%Y-%m-%d %H:%M')}", flush=True)
+            print(f"[ARRIVAL] Case {self.stats['cases_started']}: {event.case_id} at {arrival_time.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
         # Get case attributes from AttributeSimulationEngine
-        attr_case = self._case_attribute.start_new_case()
+        with self.profiler.measure("case_attribute.start_new_case"):
+            attr_case = self._case_attribute.start_new_case()
         loan_goal = attr_case.loan_goal
         app_type = attr_case.application_type
         amount = attr_case.requested_amount
@@ -631,22 +921,24 @@ class DESEngine:
             case_type=loan_goal,
             application_type=app_type,
             requested_amount=amount,
-            start_time=event.timestamp,
+            start_time=arrival_time,
         )
         # Store reference to attr engine case for later offer attribute generation
         case._attr_engine_case = attr_case
 
         # Predict first activity
-        activity, lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
+        with self.profiler.measure("next_activity.predict"):
+            activity, lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
 
         if is_end:
             # Edge case: case ends immediately
-            self._schedule_case_end(event.case_id, event.timestamp)
+            self._schedule_case_end(event.case_id, arrival_time)
             return
 
         # Allocate resource and schedule activity
-        self._schedule_activity(event.case_id, activity, lifecycle, event.timestamp, case)
-    
+        with self.profiler.measure("schedule_activity"):
+            self._schedule_activity(event.case_id, activity, lifecycle, arrival_time, case)
+
     def _on_activity_complete(self, event: SimulationEvent) -> None:
         """Handle activity completion: log event, release resource, process waiting queue."""
         case = self.case_manager.get_case(event.case_id)
@@ -657,14 +949,28 @@ class DESEngine:
         # Release the resource that completed this activity
         if event.resource:
             self.resource_pool.release(event.resource)
+            self._resource_strategy.notify_release(event.resource)
             # Try to dispatch waiting work now that this resource is free
-            self._process_waiting_queue(event.resource, event.timestamp)
+            with self.profiler.measure("process_waiting_queue"):
+                logger.debug("Processing waiting queue after activity completion. Resource freed: %s", event.resource)
+                # In PMSP mode: first drain the pre-planned worklist for this resource.
+                # Only fall back to the general waiting-queue / optimizer when the
+                # worklist is empty (nothing was dispatched from it).
+                if self._pmsp_config is not None:
+                    worklist_dispatched = self._process_resource_worklist(event.resource, event.timestamp)
+                    if not worklist_dispatched:
+                        # Es könnten inzwischen neue tasks in die waiting queue gekommen sein. 
+                        # Vefügbaren Ressourcen haen sich geändert
+                        self._process_waiting_queue(event.resource, event.timestamp)
+                else:
+                    self._process_waiting_queue(event.resource, event.timestamp)
 
         # Generate offer-dependent attributes when O_Create Offer completes
         if event.activity == "O_Create Offer" and case._attr_engine_case is not None:
             # Populate offer attributes directly on the stored case reference
             # (uses explicit CaseState, not internal _active_case pointer)
-            self._case_attribute.populate_offer_attributes(case._attr_engine_case)
+            with self.profiler.measure("case_attribute.populate_offer"):
+                self._case_attribute.populate_offer_attributes(case._attr_engine_case)
             attr = case._attr_engine_case
             # Use pd.notna() for proper NaN handling (np.nan is NOT None)
             case.credit_score = float(attr.credit_score) if pd.notna(attr.credit_score) else None
@@ -675,8 +981,12 @@ class DESEngine:
             case.selected = attr.selected
             case.accepted = attr.accepted
 
+        completion_lifecycle = event.lifecycle
+        if self._pt_lifecycle_mode == "gt_activity_gated" and self._is_process_transformer_predictor:
+            completion_lifecycle = "complete"
+
         # Record activity in case history
-        case.add_activity(event.activity, event.resource, event.lifecycle)
+        case.add_activity(event.activity, event.resource, completion_lifecycle)
 
         # Safety guard: if a case keeps looping, stop it instead of hanging the run
         if self._max_activities_per_case and len(case.activity_history) >= self._max_activities_per_case:
@@ -685,6 +995,7 @@ class DESEngine:
                 f"ending to avoid infinite loop (last={case.activity_history[-1]})."
             )
             log_record = event.to_log_record()
+            log_record['lifecycle:transition'] = completion_lifecycle
             log_record.update(case.get_payload())
             self.completed_events.append(log_record)
             self._schedule_case_end(event.case_id, event.timestamp)
@@ -694,16 +1005,29 @@ class DESEngine:
 
         # Log the event for export
         log_record = event.to_log_record()
+        log_record['lifecycle:transition'] = completion_lifecycle
         log_record.update(case.get_payload())
         self.completed_events.append(log_record)
 
         # Predict next activity
-        next_activity, next_lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
+        with self.profiler.measure("next_activity.predict"):
+            next_activity, next_lifecycle, is_end = self._normalize_next_prediction(self._next_activity.predict(case))
+
+        # Guard: cap per-activity repetitions to prevent runaway loops
+        if not is_end:
+            activity_count = case.activity_history.count(next_activity)
+            if activity_count >= self._max_activity_repeats:
+                logger.warning(
+                    "Case %s: %s repeated %d times, forcing end",
+                    event.case_id, next_activity, activity_count,
+                )
+                is_end = True
 
         if is_end:
             self._schedule_case_end(event.case_id, event.timestamp)
         else:
-            self._schedule_activity(event.case_id, next_activity, next_lifecycle, event.timestamp, case)
+            with self.profiler.measure("schedule_activity"):
+                self._schedule_activity(event.case_id, next_activity, next_lifecycle, event.timestamp, case)
 
     def _process_waiting_queue(self, freed_resource: str, current_time: datetime) -> None:
         """
@@ -711,6 +1035,22 @@ class DESEngine:
 
         Tries to dispatch waiting work to the freed resource if it's eligible.
         """
+        logger.debug("Processing waiting queue.")
+        # DRL policy overrides both batch and greedy
+        if self._drl_policy is not None:
+            self._process_waiting_queue_drl(freed_resource, current_time)
+            return
+
+        # Batch allocation policy overrides greedy logic
+        if self._batch_policy is not None:
+            self._process_waiting_queue_batch(freed_resource, current_time)
+            return
+
+        # PMSP optimization overrides greedy logic
+        if self._pmsp_config is not None:
+            self._process_waiting_queue_pmsp(freed_resource, current_time)
+            return
+
         # Check which activities have waiting work
         waiting_activities = self.resource_pool.get_all_waiting_activities()
         if not waiting_activities:
@@ -745,6 +1085,9 @@ class DESEngine:
                     f"to {freed_resource} (waited {wait_seconds:.0f}s)"
                 )
 
+                # Track assignment for strategy (keeps SHQ counts accurate)
+                self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
                 # Schedule the activity with the freed resource
                 self._schedule_activity_with_resource(
                     waiting_work.case_id,
@@ -756,15 +1099,652 @@ class DESEngine:
                 )
                 # Resource is now busy again, stop looking
                 return
-    
+
+    def _transfer_unavailable_resource_worklists(self, current_time: datetime) -> int:
+        """
+        K-Batching: Transfer tasks from unavailable resources' worklists back to waiting queue.
+        
+        When a resource becomes unavailable (e.g., outside working hours), all tasks
+        on its worklist are transferred back to the set of unassigned tasks.
+        
+        Returns:
+            Number of tasks transferred back to waiting queue.
+        """
+        if not self._pmsp_config:
+            return 0
+        
+        total_transferred = 0
+        
+        # Check all resources with worklists
+        resources_to_check = list(self._resource_worklists.keys())
+        
+        for resource in resources_to_check:
+            # Check if resource is unavailable (not available due to working hours, etc.)
+            if not self.allocator.availability.is_available(resource, current_time):
+                worklist = self._resource_worklists.get(resource, [])
+                if worklist:
+                    logger.debug(
+                        "K-Batching: Resource %s became unavailable, transferring %d tasks back to waiting queue",
+                        resource, len(worklist)
+                    )
+                    
+                    # Transfer all tasks from worklist back to waiting queue
+                    for work in worklist:
+                        self.resource_pool.add_to_waiting_queue(work)
+                        total_transferred += 1
+                    
+                    # Clear the worklist
+                    del self._resource_worklists[resource]
+        
+        return total_transferred
+
+    def _process_resource_worklist(self, resource: str, current_time: datetime) -> bool:
+        """
+        Process tasks from a resource's worklist in PMSP mode.
+
+        When a resource is freed, first check if there are tasks in its worklist
+        and execute those before processing the general waiting queue.
+        
+        K-Batching: If the resource is unavailable, transfer tasks back to waiting queue.
+
+        Returns True if at least one worklist task was dispatched (resource is now
+        busy again), False if the worklist was empty.
+        """
+        worklist = self._resource_worklists.get(resource, [])
+        if not worklist:
+            return False
+
+        # K-Batching: Check if resource is unavailable - if so, transfer tasks back
+        if not self.allocator.availability.is_available(resource, current_time):
+            logger.debug(
+                "K-Batching: Resource %s is unavailable, transferring %d tasks from worklist back to waiting queue",
+                resource, len(worklist)
+            )
+            for work in worklist:
+                self.resource_pool.add_to_waiting_queue(work)
+            del self._resource_worklists[resource]
+            return False
+
+        # logger.info("PMSP: Processing worklist for resource %s (%d tasks)", resource, len(worklist))
+
+        # SPT ordering: sort worklist by estimated processing time (shortest first)
+        # Paper: "when multiple tasks are assigned to a resource, use shortest processing time first"
+        if len(worklist) > 1:
+            # Use pre-estimated PT if available, otherwise estimate on-the-fly
+            def get_pt(w):
+                if w.estimated_pt_seconds is not None:
+                    return w.estimated_pt_seconds
+                # Fallback: estimate now (shouldn't happen if tasks were added via PMSP dispatch)
+                return self._estimate_pt_seconds(w, resource, current_time)
+            worklist.sort(key=get_pt)
+            # logger.debug(
+            #     "PMSP SPT: Worklist for %s sorted by estimated PT: %s",
+            #     resource,
+            #     [(w.activity, w.case_id, f"{get_pt(w):.1f}s") for w in worklist],
+            # )
+
+        dispatched = False
+        # Dispatch the next worklist item (resource accepts one task at a time, SPT order)
+        while worklist and not self.resource_pool.is_busy(resource, current_time):
+            work = worklist.pop(0)  # SPT order (sorted above)
+
+            # Calculate wait time for stats
+            wait_seconds = (current_time - work.arrival_time).total_seconds()
+            self.stats['wait_time_total_seconds'] += wait_seconds
+
+            # logger.debug(
+            #     "PMSP worklist: dispatching %s for case %s to %s (waited %.0fs)",
+            #     work.activity, work.case_id, resource, wait_seconds,
+            # )
+
+            # Track assignment for strategy
+            self._resource_strategy.notify_assignment(resource, work.allocation_activity)
+
+            # Schedule the activity – this also marks the resource as busy
+            self._schedule_activity_with_resource(
+                work.case_id,
+                work.activity,
+                work.lifecycle,
+                current_time,
+                work.case_state,
+                resource,
+            )
+            dispatched = True
+
+        # Clean up the entry if the worklist is now empty
+        if not worklist and resource in self._resource_worklists:
+            del self._resource_worklists[resource]
+
+        return dispatched
+
+    def _log_resource_worklists(self) -> None:
+        """Log the current worklists for all resources."""
+        # logger.info("PMSP [Step 8 - Worklists]: Current worklists for all resources:")
+        # if self._resource_worklists:
+        #     for resource, worklist in sorted(self._resource_worklists.items()):
+        #         if worklist:
+        #             logger.info("  Resource %s: %d tasks in worklist:", resource, len(worklist))
+        #             for idx, work in enumerate(worklist, 1):
+        #                 logger.info("    [%d] Task '%s' (case %s, activity '%s', arrived: %s)", 
+        #                            idx, work.allocation_activity, work.case_id, work.activity, work.arrival_time)
+        #         else:
+        #             logger.info("  Resource %s: worklist empty", resource)
+        # else:
+        #     logger.info("  No resources have worklists")
+        pass
+
+    def _process_waiting_queue_pmsp(
+        self, freed_resource: Optional[str], current_time: datetime
+    ) -> None:
+        """
+        PMSP-mode waiting-queue processing (K-Batching adaptation).
+
+        K-Batching behavior:
+        1. Transfer tasks from unavailable resources' worklists back to waiting queue
+        2. Collect all waiting tasks
+        3. If k tasks have arrived (or batch_size == 0), solve PMSP for k tasks and all available resources
+        4. Assign tasks to resources (add to worklists if resource is busy)
+        5. When a resource becomes unavailable, tasks on its worklist are transferred back
+
+        Only triggers optimization if the number of waiting tasks reaches
+        the configured batch size (or always if batch_size == 0).
+        """
+        # logger.info("=" * 80)
+        # logger.info("PMSP [PROCESS START]: Processing waiting queue in PMSP mode (K-Batching) at time %s", current_time)
+        # logger.info("=" * 80)
+        from resources.resource_optimization.resource_optimization import (
+            handle_batch_scheduling_optimization,
+        )
+
+        # K-Batching: First, transfer tasks from unavailable resources back to waiting queue
+        transferred = self._transfer_unavailable_resource_worklists(current_time)
+        if transferred > 0:
+            # logger.info("PMSP [Step 1 - Transfer]: Transferred %d tasks from unavailable resources back to waiting queue", transferred)
+            pass
+
+        waiting_tasks = self.resource_pool.get_all_waiting_tasks()
+        if not waiting_tasks:
+            # logger.info("PMSP [PROCESS END]: No waiting tasks, exiting")
+            # Log worklists even if no waiting tasks
+            self._log_resource_worklists()
+            return
+
+        # Log waiting tasks details
+        waiting_cases = set(wt.case_id for wt in waiting_tasks)
+        activity_counts = {}
+        for wt in waiting_tasks:
+            activity_counts[wt.allocation_activity] = activity_counts.get(wt.allocation_activity, 0) + 1
+        
+        # logger.info("PMSP [Step 2 - Queue Analysis]: Found %d waiting tasks across %d cases", 
+        #            len(waiting_tasks), len(waiting_cases))
+        # logger.info("PMSP [Step 2 - Queue Analysis]: Activities in queue: %s", 
+        #            ", ".join(f"{act}({count})" for act, count in sorted(activity_counts.items())))
+        # logger.info("PMSP [Step 2 - Queue Analysis]: Cases with waiting tasks: %s", 
+        #            ", ".join(sorted(waiting_cases)) if len(waiting_cases) <= 20 else f"{len(waiting_cases)} cases")
+
+        # logger.info("PMSP [Step 3 - Task Set]: Total tasks for optimization: %d", len(waiting_tasks))
+
+        # logger.info("PMSP [Step 5 - Optimization]: Starting optimization...")
+        with self.profiler.measure("pmsp.optimize"):
+            assignment, debug = handle_batch_scheduling_optimization(
+                cfg=self._pmsp_config,
+                activity="",  # not used for batch mode
+                timestamp=current_time,
+                case=None,
+                waiting_tasks=waiting_tasks,
+                processing_time_predictor=self._processing_time,
+                allocator=self.allocator,
+                resource_pool=self.resource_pool,
+            )
+
+        if assignment is None:
+            # logger.info("PMSP [PROCESS END]: Optimization returned no assignment, exiting")
+            # Log worklists even if no assignment
+            self._log_resource_worklists()
+            return
+
+        # Log assignment results
+        assigned_count = sum(1 for v in assignment.values() if v is not None)
+        unassigned_count = len(assignment) - assigned_count
+        # logger.info("PMSP [Step 6 - Assignment Results]: Optimization completed - %d assigned, %d unassigned (dummy)", 
+        #            assigned_count, unassigned_count)
+        
+        # Group assignments by resource for logging
+        assignments_by_resource = {}
+        for task_id, resource in assignment.items():
+            if resource is not None:
+                if resource not in assignments_by_resource:
+                    assignments_by_resource[resource] = []
+                assignments_by_resource[resource].append(task_id)
+        
+        # logger.info("PMSP [Step 6 - Assignment Results]: Assignments by resource:")
+        # for resource, task_list in sorted(assignments_by_resource.items()):
+        #     logger.info("  Resource %s: %d tasks -> %s", resource, len(task_list), 
+        #                ", ".join(task_list) if len(task_list) <= 5 else f"{len(task_list)} tasks")
+        
+        # Log unassigned tasks
+        unassigned_tasks = [task_id for task_id, res in assignment.items() if res is None]
+        # if unassigned_tasks:
+        #     logger.info("PMSP [Step 6 - Assignment Results]: Unassigned tasks (dummy): %d tasks -> %s", 
+        #                len(unassigned_tasks), ", ".join(unassigned_tasks) if len(unassigned_tasks) <= 10 else f"{len(unassigned_tasks)} tasks")
+
+        # Extract raw processing times from optimization (for SPT ordering)
+        raw_processing_times = debug.get("raw_processing_times", {})  # task_id -> resource -> seconds
+
+        # Apply assignments: dispatch tasks to assigned resources or add to worklists
+        # logger.info("PMSP [Step 7 - Dispatch]: Applying assignments...")
+        dispatched_count = 0
+        worklist_count = 0
+        for task_id, assigned_resource in assignment.items():
+            if assigned_resource is None:
+                # Dummy assignment — task stays in the queue
+                continue
+
+            # Find the matching WaitingWork object
+            matched_work = None
+            for wt in waiting_tasks:
+                if f"{wt.case_id}_{wt.allocation_activity}" == task_id:
+                    matched_work = wt
+                    break
+            if matched_work is None:
+                # logger.warning("PMSP: task_id %s not found in waiting tasks", task_id)
+                continue
+
+            # Remove from the waiting queue
+            removed = self.resource_pool.remove_task_by_id(
+                matched_work.allocation_activity, matched_work.case_id
+            )
+            if removed is None:
+                continue
+
+            # K-Batching: Check if resource is unavailable - if so, keep task in waiting queue
+            if not self.allocator.availability.is_available(assigned_resource, current_time):
+                # Resource is unavailable - task stays in waiting queue (will be reassigned later)
+                logger.debug(
+                    "K-Batching: Resource %s is unavailable, keeping task %s for case %s in waiting queue",
+                    assigned_resource, removed.activity, removed.case_id
+                )
+                # Re-add to waiting queue since resource is unavailable
+                self.resource_pool.add_to_waiting_queue(removed)
+                continue
+
+            # Check if the assigned resource is actually free right now
+            if self.resource_pool.is_busy(assigned_resource, current_time):
+                # Resource is busy - add to its worklist instead of dispatching
+                # Use pre-estimated PT from optimization if available (avoids re-estimation)
+                if removed.estimated_pt_seconds is None:
+                    if task_id in raw_processing_times and assigned_resource in raw_processing_times[task_id]:
+                        removed.estimated_pt_seconds = raw_processing_times[task_id][assigned_resource]
+                        # logger.debug(
+                        #     "PMSP [Step 7 - Dispatch]: Using pre-estimated PT from optimization: %.2fs for task %s -> %s",
+                        #     removed.estimated_pt_seconds, task_id, assigned_resource
+                        # )
+                    else:
+                        # Fallback: estimate now (shouldn't happen if optimization ran)
+                        removed.estimated_pt_seconds = self._estimate_pt_seconds(removed, assigned_resource, current_time)
+                        # logger.debug(
+                        #     "PMSP [Step 7 - Dispatch]: PT not found in optimization results, estimating: %.2fs for task %s -> %s",
+                        #     removed.estimated_pt_seconds, task_id, assigned_resource
+                        # )
+                self._resource_worklists[assigned_resource].append(removed)
+                worklist_count += 1
+                # logger.info(
+                #     "PMSP [Step 7 - Dispatch]: Resource %s is busy, adding task '%s' (case %s) to worklist (estimated PT: %.1fs)",
+                #     assigned_resource, removed.activity, removed.case_id, removed.estimated_pt_seconds
+                # )
+                continue
+
+            # Calculate wait time for stats
+            wait_seconds = (current_time - removed.arrival_time).total_seconds()
+            self.stats['wait_time_total_seconds'] += wait_seconds
+
+            dispatched_count += 1
+            # logger.info(
+            #     "PMSP [Step 7 - Dispatch]: DISPATCHING task '%s' (case %s) -> resource %s (waited %.1fs)",
+            #     removed.activity, removed.case_id, assigned_resource, wait_seconds,
+            # )
+
+            # Track assignment for strategy
+            self._resource_strategy.notify_assignment(assigned_resource, removed.allocation_activity)
+
+            # Schedule the activity with the assigned resource
+            self._schedule_activity_with_resource(
+                removed.case_id,
+                removed.activity,
+                removed.lifecycle,
+                current_time,
+                removed.case_state,
+                assigned_resource,
+            )
+        
+        # logger.info("PMSP [Step 7 - Dispatch]: Dispatch summary - %d dispatched, %d to worklists", 
+        #            dispatched_count, worklist_count)
+        
+        # Log worklists for all resources
+        self._log_resource_worklists()
+        
+        # logger.info("=" * 80)
+        # logger.info("PMSP [PROCESS END]: Completed PMSP processing cycle")
+        # logger.info("=" * 80)
+
+    def _process_waiting_queue_batch(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        Batch-mode waiting-queue processing (1-Batch-1 / MSA).
+
+        Collects all waiting tasks, builds the eligible worker set, and
+        delegates to the configured BatchAllocationPolicy.  Only the
+        assignment for *freed_resource* is committed.
+        """
+        from resources.batch_policies import TaskInfo, WorkerInfo
+
+        # 1. Collect all waiting tasks
+        all_waiting = self.resource_pool.get_all_waiting_tasks()
+        if not all_waiting:
+            return
+
+        # 2. Build TaskInfo list
+        tasks: list[TaskInfo] = []
+        for w in all_waiting:
+            hours_waited = (current_time - w.arrival_time).total_seconds() / 3600.0
+            tasks.append(TaskInfo(
+                task_id=f"{w.case_id}::{w.allocation_activity}",
+                case_id=w.case_id,
+                activity=w.activity,
+                allocation_activity=w.allocation_activity,
+                hours_waited=max(0.0, hours_waited),
+            ))
+
+        # 3. Build eligible_map: allocation_activity -> set of eligible worker IDs
+        #    Cache per activity since many tasks share the same activity
+        eligible_map: dict[str, set[str]] = {}
+        unique_activities = {t.allocation_activity for t in tasks}
+
+        for act in unique_activities:
+            # Tier 1: permissions
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    act, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(act)
+
+            # Tier 2: availability (working hours)
+            available = {
+                r for r in eligible
+                if self.allocator.availability.is_available(r, current_time)
+            }
+            eligible_map[act] = available
+
+        # 3b. Scope to freed worker's competitive neighborhood
+        neighbor_tasks = {t.allocation_activity for t in tasks
+                         if freed_resource in eligible_map.get(t.allocation_activity, set())}
+        neighbor_workers: set[str] = set()
+        for act in neighbor_tasks:
+            neighbor_workers.update(eligible_map[act])
+        for act, workers_set in eligible_map.items():
+            if neighbor_workers & workers_set:
+                neighbor_tasks.add(act)
+        tasks = [t for t in tasks if t.allocation_activity in neighbor_tasks]
+        eligible_map = {act: ws for act, ws in eligible_map.items() if act in neighbor_tasks}
+
+        # 3c. Neighborhood too large — skip MILP entirely, dispatch greedily
+        if len(tasks) > 50:
+            sorted_tasks = sorted(tasks, key=lambda t: t.hours_waited, reverse=True)
+            for t in sorted_tasks:
+                if freed_resource in eligible_map.get(t.allocation_activity, set()):
+                    parts = t.task_id.split("::", 1)
+                    if len(parts) != 2:
+                        break
+                    case_id, allocation_activity = parts
+                    removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+                    if removed is None:
+                        break
+                    wait_seconds = (current_time - removed.arrival_time).total_seconds()
+                    self.stats['wait_time_total_seconds'] += wait_seconds
+                    logger.debug(
+                        "Neighborhood too large (%d tasks), greedy dispatch %s for case %s to %s (waited %.0fs)",
+                        len(tasks), removed.activity, removed.case_id, freed_resource, wait_seconds,
+                    )
+                    self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+                    self._batch_policy._diag_greedy_neighborhood_too_large += 1
+                    self._schedule_activity_with_resource(
+                        removed.case_id, removed.activity, removed.lifecycle, current_time,
+                        removed.case_state, freed_resource,
+                    )
+                    return
+            # No eligible task found for freed worker in this large neighborhood
+            return
+
+        # 4. Build WorkerInfo list: union of all eligible workers (including busy)
+        all_eligible_ids: set[str] = set()
+        for s in eligible_map.values():
+            all_eligible_ids.update(s)
+
+        workers: list[WorkerInfo] = []
+        for wid in all_eligible_ids:
+            busy_until = self.resource_pool.get_busy_until(wid)
+            if busy_until is not None:
+                remaining = max(0.0, (busy_until - current_time).total_seconds())
+            else:
+                remaining = 0.0
+            workers.append(WorkerInfo(worker_id=wid, remaining_busy_seconds=remaining))
+
+        # 5. Call batch policy
+        decision = self._batch_policy.decide(
+            freed_resource=freed_resource,
+            current_time_s=current_time.timestamp(),
+            tasks=tasks,
+            workers=workers,
+            eligible_map=eligible_map,
+            processing_time_fn=self._pt_estimator.estimate,
+        )
+
+        if decision is None:
+            logger.debug(
+                "Batch policy returned no assignment for %s at %s",
+                freed_resource, current_time,
+            )
+            return
+
+        # 6. Parse task_id -> (case_id, allocation_activity)
+        parts = decision.task_id.split("::", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid task_id from batch policy: %s", decision.task_id)
+            return
+        case_id, allocation_activity = parts
+
+        # Remove the task from its waiting queue
+        removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+        if removed is None:
+            logger.warning(
+                "Batch policy assigned task %s but it was not found in queue",
+                decision.task_id,
+            )
+            return
+
+        # Calculate wait time for stats
+        wait_seconds = (current_time - removed.arrival_time).total_seconds()
+        self.stats['wait_time_total_seconds'] += wait_seconds
+
+        logger.debug(
+            "Batch dispatching %s for case %s to %s (waited %.0fs)",
+            removed.activity, removed.case_id, freed_resource, wait_seconds,
+        )
+
+        # Track assignment for strategy (keeps SHQ counts accurate)
+        self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
+        # Schedule the activity with the freed resource
+        self._schedule_activity_with_resource(
+            removed.case_id,
+            removed.activity,
+            removed.lifecycle,
+            current_time,
+            removed.case_state,
+            freed_resource,
+        )
+
+    def _process_waiting_queue_drl(
+        self, freed_resource: str, current_time: datetime
+    ) -> None:
+        """
+        DRL-mode waiting-queue processing.
+
+        Builds TaskInfo list and eligible_map (no neighborhood scoping),
+        applies auto-postpone filter, then delegates to the DRL policy.
+        """
+        from resources.batch_policies import TaskInfo
+
+        # 1. Collect all waiting tasks
+        all_waiting = self.resource_pool.get_all_waiting_tasks()
+        if not all_waiting:
+            return
+
+        # 2. Build TaskInfo list
+        tasks: list[TaskInfo] = []
+        for w in all_waiting:
+            hours_waited = (current_time - w.arrival_time).total_seconds() / 3600.0
+            tasks.append(TaskInfo(
+                task_id=f"{w.case_id}::{w.allocation_activity}",
+                case_id=w.case_id,
+                activity=w.activity,
+                allocation_activity=w.allocation_activity,
+                hours_waited=max(0.0, hours_waited),
+            ))
+
+        # 3. Build eligible_map (no neighborhood scoping for DRL)
+        eligible_map: dict[str, set[str]] = {}
+        unique_activities = {t.allocation_activity for t in tasks}
+
+        for act in unique_activities:
+            try:
+                eligible = self.allocator.permissions.get_eligible_resources(
+                    act, timestamp=current_time
+                )
+            except TypeError:
+                eligible = self.allocator.permissions.get_eligible_resources(act)
+
+            available = {
+                r for r in eligible
+                if self.allocator.availability.is_available(r, current_time)
+            }
+            eligible_map[act] = available
+
+        # 4. Auto-postpone: skip decide() if freed resource can't serve any waiting activity
+        any_feasible = any(
+            freed_resource in eligible_map.get(t.allocation_activity, set())
+            for t in tasks
+        )
+        if not any_feasible:
+            return
+
+        # 5. Compute per-activity max wait hours (for postpone starvation prevention)
+        task_max_wait: dict[str, float] = {}
+        for t in tasks:
+            current_max = task_max_wait.get(t.allocation_activity, 0.0)
+            if t.hours_waited > current_max:
+                task_max_wait[t.allocation_activity] = t.hours_waited
+
+        # 6. Provide engine state to policy (for observation building)
+        if hasattr(self._drl_policy, 'set_engine_state'):
+            self._drl_policy.set_engine_state(self.resource_pool, self.case_manager)
+
+        # 7. Build pool snapshot for training bridge (InteractiveBatchPolicy)
+        pool_snapshot = self._build_pool_snapshot()
+        waiting_activities = {t.allocation_activity for t in tasks if self.resource_pool.has_waiting_work(t.allocation_activity)}
+
+        # 8. Call policy
+        decision = self._drl_policy.decide(
+            freed_resource=freed_resource,
+            current_time_s=current_time.timestamp(),
+            tasks=tasks,
+            workers=[],  # Not used by DRL policy
+            eligible_map=eligible_map,
+            processing_time_fn=lambda w, a: 0.0,  # Not used by DRL policy
+            current_time_dt=current_time,
+            waiting_activities=waiting_activities,
+            pool_snapshot=pool_snapshot,
+            active_case_count=self.case_manager.active_count(),
+            task_max_wait_hours=task_max_wait,
+            max_postpone_wait_hours=self._drl_max_postpone_wait_hours,
+        )
+
+        if decision is None:
+            return
+
+        # 9. Parse task_id and dispatch
+        parts = decision.task_id.split("::", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid task_id from DRL policy: %s", decision.task_id)
+            return
+        case_id, allocation_activity = parts
+
+        removed = self.resource_pool.remove_task_by_id(allocation_activity, case_id)
+        if removed is None:
+            logger.warning(
+                "DRL policy assigned task %s but it was not found in queue",
+                decision.task_id,
+            )
+            return
+
+        wait_seconds = (current_time - removed.arrival_time).total_seconds()
+        self.stats['wait_time_total_seconds'] += wait_seconds
+
+        logger.debug(
+            "DRL dispatching %s for case %s to %s (waited %.0fs)",
+            removed.activity, removed.case_id, freed_resource, wait_seconds,
+        )
+
+        self._resource_strategy.notify_assignment(freed_resource, allocation_activity)
+
+        self._schedule_activity_with_resource(
+            removed.case_id,
+            removed.activity,
+            removed.lifecycle,
+            current_time,
+            removed.case_state,
+            freed_resource,
+        )
+
+    def _build_pool_snapshot(self) -> dict:
+        """Serialize resource pool state into plain dicts for thread-safe access."""
+        busy = {}
+        for res_id, (busy_until, case_id, activity) in self.resource_pool._busy_resources.items():
+            busy[res_id] = {
+                "busy_until": busy_until,
+                "case_id": case_id,
+                "activity": activity,
+            }
+
+        waiting = {}
+        for act, queue_items in self.resource_pool._waiting_queues.items():
+            if queue_items:
+                waiting[act] = [
+                    {
+                        "case_id": w.case_id,
+                        "activity": w.activity,
+                        "allocation_activity": w.allocation_activity,
+                        "arrival_time": w.arrival_time,
+                    }
+                    for w in queue_items
+                ]
+
+        return {"busy_resources": busy, "waiting_queues": waiting}
+
     def _on_case_end(self, event: SimulationEvent) -> None:
         """Handle case end: cleanup."""
         self.stats['cases_completed'] += 1
         self.case_manager.remove_case(event.case_id)
+        # Clean up predictor state for this case (prevents memory leak)
+        if hasattr(self._next_activity, 'reset_case'):
+            self._next_activity.reset_case(event.case_id)
     
     def _schedule_activity(self, case_id: str, activity: str, lifecycle: str,
                            current_time: datetime, case: CaseState) -> None:
         """Allocate resource and schedule activity completion, or queue if unavailable."""
+        logger.debug("Scheduling next activity after activity completion: %s", activity)
         # Some activities are control-flow artifacts (e.g., decision points) and must not
         # require an organizational resource.
         if not self._activity_requires_resource(activity):
@@ -773,11 +1753,47 @@ class DESEngine:
 
         allocation_activity = self._normalize_activity_for_resources(activity)
 
-        # Try to allocate a resource (with dynamic busy checking)
-        resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
+        if self._pmsp_config is None:
+            # Try to allocate a resource (with dynamic busy checking)
+            with self.profiler.measure("resource_allocation"):
+                resource, failure_reason = self._try_allocate_resource_with_reason(allocation_activity, current_time, case)
 
-        if resource is None:
-            # No resource available - add to waiting queue
+            if resource is None:
+                # No resource available - add to waiting queue
+                self.stats['waiting_events'] += 1
+                waiting_work = WaitingWork(
+                    case_id=case_id,
+                    activity=activity,
+                    lifecycle=lifecycle,
+                    allocation_activity=allocation_activity,
+                    arrival_time=current_time,
+                    case_state=case,
+                )
+                self.resource_pool.add_to_waiting_queue(waiting_work)
+
+                # Log the reason for waiting
+                if failure_reason == 'no_eligible':
+                    logger.warning(
+                        f"No eligible resources for activity '{activity}' - case {case_id} may be stuck. "
+                        f"Check permission model configuration."
+                    )
+                else:
+                    logger.debug(
+                        f"No resource for {activity} at {current_time} ({failure_reason}), "
+                        f"queued case {case_id}"
+                    )
+                
+                return
+
+            # Resource allocated - schedule the activity
+            self._schedule_activity_with_resource(
+                case_id, activity, lifecycle, current_time, case, resource
+            )
+
+        else: 
+            # Im optimization mode werden die tasks erst in batches gesammelt und nicht sofort zugeorndet. 
+            # Hier ist eine Resource freigeworden 
+            # logger.info("PMSP: Activity completed. New activity scheduled. Resource freed. Checking if optimization already applies ...")
             self.stats['waiting_events'] += 1
             waiting_work = WaitingWork(
                 case_id=case_id,
@@ -788,24 +1804,17 @@ class DESEngine:
                 case_state=case,
             )
             self.resource_pool.add_to_waiting_queue(waiting_work)
+            # logger.debug(
+            #     f"PMSP: Queued activity '{activity}' for case {case_id} at {current_time} "
+            #     f"(will be assigned via batch optimization)"
+            # )
 
-            # Log the reason for waiting
-            if failure_reason == 'no_eligible':
-                logger.warning(
-                    f"No eligible resources for activity '{activity}' - case {case_id} may be stuck. "
-                    f"Check permission model configuration."
-                )
-            else:
-                logger.debug(
-                    f"No resource for {activity} at {current_time} ({failure_reason}), "
-                    f"queued case {case_id}"
-                )
-            return
-
-        # Resource allocated - schedule the activity
-        self._schedule_activity_with_resource(
-            case_id, activity, lifecycle, current_time, case, resource
-        )
+            waiting_tasks = self.resource_pool.get_all_waiting_tasks()
+            # logger.info("PMSP: Currently waiting tasks: %d", len(waiting_tasks))
+            batch_size = self._pmsp_config.optimization_batch_size
+            if batch_size == 0 or len(waiting_tasks) >= batch_size:
+                # logger.info("PMSP: Threshold of batch size reached! Triggering optimization")
+                self._process_waiting_queue_pmsp(None, current_time)
 
     def _activity_requires_resource(self, activity: Optional[str]) -> bool:
         """Return True if this activity needs an org resource assignment."""
@@ -816,18 +1825,48 @@ class DESEngine:
 
     def _normalize_activity_for_resources(self, activity: str) -> str:
         """Normalize activity labels to match the resource permission model."""
-        # Do not normalize control-flow artifacts (already treated as resource-free)
-        if not activity or activity.startswith('DP ') or activity.startswith('PG '):
+        return self._normalize_activity_label(activity)
+
+    def _normalize_activity_label(self, activity: Optional[str]) -> Optional[str]:
+        """Normalize labels by removing loop suffixes (e.g. 'X 2' -> 'X')."""
+        if not activity:
+            return activity
+        if activity.startswith('DP ') or activity.startswith('PG '):
             return activity
 
-        # Many parts of this project generate duplicate labels to avoid loops
-        # (e.g., "W_Complete application 1", "A_Cancelled 2").
-        # The permission model is typically trained on the base label.
-        parts = activity.rsplit(' ', 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            base = parts[0].strip()
-            return base or activity
-        return activity
+        normalized = re.sub(r"\s+\d+$", "", activity).strip()
+        return normalized or activity
+
+    def _should_emit_pt_gt_start(self, activity: Optional[str]) -> bool:
+        """Return True if this activity gets a synthetic start in PT GT-gated mode."""
+        if self._pt_lifecycle_mode != "gt_activity_gated":
+            return False
+        if not self._is_process_transformer_predictor:
+            return False
+        normalized = self._normalize_activity_label(activity)
+        return normalized in self.PT_GT_START_ACTIVITIES
+
+    def _append_synthetic_start_record(
+        self,
+        case_id: str,
+        activity: str,
+        resource: Optional[str],
+        timestamp: datetime,
+        case: CaseState,
+    ) -> None:
+        """Append synthetic 'start' event directly to export records."""
+        if not self._should_emit_pt_gt_start(activity):
+            return
+
+        log_record = {
+            'case:concept:name': case_id,
+            'concept:name': activity,
+            'org:resource': resource,
+            'time:timestamp': timestamp,
+            'lifecycle:transition': 'start',
+        }
+        log_record.update(case.get_payload())
+        self.completed_events.append(log_record)
 
     def _schedule_activity_without_resource(
         self,
@@ -845,31 +1884,34 @@ class DESEngine:
         # For control-flow artifacts, treat duration as instantaneous.
         processing_seconds = 0.0
         try:
-            processing_seconds = float(self._processing_time.predict(
-                prev_activity=prev_activity,
-                prev_lifecycle=prev_lifecycle,
-                curr_activity=activity,
-                curr_lifecycle=lifecycle,
-                context={
-                    'case_id': case_id,
-                    'hour': current_time.hour,
-                    'weekday': current_time.weekday(),
-                    'month': current_time.month,
-                    'day_of_year': current_time.timetuple().tm_yday,
-                    'case:LoanGoal': case.case_type,
-                    'case:ApplicationType': case.application_type,
-                    'event_position_in_case': len(case.activity_history) + 1,
-                    'case_duration_so_far': (current_time - case.start_time).total_seconds() if case.start_time else 0.0,
-                    'resource_1': case.current_resource or 'unknown',
-                    'resource_2': 'none',
-                    'Accepted': case.accepted,
-                    'Selected': case.selected,
-                },
-            ))
+            with self.profiler.measure("processing_time.predict"):
+                processing_seconds = float(self._processing_time.predict(
+                    prev_activity=prev_activity,
+                    prev_lifecycle=prev_lifecycle,
+                    curr_activity=activity,
+                    curr_lifecycle=lifecycle,
+                    context={
+                        'case_id': case_id,
+                        'hour': current_time.hour,
+                        'weekday': current_time.weekday(),
+                        'month': current_time.month,
+                        'day_of_year': current_time.timetuple().tm_yday,
+                        'case:LoanGoal': case.case_type,
+                        'case:ApplicationType': case.application_type,
+                        'event_position_in_case': len(case.activity_history) + 1,
+                        'case_duration_so_far': (current_time - case.start_time).total_seconds() if case.start_time else 0.0,
+                        'resource_1': case.current_resource or 'unknown',
+                        'resource_2': 'none',
+                        'Accepted': case.accepted,
+                        'Selected': case.selected,
+                    },
+                ))
         except Exception:
             processing_seconds = 0.0
 
         completion_time = current_time + timedelta(seconds=processing_seconds)
+
+        self._append_synthetic_start_record(case_id, activity, None, current_time, case)
 
         event = SimulationEvent(
             timestamp=completion_time,
@@ -921,9 +1963,10 @@ class DESEngine:
             # Everyone qualified is busy
             return None, 'all_busy'
 
-        # Select randomly from truly available resources
-        import random
-        return random.choice(truly_available), None
+        # Apply resource selection heuristic (R-RMA / R-RRA / R-SHQ)
+        selected = self._resource_strategy.select(truly_available, activity)
+        self._resource_strategy.notify_assignment(selected, activity)
+        return selected, None
 
     def _schedule_activity_with_resource(self, case_id: str, activity: str, lifecycle: str,
                                           current_time: datetime, case: CaseState,
@@ -958,20 +2001,53 @@ class DESEngine:
             'case_id': case_id,
         }
 
-        processing_seconds = self._processing_time.predict(
-            # Request inter-event time (complete → complete) to use trained distributions
-            # This allows the model to predict realistic processing times based on training data
-            prev_activity=prev_activity,
-            prev_lifecycle=prev_lifecycle,
-            curr_activity=activity,
-            curr_lifecycle=lifecycle,
-            context=context,
-        )
+        with self.profiler.measure("processing_time.predict"):
+            processing_seconds = self._processing_time.predict(
+                # Request inter-event time (complete → complete) to use trained distributions
+                # This allows the model to predict realistic processing times based on training data
+                prev_activity=prev_activity,
+                prev_lifecycle=prev_lifecycle,
+                curr_activity=activity,
+                curr_lifecycle=lifecycle,
+                context=context,
+            )
+
+        # Apply per-transition P99 cap from GT distributions
+        if self._transition_p99_caps:
+            transition_key = (prev_activity, prev_lifecycle, activity, lifecycle)
+            cap = self._transition_p99_caps.get(transition_key)
+            if cap is None:
+                # Fallback: match by activity pair, ignoring lifecycle
+                for key, val in self._transition_p99_caps.items():
+                    if key[0] == prev_activity and key[2] == activity:
+                        cap = val
+                        break
+            if cap is not None and processing_seconds > cap:
+                logger.debug(
+                    "P99 cap: %s→%s capped %.1fs → %.1fs",
+                    prev_activity, activity, processing_seconds, cap,
+                )
+                processing_seconds = cap
+
         processing_time = timedelta(seconds=processing_seconds)
         completion_time = current_time + processing_time
 
-        # Mark resource as busy until completion
-        self.resource_pool.mark_busy(resource, completion_time, case_id, activity)
+        # NOTE: Completion clamping to resource working hours was tried and reverted.
+        # Per-resource clamping created a ~3500-event spike at 7 AM (first available hour)
+        # and inflated TPT by ~100h (548→648h vs GT 526h). The processing time predictor
+        # already embeds overnight gaps in its inter-event predictions, so clamping
+        # double-counts the delay. See commit history on fix/event_distribution branch.
+        # Future work: "pause clock" approach that subtracts off-hours from predicted
+        # duration rather than shifting completion forward.
+
+        # Resource is only busy for actual work duration, not the full inter-event time
+        if hasattr(self._processing_time, 'predict_resource_hold_time'):
+            resource_hold_seconds = self._processing_time.predict_resource_hold_time(activity, resource)
+            resource_release_time = current_time + min(processing_time, timedelta(seconds=resource_hold_seconds))
+        else:
+            resource_release_time = completion_time
+        self.resource_pool.mark_busy(resource, resource_release_time, case_id, activity)
+        self._append_synthetic_start_record(case_id, activity, resource, current_time, case)
 
         # Schedule completion event
         event = SimulationEvent(
@@ -993,6 +2069,16 @@ class DESEngine:
             case_id=case_id,
         )
         self.queue.schedule(event)
+
+    def _is_business_hours(self, timestamp: datetime) -> bool:
+        """Check if timestamp falls within business hours (Mon-Fri, 8-17, no holidays)."""
+        avail = self.allocator.availability
+        start_hour = getattr(avail, 'workday_start_hour', 8)
+        end_hour = getattr(avail, 'workday_end_hour', 17)
+        weekday = timestamp.weekday()
+        hour = timestamp.hour
+        is_holiday = timestamp.date() in avail.nl_holidays
+        return weekday < 5 and start_hour <= hour < end_hour and not is_holiday
 
     def _get_next_business_hour(self, current_time: datetime) -> datetime:
         """
@@ -1142,6 +2228,49 @@ class DESEngine:
         final_waiting = self.resource_pool.get_total_waiting_count()
         drained = initial_waiting - final_waiting
         logger.info(f"Drain phase complete: {drained} cases dispatched, {final_waiting} remaining")
+
+
+# ---------------------------------------------------------------------------
+# Training DES Engine — subclass for DRL training
+# ---------------------------------------------------------------------------
+
+class TrainingDESEngine(DESEngine):
+    """
+    DESEngine subclass that captures per-case cycle times for reward computation.
+
+    Used during DRL training: the Gym env reads completed case cycle times
+    via pop_completed_cases() after each decision step.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._completed_cycle_times: list[float] = []
+        self._lock = threading.Lock()
+
+    def _on_case_end(self, event: SimulationEvent) -> None:
+        """Override: capture cycle time before cleanup."""
+        case = self.case_manager.get_case(event.case_id)
+        if case and case.start_time:
+            ct_hours = (event.timestamp - case.start_time).total_seconds() / 3600.0
+            with self._lock:
+                self._completed_cycle_times.append(ct_hours)
+        super()._on_case_end(event)
+
+    def pop_completed_cases(self) -> list[float]:
+        """Return and clear accumulated cycle times (thread-safe)."""
+        with self._lock:
+            times = self._completed_cycle_times[:]
+            self._completed_cycle_times.clear()
+        return times
+
+    def run(self, num_cases: int = 100, max_time: datetime = None) -> List[Dict]:
+        """Override: signal episode end to DRL bridge after run completes."""
+        try:
+            result = super().run(num_cases=num_cases, max_time=max_time)
+        finally:
+            if self._drl_policy is not None and hasattr(self._drl_policy, 'signal_episode_end'):
+                self._drl_policy.signal_episode_end()
+        return result
 
 
 # Stub predictors for testing/fallback

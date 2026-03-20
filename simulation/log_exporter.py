@@ -28,6 +28,22 @@ class LogExporter:
         df.to_csv(path, index=False)
     
     @staticmethod
+    def append_to_csv(events: List[Dict], path: str, write_header: bool = False) -> None:
+        """
+        Append events to CSV file (incremental writing).
+        
+        Args:
+            events: List of event dictionaries to append.
+            path: Output file path.
+            write_header: If True, write header row. If False, append without header.
+        """
+        if not events:
+            return
+        
+        df = LogExporter.to_dataframe(events)
+        df.to_csv(path, mode='a', index=False, header=write_header)
+    
+    @staticmethod
     def to_xes(events: List[Dict], path: str) -> None:
         """
         Export events to XES format.

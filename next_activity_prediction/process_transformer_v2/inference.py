@@ -232,11 +232,18 @@ class PTActivityAdapter:
         return self.predictor.predict(case_state)
 
 class PTTimeAdapter:
-    def __init__(self, predictor: ProcessTransformerV2Predictor):
+    # Max duration cap in seconds (default: 30 days = 2,592,000s)
+    # Ground truth P99 inter-event time is well under 30 days.
+    # Prevents multi-month outliers from cascading queue buildup at scale.
+    DEFAULT_MAX_DURATION_SECONDS = 30 * 24 * 3600  # 30 days
+
+    def __init__(self, predictor: ProcessTransformerV2Predictor, max_duration_seconds=None):
         self.predictor = predictor
-        
+        self.max_duration_seconds = max_duration_seconds or self.DEFAULT_MAX_DURATION_SECONDS
+
     def predict(self, prev_activity, prev_lifecycle, curr_activity, curr_lifecycle, context=None) -> float:
         # We only really care about the cached value which is stored by case_id
         if context and 'case_id' in context:
-            return self.predictor.predict_time_from_cache(context['case_id'])
+            raw = self.predictor.predict_time_from_cache(context['case_id'])
+            return min(raw, self.max_duration_seconds)
         return 0.0 # Fallback 0s if no context/cache (immediate)

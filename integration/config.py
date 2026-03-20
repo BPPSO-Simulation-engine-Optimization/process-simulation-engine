@@ -5,7 +5,7 @@ Provides a dataclass to configure basic vs advanced mode for each prediction com
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Literal, List
+from typing import Optional, Literal
 
 
 @dataclass
@@ -22,11 +22,15 @@ class SimulationConfig:
     processing_time_model_path: Optional[str] = "models/processing_time_model"
 
     # Next activity prediction
-    # "basic" = auto-load (engine will try to find model), "advanced" = explicit model path
-    next_activity_mode: Literal["basic", "advanced"] = "basic"
-    next_activity_model_path: Optional[str] = "next_activity_prediction/models/next_activity_lstm"
-    next_activity_model_type: Literal["embedding", "onehot", "lifecycle_dual", "auto"] = "auto"
+    next_activity_class: str = "lstm"  # "lstm", "process_transformer", "lifecycle_dual"
+    next_activity_model_path: Optional[str] = None
+    next_activity_lifecycle_variant: Optional[str] = None  # "start_complete" or "full_lifecycle"
+    next_activity_hf_repo: Optional[str] = None  # Override HuggingFace repo for lifecycle_dual download
     next_activity_temperature: float = 1.0
+    # PT-only lifecycle logging mode (ignored unless next_activity_class is process_transformer)
+    pt_lifecycle_mode: Literal["native", "gt_activity_gated"] = "native"
+    # Max PT duration cap in seconds (prevents outlier durations from cascading queue buildup)
+    pt_max_duration_seconds: Optional[float] = None
 
     # Case arrival times (advanced uses CaseInterarrivalPipeline)
     # NOTE: These defaults must match the parameters used to train case_arrival_model.pkl
@@ -42,41 +46,35 @@ class SimulationConfig:
     arrival_dbscan_eps: float = 0.8
     arrival_dbscan_min_samples: int = 2
 
-    # Case attributes (uses AttributeSimulationEngine)
+    # Case attributes (basic = stub, advanced = AttributeSimulationEngine)
     case_attribute_mode: Literal["basic", "advanced"] = "basic"
     case_attribute_seed: int = 42
     case_attribute_offer_activity: str = "O_Create Offer"
     case_attribute_monthly_artifact_path: Optional[str] = None
     case_attribute_retrain: bool = False  # If True, retrain from df instead of using cached artifacts
 
-    # Resource allocation: resources to forbid (never allocated); default: none
-    exclude_resources: Optional[List[str]] = field(default_factory=list)
+    # Resource selection strategy (R-RMA=random, R-RRA=round_robin, R-SHQ=shortest_queue)
+    resource_selection_strategy: Literal["random", "round_robin", "shortest_queue"] = "random"
+
+    # Resource allocation mode: "greedy" uses selection_strategy, "batch" uses batch_policy,
+    # "drl" uses trained PPO, "pmsp" uses PMSP optimizer (CP-SAT + JV fallback)
+    resource_allocation_mode: Literal["greedy", "batch", "drl", "pmsp"] = "greedy"
+    # Batch policy (only when resource_allocation_mode="batch")
+    batch_policy: Literal["1_batch_1"] = "1_batch_1"
+    # DRL policy settings (only when resource_allocation_mode="drl")
+    drl_model_path: Optional[str] = "models/drl_allocation/drl_allocation_model"
+    drl_deterministic: bool = True
+    drl_reward_tau: float = 100.0
+    drl_max_postpone_wait_hours: float = 4.0
+    # PMSP settings (only when resource_allocation_mode="pmsp")
+    pmsp_dummy_delta: float = 1.0
+    pmsp_solver_time_limit_seconds: Optional[float] = 2.0
+    pmsp_prediction_batch_size: int = 0  # 0 = unlimited
+    pmsp_optimization_batch_size: int = 0  # Min waiting tasks to trigger optimization (0 = always optimize)
+    pmsp_park_song_lookahead: bool = True  # Park & Song [13] look-ahead: add predicted next tasks to optimization
 
     # Global settings
     event_log_path: Optional[str] = None
     num_cases: int = 100
     random_seed: int = 42
     verbose: bool = False
-
-    @classmethod
-    def all_basic(cls) -> "SimulationConfig":
-        """Create configuration with all basic/stub predictors."""
-        return cls()
-
-    @classmethod
-    def all_advanced(
-        cls,
-        event_log_path: str,
-        processing_time_model_path: str = "models/processing_time_model",
-        num_cases: int = 100,
-    ) -> "SimulationConfig":
-        """Create configuration with all advanced predictors."""
-        return cls(
-            processing_time_mode="advanced",
-            processing_time_model_path=processing_time_model_path,
-            next_activity_mode="advanced",
-            case_arrival_mode="advanced",
-            case_attribute_mode="advanced",
-            event_log_path=event_log_path,
-            num_cases=num_cases,
-        )
