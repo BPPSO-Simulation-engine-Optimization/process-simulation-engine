@@ -137,6 +137,12 @@ python resources/tests/test_benchmark.py
 python resources/tests/test_caching.py
 ```
 
+## Evaluation Data
+
+Simulated event logs for all allocation strategies (5 replications each, 10,000 cases per run) and the full-scale 31,509-case validation run are available on Google Drive:
+
+https://drive.google.com/file/d/1LgNv8BvfSBVb9VrfepryuIHXilVG9dTb/view?usp=sharing
+
 ## Dataset
 
 **BPI Challenge 2017** - Loan application process from a Dutch financial institution (2016-2017).
